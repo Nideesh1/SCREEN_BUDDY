@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ScreenBuddy app icon - editable source (gold on black).
+     macOS icon grid: 1024 canvas, 824x824 artwork, ~100px transparent margin,
+     corner radius 185 (= 0.225 x 824). Metallic-gold "SB" monogram on a
+     near-black squircle with a faint gold inner-edge stroke. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Near-black squircle, subtle top->bottom lift. -->
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#161616"/>
+      <stop offset="1" stop-color="#0B0B0C"/>
+    </linearGradient>
+    <!-- Faint warm top glow for depth (very low opacity). -->
+    <radialGradient id="glow" cx="0.5" cy="0.26" r="0.66">
+      <stop offset="0" stop-color="#F2D27A" stop-opacity="0.12"/>
+      <stop offset="0.55" stop-color="#F2D27A" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#F2D27A" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Bottom vignette to seat the mark. -->
+    <linearGradient id="vignette" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.5" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.35"/>
+    </linearGradient>
+    <!-- Metallic gold: deep -> bright sheen -> mid. -->
+    <linearGradient id="gold" x1="0" y1="0" x2="0.15" y2="1">
+      <stop offset="0" stop-color="#B8860B"/>
+      <stop offset="0.42" stop-color="#D4AF37"/>
+      <stop offset="0.58" stop-color="#F2D27A"/>
+      <stop offset="1" stop-color="#B8860B"/>
+    </linearGradient>
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#ground)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#vignette)"/>
+  </g>
+
+  <!-- Faint 1px gold inner-edge stroke. -->
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184" ry="184"
+        fill="none" stroke="#D4AF37" stroke-opacity="0.25" stroke-width="2"/>
+
+  <!-- "SB" monogram, optically centered (dy nudges down off the cap-height baseline). -->
+  <text x="512" y="512" text-anchor="middle" dominant-baseline="central"
+        font-family="'Avenir Next', 'Helvetica Neue', -apple-system, Arial, sans-serif"
+        font-weight="800" font-size="440" letter-spacing="-10"
+        fill="url(#gold)" dy="12">SB</text>
+</svg>

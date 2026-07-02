@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ScreenBuddy in-app header lettermark. Metallic-gold "SB" on transparent
+     background, tuned for the gold + black app theme. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120" viewBox="0 0 240 120">
+  <defs>
+    <linearGradient id="sb" x1="0" y1="0" x2="0.15" y2="1">
+      <stop offset="0" stop-color="#B8860B"/>
+      <stop offset="0.42" stop-color="#D4AF37"/>
+      <stop offset="0.58" stop-color="#F2D27A"/>
+      <stop offset="1" stop-color="#B8860B"/>
+    </linearGradient>
+  </defs>
+  <text x="120" y="60" text-anchor="middle" dominant-baseline="central"
+        font-family="'Avenir Next', 'Avenir', -apple-system, 'Helvetica Neue', Arial, sans-serif"
+        font-weight="800" font-size="96" letter-spacing="-3"
+        fill="url(#sb)">SB</text>
+</svg>

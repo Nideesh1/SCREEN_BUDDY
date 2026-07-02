@@ -1,0 +1,74 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Screen Buddy",
+  "version": "1.0.0",
+  "identifier": "com.kapari.screenbuddy",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "ScreenBuddy",
+        "width": 1000,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "visible": true,
+        "skipTaskbar": false,
+        "useHttpsScheme": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc://localhost http://localhost:* https://ai-screen-buddy-backend.pageapp.net wss://*; media-src 'self' blob:; img-src 'self' data: blob: asset: https://asset.localhost http://asset.localhost; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/runs/**", "$APPDATA/video_staging/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/ffprobe"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.13",
+      "infoPlist": "Info.plist",
+      "entitlements": "entitlements.plist",
+      "signingIdentity": "Developer ID Application: Nideesh Terapalli (ZA6K8W5F8Y)"
+    },
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "certificateThumbprint": null,
+      "timestampUrl": "",
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

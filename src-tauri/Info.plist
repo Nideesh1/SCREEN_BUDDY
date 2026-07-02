@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Screen Buddy needs microphone access for voice conversations.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Screen Buddy may use camera for video features.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Screen Buddy needs screen recording access to capture and analyze your screen.</string>
+</dict>
+</plist>

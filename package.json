@@ -1,0 +1,30 @@
+{
+  "name": "ai-screen-buddy-desktop",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "dev:prod": "VITE_CU_BACKEND_URL=https://ai-screen-buddy-backend.pageapp.net CU_BACKEND_URL=https://ai-screen-buddy-backend.pageapp.net tauri dev"
+  },
+  "dependencies": {
+    "@fabianlars/tauri-plugin-oauth": "^2.0.0",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "2.6.0",
+    "@tauri-apps/plugin-notification": "^2",
+    "@tauri-apps/plugin-shell": "^2.3.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.18.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4"
+  }
+}

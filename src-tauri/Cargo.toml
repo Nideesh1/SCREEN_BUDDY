@@ -1,0 +1,65 @@
+[package]
+name = "screen-buddy"
+version = "1.0.0"
+description = "Screen Buddy - AI assistant that can see your screen"
+authors = ["Kapari"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "screen_buddy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11", features = ["macos-private-api", "devtools", "tray-icon", "protocol-asset"] }
+tauri-plugin-log = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-oauth = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+# Always-on remote control channel (remote.rs). `connect_async` needs a TLS
+# backend for wss://; native-tls matches reqwest's default so we don't pull in a
+# second TLS stack.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+urlencoding = "2"
+base64 = "0.22"
+image = "0.25.5"
+enigo = "0.2"
+xcap = "0.9.6"
+core-graphics = "0.23"
+core-foundation = "0.9"
+aes-gcm = "0.10"
+rand = "0.8"
+# PDF ingest for pinned sets. Binds to the PDFium dynamic library at RUNTIME
+# (Pdfium::bind_to_system_library), so building does not require the dylib.
+pdfium-render = { version = "0.8", features = ["image"] }
+
+# macOS credential-vault hardening: store the AES master key in the login
+# Keychain (`keyring`) and gate its first read per run behind Touch ID
+# (`robius-authentication`). Both are macOS-only; non-macOS uses the file-key
+# fallback in credentials.rs, so these are not compiled off-platform.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+robius-authentication = "0.1"
+
+# Optimize ALL third-party crates even in `tauri dev`/debug builds. `image`
+# (and its codecs) is ~157x slower when built unoptimized, which dominates
+# screenshot latency. This compiles every dependency at opt-level 3 ONCE and
+# caches it; our own crate (top-level [profile.dev]) stays unoptimized so
+# incremental rebuilds + hot reload remain fast and debuggable.
+[profile.dev.package."*"]
+opt-level = 3

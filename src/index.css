@@ -1,0 +1,610 @@
+/* ScreenBuddy — refined luxe gold-on-black design system.
+   Gold is an ACCENT (borders, key text, active state); surfaces stay layered
+   dark neutrals — never gold-washed. All legacy var names are preserved so
+   existing views keep working; new tokens are additive.
+
+   ── LEGACY (kept; values refined subtly for richer depth) ──
+     --sb-bg          app background (near-black)
+     --sb-bg-alt      recessed well  (mapped onto --sb-surface-2)
+     --sb-panel       lifted panel   (mapped onto --sb-surface-1)
+     --sb-border      hairline border (now subtle-neutral; see --sb-border-gold for accent)
+     --sb-gold        primary metallic gold
+     --sb-gold-bright hover / active gold
+     --sb-gold-deep   deep gradient gold
+     --sb-text        primary body text
+     --sb-text-muted  secondary text
+     --sb-danger / --sb-danger-bright  danger states */
+:root {
+  /* ── Base + layered surfaces (subtle steps above --sb-bg) ── */
+  --sb-bg: #0B0B0C;            /* app canvas (near-black) */
+  --sb-surface-1: #161619;     /* raised card / panel */
+  --sb-surface-2: #121215;     /* nested well (logs, screenshots) */
+  --sb-surface-3: #1C1C21;     /* inputs / interactive fields */
+  /* legacy aliases mapped onto the new scale so old usages stay consistent */
+  --sb-panel: var(--sb-surface-1);
+  --sb-bg-alt: var(--sb-surface-2);
+
+  /* ── Gold scale (accent only) ── */
+  --sb-gold: #D4AF37;                       /* primary accent */
+  --sb-gold-bright: #F2D27A;                /* hover / active highlight */
+  --sb-gold-deep: #B8860B;                  /* deep gradient gold */
+  --sb-gold-soft: rgba(212, 175, 55, 0.50); /* secondary accent text */
+  --sb-gold-dim: rgba(212, 175, 55, 0.12);  /* tints / active backgrounds */
+  --sb-gold-line: rgba(212, 175, 55, 0.22); /* accent borders */
+
+  /* ── Text scale ── */
+  --sb-text: #EDEDE6;        /* primary */
+  --sb-text-muted: #9A968C;  /* secondary */
+  --sb-text-faint: #6F6B62;  /* tertiary / labels */
+
+  /* ── Borders ── */
+  --sb-border: rgba(255, 255, 255, 0.07);    /* subtle neutral hairline */
+  --sb-border-gold: rgba(212, 175, 55, 0.22); /* gold accent line */
+
+  /* ── Danger ── */
+  --sb-danger: #C0392B;
+  --sb-danger-bright: #E0564B;
+  --sb-success: #6FB87A;     /* completed (green-gold) */
+
+  /* ── Typography ── */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+  /* Type scale (px). Conventions: labels/uppercase use --fs-xs/sm + 600 weight +
+     letter-spacing; body uses --fs-base/md @ line-height 1.5; headings use lg–2xl
+     @ 600–700 weight, line-height ~1.2. */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-base: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+
+  /* ── Spacing scale ── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* ── Radius ── */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  /* ── Shadows (soft, low-opacity, premium) ── */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35), 0 1px 1px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.30);
+
+  /* ── Page content widths ── Wider use of the window on big screens, capped so
+     it never gets uncomfortably wide on huge monitors; the `margin: 0 auto`
+     page containers stay fluid (100% minus padding) on small windows. */
+  --page-max: 1400px;        /* standard content pages (Dashboard/History/Pinned) */
+  --page-max-narrow: 960px;  /* form-centric pages (Credentials/Settings/NewRun) */
+  --page-max-wide: 1560px;   /* dense views (RunDetail trajectory) */
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--sb-bg);
+  color: var(--sb-text);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Gold-tinted text selection. */
+::selection {
+  background: rgba(212, 175, 55, 0.28);
+  color: var(--sb-text);
+}
+
+/* Default thin, dark scrollbars with a gold-on-hover thumb. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: var(--r-pill);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--sb-gold-soft);
+}
+
+.container {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  height: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.header {
+  text-align: center;
+  position: relative;
+}
+
+.settings-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: none;
+  border: none;
+  color: var(--sb-text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.settings-btn:hover {
+  color: var(--sb-gold);
+  background: rgba(212, 175, 55, 0.1);
+}
+
+.settings-panel {
+  background: var(--sb-panel);
+  border: 1px solid var(--sb-border);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+
+.settings-panel label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--sb-text);
+}
+
+.settings-panel input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #2a2a22;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.settings-panel input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: var(--sb-gold);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.settings-panel input[type="range"]::-webkit-slider-thumb:hover {
+  background: var(--sb-gold-bright);
+}
+
+.header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+  letter-spacing: 0.3px;
+  background: linear-gradient(135deg, var(--sb-gold-bright) 0%, var(--sb-gold) 45%, var(--sb-gold-deep) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.subtitle {
+  font-size: 12px;
+  color: var(--sb-text-muted);
+}
+
+.status-section {
+  display: flex;
+  justify-content: center;
+}
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--sb-panel);
+  border: 1px solid var(--sb-border);
+  border-radius: 20px;
+  font-size: 13px;
+  color: var(--sb-text);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sb-text-muted);
+  transition: background 0.3s;
+}
+
+.status-indicator.connected .status-dot {
+  background: var(--sb-gold);
+  box-shadow: 0 0 10px rgba(212, 175, 55, 0.7);
+}
+
+.status-indicator.connecting .status-dot {
+  background: var(--sb-gold-bright);
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Gold ring spinner (ui.tsx Spinner). */
+@keyframes sb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.controls {
+  display: flex;
+  justify-content: center;
+}
+
+.session-controls {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+
+.session-controls .btn {
+  flex: 1;
+}
+
+.btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  width: 100%;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--sb-gold) 0%, var(--sb-gold-deep) 100%);
+  color: #0A0A0A;
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, var(--sb-gold-bright) 0%, var(--sb-gold) 100%);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(212, 175, 55, 0.4);
+}
+
+.btn-danger {
+  background: var(--sb-danger);
+  color: #fff;
+}
+
+.btn-danger:hover {
+  background: var(--sb-danger-bright);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(192, 57, 43, 0.45);
+}
+
+.btn-secondary {
+  background: var(--sb-surface-3);
+  color: var(--sb-text);
+  border: 1px solid var(--sb-border);
+}
+
+.btn-secondary:hover {
+  background: #24242a;
+  border-color: var(--sb-border-gold);
+  transform: translateY(-2px);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--sb-text-muted);
+  border: 1px solid transparent;
+}
+
+.btn-ghost:hover {
+  color: var(--sb-gold-bright);
+  background: var(--sb-gold-dim);
+  transform: translateY(-1px);
+}
+
+.btn-secondary.muted {
+  background: var(--sb-danger);
+  border-color: var(--sb-danger);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-icon {
+  font-size: 12px;
+}
+
+.audio-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(212, 175, 55, 0.08);
+  border: 1px solid var(--sb-border);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--sb-gold);
+}
+
+.audio-bars {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+}
+
+.audio-bars span {
+  width: 3px;
+  background: var(--sb-gold);
+  border-radius: 2px;
+  transition: height 0.1s ease;
+}
+
+/* Static heights when not speaking */
+.audio-bars span:nth-child(1) { height: 6px; }
+.audio-bars span:nth-child(2) { height: 6px; }
+.audio-bars span:nth-child(3) { height: 6px; }
+.audio-bars span:nth-child(4) { height: 6px; }
+.audio-bars span:nth-child(5) { height: 6px; }
+
+/* Only animate when speaking */
+.audio-bars.speaking span {
+  animation: audioBar 0.5s ease-in-out infinite;
+}
+
+.audio-bars.speaking span:nth-child(1) { animation-delay: 0s; height: 8px; }
+.audio-bars.speaking span:nth-child(2) { animation-delay: 0.1s; height: 16px; }
+.audio-bars.speaking span:nth-child(3) { animation-delay: 0.2s; height: 12px; }
+.audio-bars.speaking span:nth-child(4) { animation-delay: 0.3s; height: 18px; }
+.audio-bars.speaking span:nth-child(5) { animation-delay: 0.4s; height: 10px; }
+
+@keyframes audioBar {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.5); }
+}
+
+.transcript-section {
+  background: var(--sb-panel);
+  border: 1px solid var(--sb-border);
+  border-radius: 12px;
+  padding: 16px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.transcript-section h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--sb-gold);
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.transcript-container {
+  flex: 1;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.transcript-placeholder {
+  color: var(--sb-text-muted);
+  font-style: italic;
+}
+
+.transcript-item {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.transcript-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.8;
+}
+
+.transcript-text {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.transcript-item.user {
+  background: rgba(212, 175, 55, 0.12);
+  border-left: 3px solid var(--sb-gold);
+}
+
+.transcript-item.user .transcript-role {
+  color: var(--sb-gold);
+}
+
+.transcript-item.assistant {
+  background: rgba(237, 237, 230, 0.06);
+  border-left: 3px solid var(--sb-gold-deep);
+}
+
+.transcript-item.assistant .transcript-role {
+  color: var(--sb-gold-bright);
+}
+
+.footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--sb-text-muted);
+  flex-shrink: 0;
+}
+
+/* Scrollbar styles */
+.transcript-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.transcript-container::-webkit-scrollbar-track {
+  background: var(--sb-panel);
+  border-radius: 3px;
+}
+
+.transcript-container::-webkit-scrollbar-thumb {
+  background: var(--sb-gold-deep);
+  border-radius: 3px;
+}
+
+.transcript-container::-webkit-scrollbar-thumb:hover {
+  background: var(--sb-gold);
+}
+
+/* Error message */
+.error-message {
+  background: rgba(192, 57, 43, 0.12);
+  border: 1px solid rgba(192, 57, 43, 0.4);
+  color: var(--sb-danger-bright);
+  padding: var(--sp-3);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-md);
+  text-align: center;
+}
+
+/* Agent run log — subtle gold scrollbar on a near-black well. */
+.agent-log::-webkit-scrollbar {
+  width: 8px;
+}
+
+.agent-log::-webkit-scrollbar-track {
+  background: var(--sb-bg);
+  border-radius: 4px;
+}
+
+.agent-log::-webkit-scrollbar-thumb {
+  background: var(--sb-gold-deep);
+  border-radius: 4px;
+}
+
+.agent-log::-webkit-scrollbar-thumb:hover {
+  background: var(--sb-gold);
+}
+
+/* Task input — gold focus ring. */
+.agent-input:focus {
+  outline: none;
+  border-color: var(--sb-gold);
+  box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.25);
+}
+
+.agent-input::placeholder {
+  color: var(--sb-text-muted);
+}
+
+/* Nav rail hover affordance — subtle gold wash on the icon button. */
+.nav-btn:hover {
+  background: rgba(212, 175, 55, 0.1) !important;
+  color: var(--sb-gold-bright) !important;
+}
+
+/* Styled tooltip for the left nav rail. Appears just to the RIGHT of the icon
+   on hover/focus; gold/black to match the theme. Hidden + non-interactive until
+   revealed so it never blocks clicks. */
+.nav-tooltip {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+  white-space: nowrap;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--sb-text);
+  background: var(--sb-panel);
+  border: 1px solid var(--sb-border);
+  border-radius: 7px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+  z-index: 20;
+}
+
+/* Gold pointer notch on the left edge of the tooltip. */
+.nav-tooltip::before {
+  content: '';
+  position: absolute;
+  left: -5px;
+  top: 50%;
+  transform: translateY(-50%) rotate(45deg);
+  width: 8px;
+  height: 8px;
+  background: var(--sb-panel);
+  border-left: 1px solid var(--sb-border);
+  border-bottom: 1px solid var(--sb-border);
+}
+
+.nav-btn:hover .nav-tooltip,
+.nav-btn:focus-visible .nav-tooltip {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+/* Secondary line inside a tooltip (e.g. the signed-in email under "Sign out"). */
+.nav-tooltip-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--sb-text-muted);
+}
