@@ -147,3 +147,6 @@ vite.config.ts.timestamp-*
 # Fetch into src-tauri/binaries/ via scripts/fetch-ffmpeg.md before a release build.
 src-tauri/binaries/ffmpeg-*
 src-tauri/binaries/ffprobe-*
+
+# macOS junk
+.DS_Store
