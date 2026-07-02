@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This app bundles the FFmpeg command-line binaries at release time as a separate
-subprocess (not linked). Those binaries are GPL-licensed and are not committed
-here; see src-tauri/binaries/LICENSE and SOURCE.md, and scripts/fetch-ffmpeg.md
-for how to obtain them. Invoking FFmpeg as a separate executable (mere
-aggregation) does not place this MIT-licensed source under the GPL.

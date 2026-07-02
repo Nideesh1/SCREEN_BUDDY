@@ -52,4 +52,10 @@ whole reason the app is open: you can read exactly how your key is handled.
 
 ## License
 
-MIT (this source). Bundled FFmpeg binaries are GPL and fetched separately; see LICENSE.
+This project's source is MIT licensed (see [LICENSE](LICENSE)).
+
+Release builds bundle the FFmpeg / FFprobe command-line tools, which are GPL
+licensed. They are **not** committed here and are invoked as a separate
+subprocess (not linked) — "mere aggregation" — so they do not place this
+MIT-licensed source under the GPL. Fetch them via `scripts/fetch-ffmpeg.md`;
+see `src-tauri/binaries/LICENSE` and `SOURCE.md` for their terms.
