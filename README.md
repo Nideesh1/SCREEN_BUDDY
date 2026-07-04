@@ -1,5 +1,7 @@
 # ScreenBuddy
 
+[![ScreenBuddy demo](https://img.youtube.com/vi/xYO9aGTtPrI/maxresdefault.jpg)](https://www.youtube.com/watch?v=xYO9aGTtPrI)
+
 A macOS app that runs Claude computer use as a real, shippable product. It drives
 your Mac the way a person would (looking, clicking, typing) to do tasks that have
 no API, like ordering groceries on Amazon.
