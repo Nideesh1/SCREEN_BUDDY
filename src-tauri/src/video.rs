@@ -90,7 +90,10 @@ fn emit_pct(app: &AppHandle, pct: u32) {
 /// app executable (Tauri copies `externalBin` there, stripped of the target
 /// triple). There is NO `$PATH` fallback: if the sidecar is missing we return a
 /// clear error so the caller never silently runs some unknown ffmpeg.
-fn resolve_bin(name: &str) -> Result<PathBuf, String> {
+///
+/// Shared with `artifacts.rs` (video thumbnails) — this is the ONE place that
+/// decides which ffmpeg/ffprobe binary the app is allowed to run.
+pub(crate) fn resolve_bin(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate app executable: {e}"))?;
     let dir = exe
         .parent()
@@ -309,8 +312,9 @@ fn downscale(img: &DynamicImage) -> DynamicImage {
     img.resize(MAX_EDGE, MAX_EDGE, image::imageops::FilterType::Lanczos3)
 }
 
-/// Encode a DynamicImage to JPEG bytes at the given quality.
-fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
+/// Encode a DynamicImage to JPEG bytes at the given quality. Shared with
+/// `artifacts.rs` (thumbnail encoding).
+pub(crate) fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     let rgb = img.to_rgb8();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);

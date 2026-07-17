@@ -5,6 +5,12 @@
 export const CU_BACKEND =
   import.meta.env.VITE_CU_BACKEND_URL || 'http://localhost:8000'
 
+// Deadline for the best-effort artifact metadata mirror. `fetch` has no default
+// timeout, so without this a stalled connection never settles and any caller
+// awaiting it hangs forever — which is indistinguishable, from the UI's side,
+// from the request never having been sent at all.
+const MIRROR_TIMEOUT_MS = 8000
+
 // Bearer header built from the backend session token (the only credential the
 // renderer trusts — set by useGoogleAuth after the /auth/google exchange).
 export function authHeaders(): Record<string, string> {
@@ -139,6 +145,89 @@ export async function unregisterSet(setUuid: string): Promise<void> {
     }
   } catch (err) {
     console.warn('[sets] DELETE /sets error', err)
+  }
+}
+
+// ---- Backend "artifact registry" (Mongo artifacts) ------------------------
+// The desktop owns the LOCAL artifact library (the physical files live in the
+// Tauri app data dir and NEVER leave the machine); these helpers mirror the
+// METADATA ONLY into the backend so other surfaces can resolve an artifact by
+// id. Same shape as the set-registry helpers above: same bearer auth, same
+// CU_BACKEND base, all best-effort — a failure is logged and swallowed so
+// backend registration can never block or crash local artifact CRUD.
+
+// One artifact's metadata. Mirrors the Rust `ArtifactMeta` (artifacts.rs) field
+// for field — this is a shared contract with the backend, so the names here must
+// stay in lockstep with meta.json.
+export interface ArtifactMeta {
+  artifact_id: string // lowercase-hex SHA-256 of the file contents (64 chars)
+  name: string // editable display name; defaults to original_filename
+  original_filename: string
+  kind: string // "image" | "video" | "pdf" | "text" | "other"
+  mime: string
+  size_bytes: number
+  width?: number | null // images only
+  height?: number | null // images only
+  duration_ms?: number | null // video only
+  created_at: string // ISO8601 UTC
+}
+
+// Register (upsert) a locally-imported artifact's metadata with the backend.
+// Returns true on 2xx, else false (logged) — never throws, so the caller can
+// surface a small warning without discarding the (already-imported) local file.
+export async function registerArtifact(meta: ArtifactMeta): Promise<boolean> {
+  try {
+    const resp = await fetch(`${CU_BACKEND}/artifacts`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(meta),
+      signal: AbortSignal.timeout(MIRROR_TIMEOUT_MS),
+    })
+    if (!resp.ok) {
+      console.warn(`[artifacts] POST /artifacts failed (${resp.status})`)
+      return false
+    }
+    return true
+  } catch (err) {
+    console.warn('[artifacts] POST /artifacts error', err)
+    return false
+  }
+}
+
+// Mirror a rename to the backend. Best-effort: returns true on 2xx, else false.
+export async function renameRemoteArtifact(id: string, name: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`${CU_BACKEND}/artifacts/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+      signal: AbortSignal.timeout(MIRROR_TIMEOUT_MS),
+    })
+    if (!resp.ok) {
+      console.warn(`[artifacts] PATCH /artifacts/${id} failed (${resp.status})`)
+      return false
+    }
+    return true
+  } catch (err) {
+    console.warn('[artifacts] PATCH /artifacts error', err)
+    return false
+  }
+}
+
+// Deregister an artifact when it's deleted locally. Best-effort: swallow every
+// error (the local delete is what matters; the mirror can drift and re-sync).
+export async function unregisterArtifact(id: string): Promise<void> {
+  try {
+    const resp = await fetch(`${CU_BACKEND}/artifacts/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(MIRROR_TIMEOUT_MS),
+    })
+    if (!resp.ok) {
+      console.warn(`[artifacts] DELETE /artifacts/${id} failed (${resp.status})`)
+    }
+  } catch (err) {
+    console.warn('[artifacts] DELETE /artifacts error', err)
   }
 }
 

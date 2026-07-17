@@ -1,17 +1,17 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { open } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { safeInvoke, fetchTemplates, registerSet, unregisterSet, type SetTemplate } from '../lib'
+import {
+  safeInvoke,
+  fetchTemplates,
+  registerSet,
+  unregisterSet,
+  type SetTemplate,
+  type ArtifactMeta,
+} from '../lib'
 import { Card, Button, IconButton, Chip, EmptyState, Spinner, PinIcon, TrashIcon, ImageIcon, DocIcon, FilmIcon } from '../ui'
-
-// File-picker filters: images, PDFs, and text/markdown. Matches the kinds the
-// Rust pinned_create accepts and ingests.
-const PICK_FILTERS = [
-  { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
-  { name: 'PDF', extensions: ['pdf'] },
-  { name: 'Text', extensions: ['txt', 'md'] },
-]
 
 // Video → set ingestion: a short clip is picked, the Rust pipeline proposes
 // candidate frames, the user prunes them in the review grid, and the survivors
@@ -68,11 +68,31 @@ type Load =
   | { state: 'unavailable'; message: string }
   | { state: 'ready'; sets: PinnedSet[] }
 
+// The artifact library as seen by the picker. Mirrors Artifacts.tsx's Load —
+// a missing/erroring artifact_list degrades the picker, never the whole view.
+type ArtLoad =
+  | { state: 'loading' }
+  | { state: 'unavailable'; message: string }
+  | { state: 'ready'; items: ArtifactMeta[] }
+
+// Thumbnail lookup: id -> data URL, or null once we know there ISN'T one
+// (text/other kinds, or a thumb that failed to generate). null is a real,
+// cached answer — it stops us re-asking Rust on every render.
+type Thumbs = Record<string, string | null>
+
+// Fallback glyph when an artifact has no thumbnail (same mapping as Artifacts).
+function KindIcon({ kind, size = 26 }: { kind: string; size?: number }) {
+  if (kind === 'image') return <ImageIcon size={size} />
+  if (kind === 'video') return <FilmIcon size={size} />
+  return <DocIcon size={size} />
+}
+
 // Pinned reference library. Lists saved image sets via pinned_list; a set can be
 // opened (pinned_get) to preview thumbnails, and deleted (pinned_delete). The
 // Tauri commands may not exist yet (Rust agents merge in parallel), so every
 // invoke is wrapped — a missing command shows an "unavailable" state, not a crash.
 function PinnedLibrary() {
+  const navigate = useNavigate()
   const [load, setLoad] = useState<Load>({ state: 'loading' })
   const [openId, setOpenId] = useState<string | null>(null)
   const [detail, setDetail] = useState<PinnedDetail | null>(null)
@@ -85,6 +105,17 @@ function PinnedLibrary() {
   // "Link to template" picker: templates from GET /templates, '' = None (null).
   const [templates, setTemplates] = useState<SetTemplate[]>([])
   const [templateId, setTemplateId] = useState<string>('')
+
+  // ---- artifact picker (set composition) ----------------------------------
+  // A set is composed by picking from the artifact library — media is imported
+  // ONCE in Artifacts and reused here, so building a set never means re-uploading
+  // from the device. The library loads lazily the first time the panel opens.
+  const [artLoad, setArtLoad] = useState<ArtLoad>({ state: 'loading' })
+  const [thumbs, setThumbs] = useState<Thumbs>({})
+  // Artifact ids chosen for the set being created. Nothing starts checked.
+  const [pickedArtifacts, setPickedArtifacts] = useState<Set<string>>(new Set())
+  // Thumbnail ids already asked for — see the fetch effect below.
+  const requestedRef = useRef<Set<string>>(new Set())
 
   // ---- video → set ingestion flow -----------------------------------------
   // 'idle' = not active; 'extracting' = pipeline running (progress bar);
@@ -115,6 +146,81 @@ function PinnedLibrary() {
     fetchSets()
   }, [fetchSets])
 
+  const fetchArtifacts = useCallback(async () => {
+    setArtLoad({ state: 'loading' })
+    const res = await safeInvoke<ArtifactMeta[]>('artifact_list')
+    if (res.ok) setArtLoad({ state: 'ready', items: res.data ?? [] })
+    else setArtLoad({ state: 'unavailable', message: res.error })
+  }, [])
+
+  // Load the library whenever the create panel opens, so an artifact imported in
+  // the Artifacts view mid-session shows up here without a reload. The selection
+  // resets with it: ids held over from a previous open may have been deleted in
+  // Artifacts since, and a stale id would fail the create (or silently inflate
+  // the "N selected" count against a list that no longer contains it).
+  useEffect(() => {
+    if (!creating) return
+    setPickedArtifacts(new Set())
+    fetchArtifacts()
+  }, [creating, fetchArtifacts])
+
+  // Pull each thumbnail as a data URL, once per artifact. artifact_thumb Errs
+  // when there's no thumb.jpg — expected for text/other, so we cache null and
+  // render a kind icon rather than surfacing an error.
+  //
+  // `requestedRef` (not the `thumbs` state) gates re-fetching: keying off state
+  // would make this effect depend on the very thing it writes, restarting the
+  // loop after every fetch. The ref makes each id fetched exactly once for the
+  // life of the view, surviving the re-fetch on each panel open.
+  useEffect(() => {
+    if (artLoad.state !== 'ready') return
+    const missing = artLoad.items.filter((a) => !requestedRef.current.has(a.artifact_id))
+    if (missing.length === 0) return
+    let active = true
+    ;(async () => {
+      for (const art of missing) {
+        if (!active) return
+        // Claim ids one at a time, immediately before fetching — claiming the
+        // whole batch up front would strand the un-fetched tail as permanently
+        // "requested" (spinning forever) if this run is cancelled mid-loop.
+        if (requestedRef.current.has(art.artifact_id)) continue
+        requestedRef.current.add(art.artifact_id)
+        const res = await safeInvoke<string>('artifact_thumb', { id: art.artifact_id })
+        if (!active) {
+          // Cancelled: drop the claim so the next run re-fetches this one.
+          requestedRef.current.delete(art.artifact_id)
+          return
+        }
+        setThumbs((prev) => ({
+          ...prev,
+          [art.artifact_id]: res.ok ? (res.data ?? null) : null,
+        }))
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [artLoad])
+
+  // Kinds a set can actually send to the model. `load_blocks` (pinned.rs) only
+  // emits content blocks for these — an artifact of any other kind resolves
+  // fine but contributes NOTHING to the prompt. The artifact library is
+  // deliberately broader than a set (it stores videos too), so the picker has
+  // to enforce this or a pinned video would be a silent no-op: set created,
+  // model sees nothing, no error anywhere. Videos become pinnable via the
+  // video → frames flow, which turns them into image frames.
+  const SENDABLE_KINDS = new Set(['image', 'pdf', 'text'])
+  const isSendable = (kind: string) => SENDABLE_KINDS.has(kind)
+
+  const toggleArtifact = useCallback((id: string) => {
+    setPickedArtifacts((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
   // Load run templates once for the "Link to template" picker (best-effort;
   // an empty result just leaves only the "None" option).
   useEffect(() => {
@@ -137,19 +243,22 @@ function PinnedLibrary() {
     else setDetailError(res.error)
   }, [])
 
-  // Create a one-off set: pick files via the OS dialog, then pinned_create.
+  // Create a set from the artifact library: the chosen artifact ids go to Rust,
+  // which resolves each to its already-imported bytes. No OS dialog, no
+  // re-upload — the library is the single source of media.
   const createSet = useCallback(async () => {
     const name = newName.trim()
-    if (!name || busy) return
+    const artifactIds = [...pickedArtifacts]
+    if (!name || artifactIds.length === 0 || busy) return
     setBusy(true)
     setCreateError(null)
     setCreateWarning(null)
     try {
-      const selected = await open({ multiple: true, filters: PICK_FILTERS })
-      const paths = selected == null ? [] : Array.isArray(selected) ? selected : [selected]
-      if (paths.length === 0) return
-      // pinned_create returns the new set's local id ({ id }).
-      const res = await safeInvoke<{ id: string }>('pinned_create', { name, paths })
+      // Returns the new set's local id ({ id }) — same shape as pinned_create.
+      const res = await safeInvoke<{ id: string }>('pinned_create_from_artifacts', {
+        name,
+        artifactIds,
+      })
       if (res.ok) {
         // Mirror the new set into the backend registry so a dispatched run can
         // pin it by uuid. The local set id IS the set_uuid. Best-effort: on
@@ -164,6 +273,7 @@ function PinnedLibrary() {
         setCreating(false)
         setNewName('')
         setTemplateId('')
+        setPickedArtifacts(new Set())
         fetchSets()
       } else {
         setCreateError(res.error)
@@ -173,7 +283,7 @@ function PinnedLibrary() {
     } finally {
       setBusy(false)
     }
-  }, [newName, busy, templateId, fetchSets])
+  }, [newName, busy, templateId, pickedArtifacts, fetchSets])
 
   const resetVideo = useCallback(() => {
     setVideoMode('idle')
@@ -641,7 +751,212 @@ function PinnedLibrary() {
 
       {creating && (
         <Card style={{ marginBottom: 'var(--sp-4)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
+              <span style={{ fontWeight: 600, color: 'var(--sb-text)', fontSize: 'var(--fs-base)' }}>
+                Choose artifacts
+              </span>
+              {artLoad.state === 'ready' && artLoad.items.length > 0 && (
+                <>
+                  <Chip mono>
+                    {pickedArtifacts.size} of {artLoad.items.length} selected
+                  </Chip>
+                  <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+                    Click an artifact to add it to this set
+                  </span>
+                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--sp-2)' }}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setPickedArtifacts(new Set(artLoad.items.map((a) => a.artifact_id)))
+                      }
+                      disabled={busy || pickedArtifacts.size === artLoad.items.length}
+                    >
+                      Select all
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setPickedArtifacts(new Set())}
+                      disabled={busy || pickedArtifacts.size === 0}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {artLoad.state === 'loading' && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 'var(--sp-2)',
+                  color: 'var(--sb-text-muted)',
+                  fontSize: 'var(--fs-base)',
+                }}
+              >
+                <Spinner size={16} /> Loading artifacts…
+              </div>
+            )}
+
+            {/* The library is the only media source here, so if it can't be read
+                there is nothing to pick — say why and offer a retry. */}
+            {artLoad.state === 'unavailable' && (
+              <EmptyState
+                icon="⚠"
+                title="Artifact library is unavailable right now"
+                hint={artLoad.message}
+                action={
+                  <Button variant="secondary" onClick={fetchArtifacts}>
+                    Retry
+                  </Button>
+                }
+              />
+            )}
+
+            {artLoad.state === 'ready' && artLoad.items.length === 0 && (
+              <EmptyState
+                icon={<ImageIcon size={28} />}
+                title="No artifacts yet"
+                hint="Upload media in Artifacts first — import a file once and reuse it in any number of pinned sets."
+                action={
+                  <Button variant="primary" onClick={() => navigate('/artifacts')}>
+                    Go to Artifacts
+                  </Button>
+                }
+              />
+            )}
+
+            {artLoad.state === 'ready' && artLoad.items.length > 0 && (
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
+                  gap: 'var(--sp-3)',
+                  maxHeight: 420,
+                  overflowY: 'auto',
+                }}
+              >
+                {artLoad.items.map((art) => {
+                  const thumb = thumbs[art.artifact_id]
+                  const on = pickedArtifacts.has(art.artifact_id)
+                  const sendable = isSendable(art.kind)
+                  return (
+                    <button
+                      key={art.artifact_id}
+                      onClick={() => sendable && toggleArtifact(art.artifact_id)}
+                      aria-pressed={on}
+                      disabled={!sendable}
+                      title={
+                        sendable
+                          ? `${art.name} — click to ${on ? 'remove from' : 'add to'} this set`
+                          : `${art.name} — ${art.kind} can't be pinned to a set. Use "Create from video" to turn it into frames.`
+                      }
+                      style={{
+                        position: 'relative',
+                        padding: 0,
+                        textAlign: 'left',
+                        cursor: sendable ? 'pointer' : 'not-allowed',
+                        borderRadius: 'var(--r-md)',
+                        overflow: 'hidden',
+                        border: on
+                          ? '2px solid var(--sb-gold-bright)'
+                          : '2px solid var(--sb-border)',
+                        background: 'var(--sb-surface-2)',
+                        boxShadow: on ? 'var(--shadow-1)' : 'none',
+                        opacity: sendable ? 1 : 0.45,
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: 110,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          background: 'var(--sb-surface-1)',
+                          borderBottom: '1px solid var(--sb-border)',
+                          overflow: 'hidden',
+                          opacity: on ? 1 : 0.6,
+                          transition: 'opacity 120ms ease',
+                        }}
+                      >
+                        {thumb ? (
+                          <img
+                            src={thumb}
+                            alt={art.name}
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              objectFit: 'cover',
+                              display: 'block',
+                            }}
+                          />
+                        ) : thumb === null ? (
+                          <span style={{ color: 'var(--sb-text-muted)' }}>
+                            <KindIcon kind={art.kind} />
+                          </span>
+                        ) : (
+                          // undefined => the thumb fetch hasn't answered yet.
+                          <Spinner size={15} />
+                        )}
+                      </div>
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 'var(--sp-2)',
+                          padding: 'var(--sp-2) var(--sp-3)',
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 'var(--fs-md)',
+                            fontWeight: 600,
+                            color: 'var(--sb-text)',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {art.name}
+                        </span>
+                        <Chip mono>{art.kind}</Chip>
+                      </div>
+                      {/* Selection state — the whole card is the toggle, this is
+                          the affordance that shows which way it went. */}
+                      <span
+                        style={{
+                          position: 'absolute',
+                          top: 6,
+                          right: 6,
+                          width: 24,
+                          height: 24,
+                          borderRadius: '50%',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontSize: 13,
+                          fontWeight: 700,
+                          color: on ? '#0A0A0A' : 'var(--sb-text-muted)',
+                          background: on ? 'var(--sb-gold-bright)' : 'rgba(10,10,12,0.72)',
+                          border: on
+                            ? '1px solid var(--sb-gold-bright)'
+                            : '1px solid var(--sb-border)',
+                          boxShadow: 'var(--shadow-1)',
+                        }}
+                      >
+                        {on ? '✓' : '＋'}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
             <input
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
@@ -685,9 +1000,14 @@ function PinnedLibrary() {
                 </option>
               ))}
             </select>
-            <Button variant="primary" disabled={!newName.trim() || busy} onClick={createSet}>
-              {busy ? 'Adding…' : 'Choose files…'}
+            <Button
+              variant="primary"
+              disabled={!newName.trim() || pickedArtifacts.size === 0 || busy}
+              onClick={createSet}
+            >
+              {busy ? 'Creating…' : `Create set (${pickedArtifacts.size})`}
             </Button>
+            </div>
           </div>
         </Card>
       )}

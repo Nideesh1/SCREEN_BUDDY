@@ -5200,6 +5200,7 @@ version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "chrono",
  "core-foundation 0.9.4",
  "core-graphics 0.23.2",
  "enigo",
@@ -5213,6 +5214,7 @@ dependencies = [
  "robius-authentication",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

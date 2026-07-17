@@ -54,6 +54,7 @@ function RemoteIndicator() {
 // caller that still thinks in view ids has one source of truth.
 export type ViewId =
   | 'dashboard'
+  | 'artifacts'
   | 'pinned'
   | 'runs'
   | 'history'
@@ -68,6 +69,7 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
+  { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
   { id: 'runs', Icon: PlusIcon, label: 'Runs' },
   { id: 'history', Icon: ClockIcon, label: 'History' },
@@ -247,6 +249,17 @@ function ClockIcon() {
     <IconBase>
       <circle cx="12" cy="12" r="9" />
       <polyline points="12 7 12 12 16 14" />
+    </IconBase>
+  )
+}
+
+function ArtifactIcon() {
+  // Stacked layers — a library of media sitting on top of each other.
+  return (
+    <IconBase>
+      <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
+      <path d="M3 12.5 12 17l9-4.5" />
+      <path d="M3 17 12 21.5 21 17" />
     </IconBase>
   )
 }

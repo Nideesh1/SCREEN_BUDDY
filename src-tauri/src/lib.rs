@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use tauri::{Manager, State};
 
 mod agent;
+mod artifacts;
 mod capture;
 mod computer;
 mod credentials;
@@ -235,8 +236,14 @@ pub fn run() {
         permissions::request_accessibility,
         pinned::pinned_list,
         pinned::pinned_create,
+        pinned::pinned_create_from_artifacts,
         pinned::pinned_delete,
         pinned::pinned_get,
+        artifacts::artifact_import,
+        artifacts::artifact_list,
+        artifacts::artifact_thumb,
+        artifacts::artifact_rename,
+        artifacts::artifact_delete,
         video::extract_frames_from_video
     ])
     .setup(|app| {

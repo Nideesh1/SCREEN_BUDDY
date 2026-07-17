@@ -44,6 +44,10 @@ core-graphics = "0.23"
 core-foundation = "0.9"
 aes-gcm = "0.10"
 rand = "0.8"
+# Artifact library (artifacts.rs): content-addressed ids (SHA-256 of the file
+# bytes, which gives dedup for free) + ISO8601 UTC `created_at` timestamps.
+sha2 = "0.10"
+chrono = "0.4"
 # PDF ingest for pinned sets. Binds to the PDFium dynamic library at RUNTIME
 # (Pdfium::bind_to_system_library), so building does not require the dylib.
 pdfium-render = { version = "0.8", features = ["image"] }

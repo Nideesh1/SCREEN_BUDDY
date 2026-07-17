@@ -11,6 +11,7 @@ import NewRun from './views/NewRun'
 import History from './views/History'
 import RunDetail from './views/RunDetail'
 import PinnedLibrary from './views/PinnedLibrary'
+import Artifacts from './views/Artifacts'
 import Credentials from './views/Credentials'
 import Settings from './views/Settings'
 
@@ -90,6 +91,7 @@ function App() {
             {/* Drilldown: live or replay, decided inside RunDetail. */}
             <Route path="runs/:runId" element={<RunDetail />} />
             <Route path="history" element={<History />} />
+            <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />
             <Route path="credentials" element={<Credentials />} />
             <Route path="settings" element={<Settings />} />
