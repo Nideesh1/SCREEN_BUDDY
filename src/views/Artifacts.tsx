@@ -84,6 +84,10 @@ function Artifacts() {
   const [confirmId, setConfirmId] = useState<string | null>(null)
   // Thumbnail ids already asked for — see the fetch effect below.
   const requestedRef = useRef<Set<string>>(new Set())
+  // Guards against writing thumb state after unmount. Deliberately NOT reset per
+  // fetch run — a thumbnail fetch must survive list refreshes (see the effect).
+  const mountedRef = useRef(true)
+  useEffect(() => () => { mountedRef.current = false }, [])
   // Set by Escape so the resulting blur discards the draft instead of saving it.
   const cancelEditRef = useRef(false)
 
@@ -110,30 +114,34 @@ function Artifacts() {
   useEffect(() => {
     if (load.state !== 'ready') return
     const missing = load.items.filter((a) => !requestedRef.current.has(a.artifact_id))
-    if (missing.length === 0) return
-    let active = true
-    ;(async () => {
-      for (const art of missing) {
-        if (!active) return
-        // Claim ids one at a time, immediately before fetching — claiming the
-        // whole batch up front would strand the un-fetched tail as permanently
-        // "requested" (spinning forever) if this run is cancelled mid-loop.
-        if (requestedRef.current.has(art.artifact_id)) continue
-        requestedRef.current.add(art.artifact_id)
-        const res = await safeInvoke<string>('artifact_thumb', { id: art.artifact_id })
-        if (!active) {
-          // Cancelled: drop the claim so the next run re-fetches this one.
-          requestedRef.current.delete(art.artifact_id)
-          return
+    // Fetch each missing thumbnail in its OWN task, and never abort a task when
+    // `load` changes. A thumbnail is content-addressed by id, so it stays valid
+    // no matter how many list refreshes land while it's in flight. The previous
+    // version aborted on every refresh and dropped the claim asynchronously —
+    // but the replacement effect run had already snapshotted `missing` without
+    // that id, so a delete+reupload (which fires several rapid refreshes) could
+    // strand an id: claimed, then un-claimed, but fetched by nobody, spinning
+    // forever even though thumb.jpg exists on disk. Now every claimed id is
+    // guaranteed to resolve to a value (a data URL, or null → kind icon), so a
+    // tile can never hang on a spinner.
+    for (const art of missing) {
+      requestedRef.current.add(art.artifact_id)
+      void (async () => {
+        try {
+          const res = await safeInvoke<string>('artifact_thumb', { id: art.artifact_id })
+          if (mountedRef.current) {
+            setThumbs((prev) => ({
+              ...prev,
+              [art.artifact_id]: res.ok ? (res.data ?? null) : null,
+            }))
+          }
+        } catch {
+          // Never leave a claimed id unresolved — fall back to the kind icon.
+          if (mountedRef.current) {
+            setThumbs((prev) => ({ ...prev, [art.artifact_id]: null }))
+          }
         }
-        setThumbs((prev) => ({
-          ...prev,
-          [art.artifact_id]: res.ok ? (res.data ?? null) : null,
-        }))
-      }
-    })()
-    return () => {
-      active = false
+      })()
     }
   }, [load])
 

@@ -405,6 +405,182 @@ function PinnedLibrary() {
     [fetchSets, openId],
   )
 
+  // Return to the sets list from the drill-down detail screen.
+  const closeSet = useCallback(() => {
+    setOpenId(null)
+    setDetail(null)
+    setDetailError(null)
+  }, [])
+
+  // ---- drill-down detail screen -------------------------------------------
+  // When a set is open we render a DEDICATED full-screen view for it instead of
+  // the list (the list is hidden). `openId` drives list-vs-detail: null = list,
+  // a set id = this screen. The set's name/count come from `detail` once
+  // pinned_get answers, and fall back to the list row meta while it's in flight
+  // so the header is populated during loading.
+  if (openId !== null) {
+    const meta = load.state === 'ready' ? load.sets.find((s) => s.id === openId) : undefined
+    const setName = detail?.name ?? meta?.name ?? 'Set'
+    const itemCount = detail ? detail.images.length : meta?.count
+    return (
+      <div style={{ padding: 'var(--sp-5)', maxWidth: 'var(--page-max)', margin: '0 auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <button
+            onClick={closeSet}
+            className="agent-input"
+            aria-label="Back to all sets"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 'var(--sp-2)',
+              padding: '7px 12px',
+              fontSize: 'var(--fs-base)',
+              fontWeight: 600,
+              cursor: 'pointer',
+              color: 'var(--sb-text)',
+              background: 'var(--sb-surface-3)',
+              border: '1px solid var(--sb-border)',
+              borderRadius: 'var(--r-sm)',
+            }}
+          >
+            ← All sets
+          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', minWidth: 0 }}>
+            <PinIcon size={18} />
+            <h1
+              style={{
+                margin: 0,
+                fontSize: 'var(--fs-xl)',
+                fontWeight: 700,
+                color: 'var(--sb-gold-bright)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {setName}
+            </h1>
+            {itemCount !== undefined && (
+              <Chip mono>
+                {itemCount} {itemCount === 1 ? 'item' : 'items'}
+              </Chip>
+            )}
+          </div>
+          <div style={{ marginLeft: 'auto' }}>
+            <IconButton
+              title="Delete set"
+              aria-label="Delete set"
+              onClick={() => deleteSet(openId)}
+              style={{ color: 'var(--sb-danger-bright)' }}
+            >
+              <TrashIcon size={16} />
+            </IconButton>
+          </div>
+        </div>
+
+        {detailError && (
+          <div className="error-message" style={{ marginBottom: 'var(--sp-3)' }}>
+            {detailError}
+          </div>
+        )}
+
+        {!detail && !detailError && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--sp-2)',
+              color: 'var(--sb-text-muted)',
+              fontSize: 'var(--fs-base)',
+            }}
+          >
+            <Spinner size={16} /> Loading set…
+          </div>
+        )}
+
+        {detail && detail.images.length === 0 && (
+          <Card>
+            <EmptyState
+              icon={<ImageIcon size={28} />}
+              title="This set is empty"
+              hint="It has no items to preview."
+            />
+          </Card>
+        )}
+
+        {detail && detail.images.length > 0 && (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
+              gap: 'var(--sp-3)',
+            }}
+          >
+            {detail.images.map((img, i) => (
+              <Card key={i} padded={false}>
+                <div
+                  style={{
+                    height: 180,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    background: 'var(--sb-surface-1)',
+                    borderBottom: '1px solid var(--sb-border)',
+                    overflow: 'hidden',
+                  }}
+                >
+                  {img.dataUrl ? (
+                    <img
+                      src={img.dataUrl}
+                      alt={img.name}
+                      style={{
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'cover',
+                        display: 'block',
+                      }}
+                    />
+                  ) : (
+                    <span
+                      style={{
+                        display: 'inline-flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        gap: 'var(--sp-2)',
+                        color: 'var(--sb-text-muted)',
+                      }}
+                    >
+                      <KindIcon kind={img.kind} size={34} />
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-xs)' }}>
+                        {img.kind}
+                      </span>
+                    </span>
+                  )}
+                </div>
+                <div style={{ padding: 'var(--sp-2) var(--sp-3)' }}>
+                  <span
+                    style={{
+                      display: 'block',
+                      fontSize: 'var(--fs-md)',
+                      fontWeight: 600,
+                      color: 'var(--sb-text)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={`${img.name}${img.kind === 'pdf' ? ' (visual)' : ''}`}
+                  >
+                    {img.name}
+                  </span>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div style={{ padding: 'var(--sp-5)', maxWidth: 'var(--page-max)', margin: '0 auto' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
@@ -1065,12 +1241,12 @@ function PinnedLibrary() {
           }}
         >
           {load.sets.map((set) => {
-            const isOpen = openId === set.id
             return (
-              <Card key={set.id} padded={false} style={isOpen ? { borderColor: 'var(--sb-border-gold)' } : undefined}>
+              <Card key={set.id} padded={false}>
                 <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--sp-2)', padding: 'var(--sp-3) var(--sp-4)' }}>
                   <button
-                    onClick={() => (isOpen ? setOpenId(null) : openSet(set.id))}
+                    onClick={() => openSet(set.id)}
+                    title={`Open ${set.name}`}
                     style={{
                       flex: 1,
                       minWidth: 0,
@@ -1120,76 +1296,6 @@ function PinnedLibrary() {
                     <TrashIcon size={16} />
                   </IconButton>
                 </div>
-
-                {isOpen && (
-                  <div
-                    style={{
-                      padding: 'var(--sp-3) var(--sp-4)',
-                      borderTop: '1px solid var(--sb-border)',
-                      background: 'var(--sb-surface-2)',
-                    }}
-                  >
-                    {detailError && <div className="error-message">{detailError}</div>}
-                    {!detail && !detailError && (
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-                        <Spinner size={13} /> Loading preview…
-                      </span>
-                    )}
-                    {detail && (
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
-                        {detail.images.length === 0 && (
-                          <span style={{ color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-                            (empty set)
-                          </span>
-                        )}
-                        {detail.images.map((img, i) =>
-                          img.dataUrl ? (
-                            <img
-                              key={i}
-                              src={img.dataUrl}
-                              alt={img.name}
-                              title={`${img.name}${img.kind === 'pdf' ? ' (visual)' : ''}`}
-                              style={{
-                                width: 84,
-                                height: 84,
-                                objectFit: 'cover',
-                                borderRadius: 'var(--r-sm)',
-                                border: '1px solid var(--sb-border)',
-                              }}
-                            />
-                          ) : (
-                            <div
-                              key={i}
-                              title={img.name}
-                              style={{
-                                width: 84,
-                                height: 84,
-                                display: 'flex',
-                                flexDirection: 'column',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                gap: 4,
-                                borderRadius: 'var(--r-sm)',
-                                border: '1px solid var(--sb-border)',
-                                background: 'var(--sb-surface-1)',
-                                color: 'var(--sb-text-muted)',
-                                fontSize: 'var(--fs-xs)',
-                                padding: 6,
-                                boxSizing: 'border-box',
-                                textAlign: 'center',
-                              }}
-                            >
-                              <span style={{ display: 'inline-flex' }}>
-                                {img.kind === 'image' ? <ImageIcon size={22} /> : <DocIcon size={22} />}
-                              </span>
-                              <span style={{ wordBreak: 'break-word', fontFamily: 'var(--font-mono)' }}>{img.kind}</span>
-                            </div>
-                          ),
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
               </Card>
             )
           })}
