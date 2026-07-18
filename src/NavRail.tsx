@@ -57,6 +57,7 @@ export type ViewId =
   | 'artifacts'
   | 'pinned'
   | 'runs'
+  | 'scheduled'
   | 'history'
   | 'credentials'
   | 'settings'
@@ -72,6 +73,7 @@ const ITEMS: NavItem[] = [
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
   { id: 'runs', Icon: PlusIcon, label: 'Runs' },
+  { id: 'scheduled', Icon: CalendarIcon, label: 'Scheduled' },
   { id: 'history', Icon: ClockIcon, label: 'History' },
   { id: 'credentials', Icon: KeyIcon, label: 'Credentials' },
   { id: 'settings', Icon: GearIcon, label: 'Settings' },
@@ -240,6 +242,17 @@ function PlusIcon() {
     <IconBase>
       <line x1="12" y1="5" x2="12" y2="19" />
       <line x1="5" y1="12" x2="19" y2="12" />
+    </IconBase>
+  )
+}
+
+function CalendarIcon() {
+  return (
+    <IconBase>
+      <rect x="3" y="4" width="18" height="17" rx="2" />
+      <line x1="3" y1="9" x2="21" y2="9" />
+      <line x1="8" y1="2" x2="8" y2="6" />
+      <line x1="16" y1="2" x2="16" y2="6" />
     </IconBase>
   )
 }

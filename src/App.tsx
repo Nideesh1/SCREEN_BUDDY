@@ -14,6 +14,10 @@ import PinnedLibrary from './views/PinnedLibrary'
 import Artifacts from './views/Artifacts'
 import Credentials from './views/Credentials'
 import Settings from './views/Settings'
+import Scheduled from './views/Scheduled'
+import ScheduleDetail from './views/ScheduleDetail'
+import ScheduleFireModal from './views/ScheduleFireModal'
+import { useScheduler } from './useScheduler'
 
 // App is the auth gate (single source of truth for auth state). It calls
 // useGoogleAuth() ONCE. Not authenticated -> splash. Authenticated -> the
@@ -80,6 +84,9 @@ function App() {
 
   return (
     <ActiveRunProvider>
+      {/* Global cron firing engine + fire modal — mounted above the router so
+          the modal appears no matter which view is active. */}
+      <SchedulerHost />
       <HashRouter>
         <Routes>
           <Route element={<Layout userEmail={userEmail} onSignOut={logout} />}>
@@ -90,6 +97,9 @@ function App() {
             <Route path="runs" element={<NewRun />} />
             {/* Drilldown: live or replay, decided inside RunDetail. */}
             <Route path="runs/:runId" element={<RunDetail />} />
+            {/* Scheduled (future) runs + drilldown. */}
+            <Route path="scheduled" element={<Scheduled />} />
+            <Route path="scheduled/:id" element={<ScheduleDetail />} />
             <Route path="history" element={<History />} />
             <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />
@@ -101,6 +111,24 @@ function App() {
         </Routes>
       </HashRouter>
     </ActiveRunProvider>
+  )
+}
+
+// Drives the cron firing engine (useScheduler) and renders the fire modal for
+// the head-of-queue owed occurrence. Rendered once, globally, so the modal
+// floats above whichever view is active. require_confirmation defaults true, so
+// every owed occurrence surfaces here as a modal.
+function SchedulerHost() {
+  const { current, accept, snooze, skip, busy } = useScheduler()
+  if (!current) return null
+  return (
+    <ScheduleFireModal
+      item={current}
+      busy={busy}
+      onAccept={accept}
+      onSnooze={snooze}
+      onSkip={skip}
+    />
   )
 }
 

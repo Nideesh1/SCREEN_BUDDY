@@ -4,9 +4,24 @@ import { invoke } from '@tauri-apps/api/core'
 import { safeInvoke, CU_BACKEND, authHeaders } from '../lib'
 import { Card, SectionTitle, Button, Chip, Spinner } from '../ui'
 import { Link } from 'react-router-dom'
+import { createSchedule, cronLabel } from '../schedules'
+import RunsTabs from './RunsTabs'
 
 // Default model used across the launcher when no template overrides it.
 const DEFAULT_MODEL = 'claude-sonnet-5'
+
+// The browser's IANA timezone — used verbatim for any schedule we create so the
+// backend interprets the cron in the user's local zone.
+const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
+
+// Cron presets for the "Schedule instead of running now" affordance. `custom`
+// reveals a raw cron field; every other option sets `cron` directly.
+const CRON_PRESETS: { id: string; label: string; cron: string }[] = [
+  { id: 'daily9', label: 'Daily 9am', cron: '0 9 * * *' },
+  { id: 'weeklyMon', label: 'Weekly Mon 9am', cron: '0 9 * * 1' },
+  { id: 'hourly', label: 'Hourly', cron: '0 * * * *' },
+  { id: 'custom', label: 'Custom…', cron: '' },
+]
 
 // A run template, served by `GET ${CU_BACKEND}/templates` (snake_case). Each
 // seeds the task textarea + model, and may suggest a Pinned library set (matched
@@ -72,6 +87,20 @@ function NewRun() {
   const [pinnedSetIds, setPinnedSetIds] = useState<string[]>([])
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // ── Scheduling affordance ──────────────────────────────────────────────────
+  // When on, Start becomes "Create schedule" (POST /schedules) instead of an
+  // immediate run. cron is driven by a preset; `custom` reveals the raw field.
+  const [scheduleMode, setScheduleMode] = useState(false)
+  const [scheduleName, setScheduleName] = useState('')
+  const [cronPreset, setCronPreset] = useState<string>(CRON_PRESETS[0].id)
+  const [customCron, setCustomCron] = useState('')
+  const [scheduling, setScheduling] = useState(false)
+  const [scheduled, setScheduled] = useState<string | null>(null)
+
+  // The effective cron: the raw field when "custom" is selected, else the preset.
+  const effectiveCron =
+    cronPreset === 'custom' ? customCron.trim() : CRON_PRESETS.find((p) => p.id === cronPreset)?.cron ?? ''
 
   const loadSets = useCallback(async () => {
     const res = await safeInvoke<PinnedSet[]>('pinned_list')
@@ -185,7 +214,35 @@ function NewRun() {
     }
   }, [task, model, pinnedSetIds, starting, navigate])
 
+  // Create a schedule instead of running now. Pins the single first selected set
+  // (the backend schedule references one pinned_set_id). Navigates to the
+  // Scheduled list on success.
+  const createScheduleNow = useCallback(async () => {
+    if (!task.trim() || !scheduleName.trim() || !effectiveCron || scheduling) return
+    setScheduling(true)
+    setError(null)
+    setScheduled(null)
+    try {
+      await createSchedule({
+        name: scheduleName.trim(),
+        cron: effectiveCron,
+        timezone: BROWSER_TZ,
+        task,
+        model,
+        pinned_set_id: pinnedSetIds[0] ?? null,
+      })
+      setScheduled(scheduleName.trim())
+      navigate('/scheduled')
+    } catch (err) {
+      setError(`Failed to create schedule: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setScheduling(false)
+    }
+  }, [task, scheduleName, effectiveCron, model, pinnedSetIds, scheduling, navigate])
+
   const canStart = task.trim().length > 0 && !starting
+  const canSchedule =
+    task.trim().length > 0 && scheduleName.trim().length > 0 && effectiveCron.length > 0 && !scheduling
 
   // ── BYOK gate ──────────────────────────────────────────────────────────────
   // Still resolving whether a key exists: hold the layout with a quiet spinner.
@@ -223,6 +280,8 @@ function NewRun() {
         boxSizing: 'border-box',
       }}
     >
+      <RunsTabs />
+
       {/* Heading */}
       <div style={{ textAlign: 'center' }}>
         <h1
@@ -333,6 +392,97 @@ function NewRun() {
             </Field>
           </div>
 
+          {/* Schedule-instead-of-run toggle */}
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--sp-2)',
+              cursor: 'pointer',
+              fontSize: 'var(--fs-md)',
+              color: 'var(--sb-text-muted)',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={scheduleMode}
+              onChange={(e) => {
+                setScheduleMode(e.target.checked)
+                setError(null)
+                setScheduled(null)
+              }}
+            />
+            ⏰ Schedule instead of running now
+          </label>
+
+          {/* Cron inputs — revealed when scheduling */}
+          {scheduleMode && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 'var(--sp-4)',
+                padding: 'var(--sp-4)',
+                background: 'var(--sb-surface-2)',
+                border: '1px solid var(--sb-border)',
+                borderRadius: 'var(--r-md)',
+              }}
+            >
+              <Field label="Schedule name">
+                <input
+                  className="agent-input"
+                  value={scheduleName}
+                  onChange={(e) => setScheduleName(e.target.value)}
+                  placeholder="e.g. Morning inbox sweep"
+                  style={selectStyle}
+                />
+              </Field>
+
+              <Field label="Frequency">
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
+                  {CRON_PRESETS.map((p) => {
+                    const selected = p.id === cronPreset
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => setCronPreset(p.id)}
+                        style={templateChipStyle(selected)}
+                      >
+                        {p.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </Field>
+
+              {cronPreset === 'custom' && (
+                <Field label="Cron expression">
+                  <input
+                    className="agent-input"
+                    value={customCron}
+                    onChange={(e) => setCustomCron(e.target.value)}
+                    placeholder="e.g. 0 9 * * 1-5"
+                    spellCheck={false}
+                    style={{ ...selectStyle, fontFamily: 'var(--font-mono)', cursor: 'text' }}
+                  />
+                </Field>
+              )}
+
+              {/* Live human-readable preview + timezone */}
+              <div style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)' }}>
+                {effectiveCron ? (
+                  <>
+                    <span style={{ color: 'var(--sb-gold)' }}>{cronLabel(effectiveCron)}</span>
+                    <span style={{ color: 'var(--sb-text-faint)' }}> · {BROWSER_TZ}</span>
+                  </>
+                ) : (
+                  <span style={{ color: 'var(--sb-text-faint)' }}>Enter a cron expression to preview.</span>
+                )}
+              </div>
+            </div>
+          )}
+
           {error && (
             <div
               style={{
@@ -348,30 +498,70 @@ function NewRun() {
             </div>
           )}
 
-          {/* Start */}
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Button
-              variant="primary"
-              size="md"
-              disabled={!canStart}
-              onClick={start}
+          {scheduled && (
+            <div
               style={{
-                minWidth: 180,
-                padding: '13px 26px',
-                fontSize: 'var(--fs-lg)',
-                opacity: canStart ? 1 : 0.45,
-                cursor: canStart ? 'pointer' : 'not-allowed',
+                padding: '10px var(--sp-3)',
+                borderRadius: 'var(--r-sm)',
+                fontSize: 'var(--fs-md)',
+                color: 'var(--sb-success)',
+                background: 'rgba(111, 184, 122, 0.12)',
+                border: '1px solid rgba(111, 184, 122, 0.30)',
               }}
             >
-              {starting ? (
-                <>
-                  <Spinner size={16} style={{ borderTopColor: '#0A0A0A', borderColor: 'rgba(0,0,0,0.25)' }} />
-                  Starting…
-                </>
-              ) : (
-                <>▶ Start run</>
-              )}
-            </Button>
+              Scheduled “{scheduled}”.
+            </div>
+          )}
+
+          {/* Start / Create schedule */}
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            {scheduleMode ? (
+              <Button
+                variant="primary"
+                size="md"
+                disabled={!canSchedule}
+                onClick={createScheduleNow}
+                style={{
+                  minWidth: 180,
+                  padding: '13px 26px',
+                  fontSize: 'var(--fs-lg)',
+                  opacity: canSchedule ? 1 : 0.45,
+                  cursor: canSchedule ? 'pointer' : 'not-allowed',
+                }}
+              >
+                {scheduling ? (
+                  <>
+                    <Spinner size={16} style={{ borderTopColor: '#0A0A0A', borderColor: 'rgba(0,0,0,0.25)' }} />
+                    Scheduling…
+                  </>
+                ) : (
+                  <>⏰ Create schedule</>
+                )}
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                size="md"
+                disabled={!canStart}
+                onClick={start}
+                style={{
+                  minWidth: 180,
+                  padding: '13px 26px',
+                  fontSize: 'var(--fs-lg)',
+                  opacity: canStart ? 1 : 0.45,
+                  cursor: canStart ? 'pointer' : 'not-allowed',
+                }}
+              >
+                {starting ? (
+                  <>
+                    <Spinner size={16} style={{ borderTopColor: '#0A0A0A', borderColor: 'rgba(0,0,0,0.25)' }} />
+                    Starting…
+                  </>
+                ) : (
+                  <>▶ Start run</>
+                )}
+              </Button>
+            )}
           </div>
         </div>
       </Card>

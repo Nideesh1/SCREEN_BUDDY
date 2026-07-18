@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime } from '../lib'
 import { Card, SectionTitle, StatusPill, Button, EmptyState, Spinner, Divider } from '../ui'
+import RunsTabs from './RunsTabs'
 
 // One row in the runs list. The backend shape is best-effort — we read the
 // common fields and degrade gracefully when any are missing. The canonical id
@@ -57,6 +58,9 @@ function History() {
 
   return (
     <div style={{ padding: 'var(--sp-5)', maxWidth: 'var(--page-max)', margin: '0 auto' }}>
+      <div style={{ marginBottom: 'var(--sp-5)' }}>
+        <RunsTabs />
+      </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--sp-3)', marginBottom: 'var(--sp-5)' }}>
         <h1 style={{ margin: 0, fontSize: 'var(--fs-2xl)', fontWeight: 700, color: 'var(--sb-text)' }}>
           History
