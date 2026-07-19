@@ -4,7 +4,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { safeInvoke, CU_BACKEND, authHeaders } from '../lib'
 import { Card, SectionTitle, Button, Chip, Spinner } from '../ui'
 import { Link } from 'react-router-dom'
-import { createSchedule, cronLabel } from '../schedules'
+import { createSchedule } from '../schedules'
+import CronBuilder from './CronBuilder'
 import RunsTabs from './RunsTabs'
 
 // Default model used across the launcher when no template overrides it.
@@ -13,15 +14,6 @@ const DEFAULT_MODEL = 'claude-sonnet-5'
 // The browser's IANA timezone — used verbatim for any schedule we create so the
 // backend interprets the cron in the user's local zone.
 const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
-
-// Cron presets for the "Schedule instead of running now" affordance. `custom`
-// reveals a raw cron field; every other option sets `cron` directly.
-const CRON_PRESETS: { id: string; label: string; cron: string }[] = [
-  { id: 'daily9', label: 'Daily 9am', cron: '0 9 * * *' },
-  { id: 'weeklyMon', label: 'Weekly Mon 9am', cron: '0 9 * * 1' },
-  { id: 'hourly', label: 'Hourly', cron: '0 * * * *' },
-  { id: 'custom', label: 'Custom…', cron: '' },
-]
 
 // A run template, served by `GET ${CU_BACKEND}/templates` (snake_case). Each
 // seeds the task textarea + model, and may suggest a Pinned library set (matched
@@ -160,17 +152,15 @@ function NewRun() {
 
   // ── Scheduling affordance ──────────────────────────────────────────────────
   // When on, Start becomes "Create schedule" (POST /schedules) instead of an
-  // immediate run. cron is driven by a preset; `custom` reveals the raw field.
+  // immediate run. cron is driven by the CronBuilder; empty = can't schedule.
   const [scheduleMode, setScheduleMode] = useState(false)
   const [scheduleName, setScheduleName] = useState('')
-  const [cronPreset, setCronPreset] = useState<string>(CRON_PRESETS[0].id)
-  const [customCron, setCustomCron] = useState('')
+  const [cron, setCron] = useState('0 9 * * *')
   const [scheduling, setScheduling] = useState(false)
   const [scheduled, setScheduled] = useState<string | null>(null)
 
-  // The effective cron: the raw field when "custom" is selected, else the preset.
-  const effectiveCron =
-    cronPreset === 'custom' ? customCron.trim() : CRON_PRESETS.find((p) => p.id === cronPreset)?.cron ?? ''
+  // The effective cron the builder controls; '' when invalid/incomplete.
+  const effectiveCron = cron.trim()
 
   const loadSets = useCallback(async () => {
     const res = await safeInvoke<PinnedSet[]>('pinned_list')
@@ -577,48 +567,7 @@ function NewRun() {
                 />
               </Field>
 
-              <Field label="Frequency">
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
-                  {CRON_PRESETS.map((p) => {
-                    const selected = p.id === cronPreset
-                    return (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => setCronPreset(p.id)}
-                        style={templateChipStyle(selected)}
-                      >
-                        {p.label}
-                      </button>
-                    )
-                  })}
-                </div>
-              </Field>
-
-              {cronPreset === 'custom' && (
-                <Field label="Cron expression">
-                  <input
-                    className="agent-input"
-                    value={customCron}
-                    onChange={(e) => setCustomCron(e.target.value)}
-                    placeholder="e.g. 0 9 * * 1-5"
-                    spellCheck={false}
-                    style={{ ...selectStyle, fontFamily: 'var(--font-mono)', cursor: 'text' }}
-                  />
-                </Field>
-              )}
-
-              {/* Live human-readable preview + timezone */}
-              <div style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)' }}>
-                {effectiveCron ? (
-                  <>
-                    <span style={{ color: 'var(--sb-gold)' }}>{cronLabel(effectiveCron)}</span>
-                    <span style={{ color: 'var(--sb-text-faint)' }}> · {BROWSER_TZ}</span>
-                  </>
-                ) : (
-                  <span style={{ color: 'var(--sb-text-faint)' }}>Enter a cron expression to preview.</span>
-                )}
-              </div>
+              <CronBuilder value={cron} onChange={setCron} timezone={BROWSER_TZ} />
             </div>
           )}
 

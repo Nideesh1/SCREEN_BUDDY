@@ -6,9 +6,9 @@ import {
   getSchedule,
   patchSchedule,
   deleteSchedule,
-  cronLabel,
   type ScheduleDetail as ScheduleDetailData,
 } from '../schedules'
+import CronBuilder from './CronBuilder'
 
 interface PinnedSet {
   id: string
@@ -159,18 +159,8 @@ function ScheduleDetail() {
                 <input className="agent-input" value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
               </Field>
 
-              <Field label="Cron expression">
-                <input
-                  className="agent-input"
-                  value={cron}
-                  onChange={(e) => setCron(e.target.value)}
-                  spellCheck={false}
-                  style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
-                />
-                <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-gold)' }}>{cronLabel(cron)}</span>
-                <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
-                  Timezone: {load.schedule.timezone}
-                </span>
+              <Field label="Schedule">
+                <CronBuilder value={cron} onChange={setCron} timezone={load.schedule.timezone} />
               </Field>
 
               <Field label="Task">
