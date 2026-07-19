@@ -11,6 +11,7 @@ mod permissions;
 mod pinned;
 mod remote;
 mod video;
+mod window;
 
 use computer::Computer;
 
@@ -244,7 +245,8 @@ pub fn run() {
         artifacts::artifact_thumb,
         artifacts::artifact_rename,
         artifacts::artifact_delete,
-        video::extract_frames_from_video
+        video::extract_frames_from_video,
+        window::bring_to_front
     ])
     .setup(|app| {
       if cfg!(debug_assertions) {

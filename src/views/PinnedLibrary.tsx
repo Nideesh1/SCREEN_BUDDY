@@ -53,9 +53,12 @@ interface PinnedSet {
 interface PinnedImage {
   name: string
   // "image" | "pdf" | "text". A pdf resolved to image-mode (scanned) carries a
-  // preview dataUrl of its first rendered page.
+  // preview data_url of its first rendered page.
   kind: string
-  dataUrl: string
+  // Snake_case to match the Rust `PinnedImage` field verbatim: Tauri does NOT
+  // camelCase command return values (only arguments), so `dataUrl` would read
+  // back as undefined and every tile would fall through to the KindIcon.
+  data_url: string
 }
 
 interface PinnedDetail {
@@ -529,9 +532,9 @@ function PinnedLibrary() {
                     overflow: 'hidden',
                   }}
                 >
-                  {img.dataUrl ? (
+                  {img.data_url ? (
                     <img
-                      src={img.dataUrl}
+                      src={img.data_url}
                       alt={img.name}
                       style={{
                         width: '100%',

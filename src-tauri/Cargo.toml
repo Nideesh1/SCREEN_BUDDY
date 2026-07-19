@@ -59,6 +59,10 @@ pdfium-render = { version = "0.8", features = ["image"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 robius-authentication = "0.1"
+# Objective-C bridge used only by window.rs to call
+# `[NSApplication activateIgnoringOtherApps:]`, which is required to steal focus
+# from the frontmost app when a scheduled run fires in the background.
+objc = "0.2"
 
 # Optimize ALL third-party crates even in `tauri dev`/debug builds. `image`
 # (and its codecs) is ~157x slower when built unoptimized, which dominates
