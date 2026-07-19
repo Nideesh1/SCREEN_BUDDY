@@ -87,7 +87,15 @@ function Artifacts() {
   // Guards against writing thumb state after unmount. Deliberately NOT reset per
   // fetch run — a thumbnail fetch must survive list refreshes (see the effect).
   const mountedRef = useRef(true)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  // Reset on mount (not just cleanup) so React StrictMode's dev mount→unmount→
+  // remount cycle doesn't leave this stuck false — which would block every
+  // setThumbs and spin all thumbnails forever.
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
   // Set by Escape so the resulting blur discards the draft instead of saving it.
   const cancelEditRef = useRef(false)
 
