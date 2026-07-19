@@ -33,6 +33,9 @@ interface RunTemplate {
   model: string
   suggestedSetName?: string
   credentialTarget?: string
+  // Slot names the scaffold references as `{name}` placeholders (e.g.
+  // ["items", "address", "card"]). Each renders as its own form field.
+  requiredInputs: string[]
 }
 
 // Raw template shape as returned by the backend (snake_case).
@@ -43,6 +46,7 @@ interface RawTemplate {
   model?: string
   suggested_set_name?: string
   credential_target?: string
+  required_inputs?: string[]
   builtin?: boolean
 }
 
@@ -51,6 +55,7 @@ const BLANK_TEMPLATE: RunTemplate = {
   name: 'Blank run',
   taskScaffold: '',
   model: DEFAULT_MODEL,
+  requiredInputs: [],
 }
 
 function normalizeTemplate(t: RawTemplate): RunTemplate {
@@ -61,7 +66,36 @@ function normalizeTemplate(t: RawTemplate): RunTemplate {
     model: t.model || DEFAULT_MODEL,
     suggestedSetName: t.suggested_set_name || undefined,
     credentialTarget: t.credential_target || undefined,
+    requiredInputs: Array.isArray(t.required_inputs) ? t.required_inputs : [],
   }
+}
+
+// Substitute `{name}` placeholders in the scaffold with the values the user
+// typed. Only FILLED inputs are substituted; an empty value (or a placeholder
+// with no matching input) is left literal so nothing crashes and the agent can
+// still see which slots weren't provided.
+function substituteInputs(scaffold: string, values: Record<string, string>): string {
+  let out = scaffold
+  for (const [key, raw] of Object.entries(values)) {
+    const value = raw.trim()
+    if (!value) continue
+    out = out.split(`{${key}}`).join(value)
+  }
+  return out
+}
+
+// "items" → "Items", "delivery_address" → "Delivery Address".
+function humanizeInput(name: string): string {
+  return name
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ')
+}
+
+// Inputs that tend to hold long / multi-line values render as a textarea.
+function isMultilineInput(name: string): boolean {
+  return /item|address|list|note|detail|desc/i.test(name)
 }
 
 interface PinnedSet {
@@ -82,6 +116,9 @@ function NewRun() {
   const [templates, setTemplates] = useState<RunTemplate[]>([BLANK_TEMPLATE])
   const [templateId, setTemplateId] = useState<string>(BLANK_TEMPLATE.id)
   const [task, setTask] = useState('')
+  // Values for the selected template's `required_inputs`, keyed by slot name.
+  // Substituted into the scaffold's `{name}` placeholders to build the run task.
+  const [inputValues, setInputValues] = useState<Record<string, string>>({})
   const [model, setModel] = useState(DEFAULT_MODEL)
   const [sets, setSets] = useState<PinnedSet[]>([])
   const [pinnedSetIds, setPinnedSetIds] = useState<string[]>([])
@@ -154,15 +191,27 @@ function NewRun() {
   }, [])
 
   const template = templates.find((t) => t.id === templateId)
+  const requiredInputs = template?.requiredInputs ?? []
 
-  // Apply a template: prefill task + model, and (if its suggested set name maps
-  // to a Pinned library set) pre-select that set.
+  // The task that actually launches the run: when the template has required
+  // inputs we substitute their values into the scaffold's `{name}` placeholders;
+  // otherwise the raw task text is used verbatim (unchanged behavior).
+  const finalTask = requiredInputs.length > 0 ? substituteInputs(task, inputValues) : task
+
+  // Update a single required-input field.
+  const setInputValue = useCallback((name: string, value: string) => {
+    setInputValues((prev) => ({ ...prev, [name]: value }))
+  }, [])
+
+  // Apply a template: prefill task + model, reset input values, and (if its
+  // suggested set name maps to a Pinned library set) pre-select that set.
   const applyTemplate = useCallback(
     (t: RunTemplate | undefined) => {
       setTemplateId(t?.id ?? BLANK_TEMPLATE.id)
       if (!t) return
       setTask(t.taskScaffold)
       setModel(t.model)
+      setInputValues({})
       if (t.suggestedSetName) {
         const match = sets.find((s) => s.name === t.suggestedSetName)
         setPinnedSetIds(match ? [match.id] : [])
@@ -174,7 +223,7 @@ function NewRun() {
   )
 
   const start = useCallback(async () => {
-    if (!task.trim() || starting) return
+    if (!finalTask.trim() || starting) return
     setStarting(true)
     setError(null)
     try {
@@ -182,7 +231,7 @@ function NewRun() {
       const resp = await fetch(`${CU_BACKEND}/runs`, {
         method: 'POST',
         headers: { ...authHeaders(), 'content-type': 'application/json' },
-        body: JSON.stringify({ task, model, pinned_image_refs: [] }),
+        body: JSON.stringify({ task: finalTask, model, pinned_image_refs: [] }),
       })
       if (!resp.ok) {
         setError(`Could not create run (HTTP ${resp.status}). Agent not started.`)
@@ -197,7 +246,7 @@ function NewRun() {
 
       // b) Only now kick off the agent, handing it the pre-minted run id.
       await invoke('start_agent_task', {
-        prompt: task,
+        prompt: finalTask,
         auth: localStorage.getItem('screen_buddy_session_token') ?? undefined,
         pinnedSetIds,
         runId,
@@ -212,13 +261,13 @@ function NewRun() {
     } finally {
       setStarting(false)
     }
-  }, [task, model, pinnedSetIds, starting, navigate])
+  }, [finalTask, model, pinnedSetIds, starting, navigate])
 
   // Create a schedule instead of running now. Pins the single first selected set
   // (the backend schedule references one pinned_set_id). Navigates to the
   // Scheduled list on success.
   const createScheduleNow = useCallback(async () => {
-    if (!task.trim() || !scheduleName.trim() || !effectiveCron || scheduling) return
+    if (!finalTask.trim() || !scheduleName.trim() || !effectiveCron || scheduling) return
     setScheduling(true)
     setError(null)
     setScheduled(null)
@@ -227,7 +276,7 @@ function NewRun() {
         name: scheduleName.trim(),
         cron: effectiveCron,
         timezone: BROWSER_TZ,
-        task,
+        task: finalTask,
         model,
         pinned_set_id: pinnedSetIds[0] ?? null,
       })
@@ -238,11 +287,11 @@ function NewRun() {
     } finally {
       setScheduling(false)
     }
-  }, [task, scheduleName, effectiveCron, model, pinnedSetIds, scheduling, navigate])
+  }, [finalTask, scheduleName, effectiveCron, model, pinnedSetIds, scheduling, navigate])
 
-  const canStart = task.trim().length > 0 && !starting
+  const canStart = finalTask.trim().length > 0 && !starting
   const canSchedule =
-    task.trim().length > 0 && scheduleName.trim().length > 0 && effectiveCron.length > 0 && !scheduling
+    finalTask.trim().length > 0 && scheduleName.trim().length > 0 && effectiveCron.length > 0 && !scheduling
 
   // ── BYOK gate ──────────────────────────────────────────────────────────────
   // Still resolving whether a key exists: hold the layout with a quiet spinner.
@@ -338,17 +387,80 @@ function NewRun() {
             )}
           </Field>
 
-          {/* Task */}
-          <Field label="Task">
-            <textarea
-              className="agent-input"
-              value={task}
-              onChange={(e) => setTask(e.target.value)}
-              placeholder="e.g. Open Safari, search for the weather in Tokyo, and read it back to me…"
-              rows={6}
-              style={textareaStyle}
-            />
-          </Field>
+          {/* Required inputs — one labeled field per template slot. Only shown
+              when the selected template declares required_inputs. */}
+          {requiredInputs.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}>
+              {requiredInputs.map((name) => {
+                const value = inputValues[name] ?? ''
+                const multiline = isMultilineInput(name)
+                return (
+                  <Field key={name} label={humanizeInput(name)}>
+                    {multiline ? (
+                      <textarea
+                        className="agent-input"
+                        value={value}
+                        onChange={(e) => setInputValue(name, e.target.value)}
+                        placeholder={`Enter ${humanizeInput(name).toLowerCase()}…`}
+                        rows={3}
+                        style={{ ...textareaStyle, minHeight: 72 }}
+                      />
+                    ) : (
+                      <input
+                        className="agent-input"
+                        value={value}
+                        onChange={(e) => setInputValue(name, e.target.value)}
+                        placeholder={`Enter ${humanizeInput(name).toLowerCase()}…`}
+                        style={{ ...selectStyle, cursor: 'text' }}
+                      />
+                    )}
+                  </Field>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Task — for templates with required inputs, the scaffold (with its
+              `{name}` placeholders) is the editable base; the field below shows
+              the substituted task that will actually launch. Templates without
+              required inputs keep the original single-textarea behavior. */}
+          {requiredInputs.length > 0 ? (
+            <>
+              <Field label="Task scaffold">
+                <textarea
+                  className="agent-input"
+                  value={task}
+                  onChange={(e) => setTask(e.target.value)}
+                  placeholder="Task scaffold with {placeholders}…"
+                  rows={6}
+                  style={textareaStyle}
+                />
+              </Field>
+              <Field label="Final task (preview)">
+                <textarea
+                  className="agent-input"
+                  value={finalTask}
+                  readOnly
+                  rows={6}
+                  style={{ ...textareaStyle, opacity: 0.85, cursor: 'default' }}
+                />
+                <span style={hintStyle}>
+                  Filled inputs are substituted into the scaffold. This is what launches the run.
+                </span>
+              </Field>
+            </>
+          ) : (
+            <Field label="Task">
+              <textarea
+                className="agent-input"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                placeholder="e.g. Open Safari, search for the weather in Tokyo, and read it back to me…"
+                rows={6}
+                style={textareaStyle}
+              />
+            </Field>
+          )}
 
           {/* Pinned references + Model side by side */}
           <div

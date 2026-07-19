@@ -89,6 +89,9 @@ interface NavRailProps {
 // there). Returns null when nothing matches (e.g. an unknown route).
 function activeIdFor(pathname: string): ViewId | null {
   const seg = pathname.replace(/^\/+/, '').split('/')[0]
+  // Templates is a Runs sub-view (reached from the Runs sub-nav), so keep the
+  // "Runs" rail item lit while it's open — it has no rail icon of its own.
+  if (seg === 'templates') return 'runs'
   const match = ITEMS.find((item) => item.id === seg)
   return match ? match.id : null
 }

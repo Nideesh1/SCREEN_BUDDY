@@ -15,6 +15,7 @@ import Artifacts from './views/Artifacts'
 import Credentials from './views/Credentials'
 import Settings from './views/Settings'
 import Scheduled from './views/Scheduled'
+import Templates from './views/Templates'
 import ScheduleDetail from './views/ScheduleDetail'
 import ScheduleFireModal from './views/ScheduleFireModal'
 import { useScheduler } from './useScheduler'
@@ -101,6 +102,8 @@ function App() {
             <Route path="scheduled" element={<Scheduled />} />
             <Route path="scheduled/:id" element={<ScheduleDetail />} />
             <Route path="history" element={<History />} />
+            {/* Templates manager — a Runs sub-view alongside New / Scheduled / History. */}
+            <Route path="templates" element={<Templates />} />
             <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />
             <Route path="credentials" element={<Credentials />} />

@@ -74,11 +74,43 @@ export async function reconcileOrphanedRuns(): Promise<void> {
 // failures are logged and swallowed so backend registration can never block or
 // crash local set CRUD.
 
-// One template option for the "Link to template" picker.
-export interface SetTemplate {
+// The canonical run-template shape, field-for-field the backend contract
+// (snake_case). Templates are now per-user editable via the CRUD helpers below;
+// `GET /templates` auto-seeds the built-ins for a user with none. NewRun reads a
+// subset of these to prefill the launcher; the Templates manager edits them all.
+export interface Template {
   template_id: string
   name: string
+  task_scaffold: string
+  model: string
+  suggested_set_name: string
+  set_names: string[]
+  credential_target: string
+  required_inputs: string[]
+  builtin: boolean
+  created_at: string
+  updated_at: string
 }
+
+// One template option for the "Link to template" picker — a two-field subset of
+// the canonical Template. Kept as a narrow projection so picker callers (e.g.
+// PinnedLibrary) stay decoupled from the full shape.
+export type SetTemplate = Pick<Template, 'template_id' | 'name'>
+
+// Body accepted by POST /templates. Only name + task_scaffold are required; the
+// rest fall back to backend defaults when omitted.
+export interface CreateTemplateBody {
+  name: string
+  task_scaffold: string
+  model?: string
+  suggested_set_name?: string
+  credential_target?: string
+  set_names?: string[]
+  required_inputs?: string[]
+}
+
+// Fields patchable via PATCH /templates/{id} — any subset of the writable fields.
+export type TemplatePatch = Partial<CreateTemplateBody>
 
 // Fetch the user's run templates for the create-set "Link to template" picker.
 // Payload may be a bare array or { templates: [] } (same shape NewRun consumes).
@@ -104,6 +136,76 @@ export async function fetchTemplates(): Promise<SetTemplate[]> {
     console.warn('[sets] GET /templates error', err)
     return []
   }
+}
+
+// ---- Template CRUD (owner-scoped /templates) ------------------------------
+// Full management client for the per-user run templates the Templates manager
+// edits. Same bearer auth + CU_BACKEND base as every other backend call. Unlike
+// the best-effort mirror helpers above, these THROW on failure so the manager
+// UI can surface an error and roll back its optimistic state. The picker-lite
+// `fetchTemplates` above stays as-is for callers that only need id + name.
+
+// Shared JSON headers (bearer auth + content-type) for template write calls.
+function templateJsonHeaders(): Record<string, string> {
+  return { ...authHeaders(), 'content-type': 'application/json' }
+}
+
+// Throw a readable, status-carrying error for any non-2xx template response.
+async function ensureTemplateOk(resp: Response, what: string): Promise<void> {
+  if (!resp.ok) {
+    throw new Error(`${what} failed (HTTP ${resp.status})`)
+  }
+}
+
+// GET /templates → Template[] (full shape; auto-seeds built-ins when the user
+// has none). Payload may be a bare array or `{ templates: [] }`.
+export async function listTemplates(): Promise<Template[]> {
+  const resp = await fetch(`${CU_BACKEND}/templates`, { headers: authHeaders() })
+  await ensureTemplateOk(resp, 'List templates')
+  const data = await resp.json()
+  return Array.isArray(data) ? (data as Template[]) : ((data.templates ?? []) as Template[])
+}
+
+// POST /templates → Template
+export async function createTemplate(body: CreateTemplateBody): Promise<Template> {
+  const resp = await fetch(`${CU_BACKEND}/templates`, {
+    method: 'POST',
+    headers: templateJsonHeaders(),
+    body: JSON.stringify(body),
+  })
+  await ensureTemplateOk(resp, 'Create template')
+  return (await resp.json()) as Template
+}
+
+// PATCH /templates/{id} → Template
+export async function updateTemplate(id: string, patch: TemplatePatch): Promise<Template> {
+  const resp = await fetch(`${CU_BACKEND}/templates/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: templateJsonHeaders(),
+    body: JSON.stringify(patch),
+  })
+  await ensureTemplateOk(resp, 'Update template')
+  return (await resp.json()) as Template
+}
+
+// DELETE /templates/{id} → 204
+export async function deleteTemplate(id: string): Promise<void> {
+  const resp = await fetch(`${CU_BACKEND}/templates/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  await ensureTemplateOk(resp, 'Delete template')
+}
+
+// POST /templates/seed → Template[] (idempotent — restores the built-in set).
+export async function seedTemplates(): Promise<Template[]> {
+  const resp = await fetch(`${CU_BACKEND}/templates/seed`, {
+    method: 'POST',
+    headers: templateJsonHeaders(),
+  })
+  await ensureTemplateOk(resp, 'Seed templates')
+  const data = await resp.json()
+  return Array.isArray(data) ? (data as Template[]) : ((data.templates ?? []) as Template[])
 }
 
 // Register (upsert) a local pinned set with the backend registry so a dispatched

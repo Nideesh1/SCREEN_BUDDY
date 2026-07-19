@@ -4,12 +4,13 @@ import { useLocation, useNavigate } from 'react-router-dom'
 // Scheduled (future), and History (past). Rendered at the top of each so the
 // group reads as one area. Route-aware: the active tab derives from the current
 // path prefix (so /scheduled/:id keeps "Scheduled" lit).
-type TabId = 'runs' | 'scheduled' | 'history'
+type TabId = 'runs' | 'scheduled' | 'history' | 'templates'
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'runs', label: 'New run' },
   { id: 'scheduled', label: 'Scheduled' },
   { id: 'history', label: 'History' },
+  { id: 'templates', label: 'Templates' },
 ]
 
 function activeTab(pathname: string): TabId {
