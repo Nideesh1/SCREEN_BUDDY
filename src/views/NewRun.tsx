@@ -98,6 +98,39 @@ function isMultilineInput(name: string): boolean {
   return /item|address|list|note|detail|desc/i.test(name)
 }
 
+// Every `{token}` placeholder actually present in the scaffold, in scaffold
+// order, de-duplicated. This is the source of truth for which fields to render.
+function scaffoldPlaceholders(scaffold: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const re = /\{(\w+)\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(scaffold)) !== null) {
+    const name = m[1]
+    if (!seen.has(name)) {
+      seen.add(name)
+      out.push(name)
+    }
+  }
+  return out
+}
+
+// The full set of variables to prompt for: placeholders present in the scaffold
+// (in scaffold order) UNIONed with any declared required inputs that aren't in
+// the scaffold, de-duplicated. Drives both the form fields and the "has
+// variables?" condition.
+function mergeTemplateVars(scaffold: string, requiredInputs: string[]): string[] {
+  const out = scaffoldPlaceholders(scaffold)
+  const seen = new Set(out)
+  for (const name of requiredInputs) {
+    if (!seen.has(name)) {
+      seen.add(name)
+      out.push(name)
+    }
+  }
+  return out
+}
+
 interface PinnedSet {
   id: string
   name: string
@@ -191,12 +224,17 @@ function NewRun() {
   }, [])
 
   const template = templates.find((t) => t.id === templateId)
-  const requiredInputs = template?.requiredInputs ?? []
 
-  // The task that actually launches the run: when the template has required
-  // inputs we substitute their values into the scaffold's `{name}` placeholders;
+  // The variables to prompt for: every `{token}` placeholder present in the
+  // scaffold (`task` holds the scaffold source), UNIONed with the template's
+  // declared required inputs, in scaffold order first. Drives the form fields
+  // and the "this template has variables" branch below.
+  const templateVars = mergeTemplateVars(task, template?.requiredInputs ?? [])
+
+  // The task that actually launches the run: when the template has variables we
+  // substitute their values into the scaffold's `{name}` placeholders;
   // otherwise the raw task text is used verbatim (unchanged behavior).
-  const finalTask = requiredInputs.length > 0 ? substituteInputs(task, inputValues) : task
+  const finalTask = templateVars.length > 0 ? substituteInputs(task, inputValues) : task
 
   // Update a single required-input field.
   const setInputValue = useCallback((name: string, value: string) => {
@@ -387,11 +425,12 @@ function NewRun() {
             )}
           </Field>
 
-          {/* Required inputs — one labeled field per template slot. Only shown
-              when the selected template declares required_inputs. */}
-          {requiredInputs.length > 0 && (
+          {/* Template variables — one labeled field per `{token}` in the
+              scaffold (unioned with declared required_inputs). Only shown when
+              the selected template actually has variables. */}
+          {templateVars.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}>
-              {requiredInputs.map((name) => {
+              {templateVars.map((name) => {
                 const value = inputValues[name] ?? ''
                 const multiline = isMultilineInput(name)
                 return (
@@ -420,35 +459,23 @@ function NewRun() {
             </div>
           )}
 
-          {/* Task — for templates with required inputs, the scaffold (with its
-              `{name}` placeholders) is the editable base; the field below shows
-              the substituted task that will actually launch. Templates without
-              required inputs keep the original single-textarea behavior. */}
-          {requiredInputs.length > 0 ? (
-            <>
-              <Field label="Task scaffold">
-                <textarea
-                  className="agent-input"
-                  value={task}
-                  onChange={(e) => setTask(e.target.value)}
-                  placeholder="Task scaffold with {placeholders}…"
-                  rows={6}
-                  style={textareaStyle}
-                />
-              </Field>
-              <Field label="Final task (preview)">
-                <textarea
-                  className="agent-input"
-                  value={finalTask}
-                  readOnly
-                  rows={6}
-                  style={{ ...textareaStyle, opacity: 0.85, cursor: 'default' }}
-                />
-                <span style={hintStyle}>
-                  Filled inputs are substituted into the scaffold. This is what launches the run.
-                </span>
-              </Field>
-            </>
+          {/* Task — for templates WITH variables we show a single read-only
+              preview of the substituted final task (what actually launches); the
+              per-variable fields above are the only editable inputs. Templates
+              without variables keep the original single editable textarea. */}
+          {templateVars.length > 0 ? (
+            <Field label="Final task (preview)">
+              <textarea
+                className="agent-input"
+                value={finalTask}
+                readOnly
+                rows={6}
+                style={{ ...textareaStyle, opacity: 0.85, cursor: 'default' }}
+              />
+              <span style={hintStyle}>
+                Filled inputs are substituted into the scaffold. This is what launches the run.
+              </span>
+            </Field>
           ) : (
             <Field label="Task">
               <textarea
