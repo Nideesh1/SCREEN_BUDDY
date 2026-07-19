@@ -321,6 +321,16 @@ function NewRun() {
   const canSchedule =
     finalTask.trim().length > 0 && scheduleName.trim().length > 0 && effectiveCron.length > 0 && !scheduling
 
+  // What's still missing, so the disabled button explains itself instead of
+  // just greying out (a valid cron alone isn't enough — a schedule needs a task
+  // and a name too).
+  const scheduleMissing = [
+    finalTask.trim().length === 0 && 'a task',
+    scheduleName.trim().length === 0 && 'a schedule name',
+    effectiveCron.length === 0 && 'a frequency',
+  ].filter(Boolean) as string[]
+  const startMissing = finalTask.trim().length === 0 ? ['a task'] : []
+
   // ── BYOK gate ──────────────────────────────────────────────────────────────
   // Still resolving whether a key exists: hold the layout with a quiet spinner.
   if (hasKey === null) {
@@ -602,7 +612,16 @@ function NewRun() {
           )}
 
           {/* Start / Create schedule */}
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 'var(--sp-3)' }}>
+            <span style={hintStyle}>
+              {scheduleMode
+                ? scheduleMissing.length > 0
+                  ? `Still needed to schedule: ${scheduleMissing.join(', ')}.`
+                  : ''
+                : startMissing.length > 0
+                  ? `Still needed to start: ${startMissing.join(', ')}.`
+                  : ''}
+            </span>
             {scheduleMode ? (
               <Button
                 variant="primary"
