@@ -102,8 +102,19 @@ export function useGoogleAuth() {
       const codeVerifier = randomVerifier()
       const codeChallenge = await challengeFromVerifier(codeVerifier)
 
-      // Build OAuth URL with actual port
-      const redirectUri = `http://localhost:${port}/callback`
+      // Build OAuth URL with actual port.
+      //
+      // 127.0.0.1, NOT "localhost". tauri-plugin-oauth binds the callback
+      // server to IPv4 127.0.0.1 only, but Windows resolves "localhost" to ::1
+      // FIRST — so the browser opened an IPv6 connection to a port nothing was
+      // listening on, the redirect was refused, and login hung forever waiting
+      // on a callback that could never arrive. macOS resolves localhost to
+      // 127.0.0.1 first, which is why this only ever broke on Windows.
+      //
+      // Naming the loopback address explicitly removes the resolver from the
+      // equation on every platform. Google treats http://127.0.0.1:<port> as a
+      // loopback redirect, so the OAuth client must list it (see below).
+      const redirectUri = `http://127.0.0.1:${port}/callback`
       const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scopes}&access_type=offline&prompt=consent&code_challenge=${codeChallenge}&code_challenge_method=S256`
 
       // Open browser for OAuth

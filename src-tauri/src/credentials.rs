@@ -2,17 +2,24 @@
 //
 // SECURITY MODEL:
 // The vault is an AES-256-GCM encrypted file (`credentials.enc`). The 32-byte
-// master key is, on macOS, stored in the login Keychain (via the `keyring`
-// crate) and its first use per app run is gated behind a Touch ID / biometric
-// prompt (via `robius-authentication`). The unlocked key is then cached in
+// master key is stored in the OS credential store — the login Keychain on
+// macOS, Credential Manager on Windows, both via the `keyring` crate — and its
+// first use per app run is gated behind a biometric prompt (Touch ID / Windows
+// Hello, via `robius-authentication`). The unlocked key is then cached in
 // memory for the rest of the session so the user is prompted at most once per
 // run — not on every credential operation.
 //
-// FALLBACK: if the Keychain or the biometric gate is unavailable (older macOS,
-// no enrolled biometrics, non-macOS, or any runtime error) we fall back to the
-// legacy on-disk key file at `app_data_dir/.cred_key` (chmod 0600 on unix), so
-// the vault keeps working and the build always compiles. We never hard-fail the
+// FALLBACK: if the credential store or the biometric gate is unavailable (older
+// OS, no enrolled biometrics, an unsupported platform, or any runtime error) we
+// fall back to the legacy on-disk key file at `app_data_dir/.cred_key`, so the
+// vault keeps working and the build always compiles. We never hard-fail the
 // vault just because the secure path is missing.
+//
+// The fallback is genuinely weaker: the master key sits in a plain file next to
+// the ciphertext it protects, and `restrict_perms` can only tighten it on unix
+// (chmod 0600) — on Windows it is a no-op and the file inherits the app-data
+// ACL. That is why Windows now takes the Credential Manager path rather than
+// dropping straight to the file key, which is what it did before.
 //
 // Passwords are returned ONLY through the non-command `lookup` helper (used by
 // the agent loop's `use_credential` tool to type a secret locally). The
@@ -36,9 +43,14 @@ const VAULT_FILE: &str = "credentials.enc";
 const ANTHROPIC_KEY_FILE: &str = "anthropic_key.enc";
 const NONCE_LEN: usize = 12;
 
-#[cfg(target_os = "macos")]
+/// Identifiers for the master-key entry in the OS credential store (macOS
+/// Keychain service/account; Windows Credential Manager target/username).
+/// Deliberately identical across platforms so the entry is recognisable, and
+/// deliberately NOT changed from the original macOS values — an existing macOS
+/// install must keep finding the key it already stored.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "com.screenbuddy.vault";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_ACCOUNT: &str = "vault-master-key";
 
 /// Session cache of the unlocked 32-byte master key. Populated on first vault
@@ -89,27 +101,32 @@ fn master_key(app: &AppHandle) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-#[cfg(target_os = "macos")]
+/// macOS and Windows both have a real OS credential store, so both take the
+/// secure path and only degrade to the file key on error.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn acquire_key(app: &AppHandle) -> Result<[u8; 32], String> {
     match keychain_key() {
         Ok(key) => Ok(key),
         Err(e) => {
             // Never hard-fail: degrade to the legacy file key so the vault works.
-            log::warn!("keychain master key unavailable ({e}); using file key fallback");
+            log::warn!("OS credential store master key unavailable ({e}); using file key fallback");
             file_key(app)
         }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Everything else (Linux/BSD) has no store wired up here, so the file key is
+/// the only option.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn acquire_key(app: &AppHandle) -> Result<[u8; 32], String> {
     file_key(app)
 }
 
-/// macOS: read (or create) the master key in the login Keychain, gated behind a
-/// one-time biometric prompt. Any failure here is surfaced to the caller, which
-/// falls back to the file key — so this never panics the vault.
-#[cfg(target_os = "macos")]
+/// Read (or create) the master key in the OS credential store — the login
+/// Keychain on macOS, Credential Manager on Windows — gated behind a one-time
+/// biometric prompt. Any failure here is surfaced to the caller, which falls
+/// back to the file key, so this never panics the vault.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_key() -> Result<[u8; 32], String> {
     use base64::Engine;
 
@@ -146,11 +163,18 @@ fn keychain_key() -> Result<[u8; 32], String> {
     }
 }
 
-/// macOS biometric gate. Succeeds (Ok) when the user authenticates; returns Err
-/// when biometrics are unavailable or the user cancels — the caller then decides
-/// whether to fall back. We allow device-password fallback so machines without an
-/// enrolled fingerprint can still unlock via the OS auth sheet.
-#[cfg(target_os = "macos")]
+/// Biometric gate — Touch ID on macOS, Windows Hello on Windows. Succeeds (Ok)
+/// when the user authenticates; returns Err when biometrics are unavailable or
+/// the user cancels, and the caller then decides whether to fall back. We allow
+/// device-password fallback so machines without an enrolled fingerprint can
+/// still unlock via the OS auth sheet.
+///
+/// The `Text` value below is already cross-platform (it carries an arm per
+/// platform), so nothing in the body is macOS-specific. Note that the Windows
+/// backend of `robius-authentication` IGNORES the `Policy` argument — Windows
+/// Hello decides which factors it will accept — so `PolicyBuilder` only
+/// actually governs the Apple path.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn biometric_gate() -> Result<(), String> {
     use robius_authentication::{
         AndroidText, BiometricStrength, Context, PolicyBuilder, Text, WindowsText,
@@ -182,7 +206,8 @@ fn biometric_gate() -> Result<(), String> {
 }
 
 /// Load the 32-byte on-disk master key, generating + persisting it on first use.
-/// This is the cross-platform fallback (and the only path on non-macOS).
+/// This is the cross-platform fallback, used when the OS credential store is
+/// unavailable and as the only path on platforms with no store wired up.
 fn file_key(app: &AppHandle) -> Result<[u8; 32], String> {
     let path = app_data(app)?.join(KEY_FILE);
     if path.exists() {
@@ -212,6 +237,14 @@ fn restrict_perms(path: &PathBuf) -> Result<(), String> {
     fs::set_permissions(path, perms).map_err(|e| format!("chmod key: {e}"))
 }
 
+/// No-op off unix. On Windows there is no chmod equivalent, so the file simply
+/// inherits the ACL of the app-data directory (user-owned, but readable by any
+/// process running as that user, and by an administrator).
+///
+/// This is precisely why the Windows build must reach the Credential Manager
+/// path in `keychain_key` — this fallback cannot protect the key on its own.
+/// Tightening it further would mean a DACL/DPAPI pass, which is only worth doing
+/// if the fallback ever becomes the primary path on Windows.
 #[cfg(not(unix))]
 fn restrict_perms(_path: &PathBuf) -> Result<(), String> {
     Ok(())

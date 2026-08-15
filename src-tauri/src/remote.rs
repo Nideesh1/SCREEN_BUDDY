@@ -67,6 +67,19 @@ fn ws_url(backend: &str, token: &str) -> String {
     format!("{ws_base}/agent/listen?token={}", urlencoding::encode(token))
 }
 
+/// The same URL with the token query stripped, for logging.
+///
+/// The session token is a live bearer credential — it authenticates the WS AND
+/// doubles as the run's auth. Logging the full URL wrote it to stdout on every
+/// connect, so it landed in terminal scrollback, any redirected log file, and CI
+/// output. Log the endpoint, never the credential.
+fn ws_url_redacted(url: &str) -> &str {
+    match url.find("?token=") {
+        Some(i) => &url[..i],
+        None => url,
+    }
+}
+
 /// Emit the `remote://status` event so the UI indicator can reflect the link.
 fn emit_status(app: &AppHandle, connected: bool) {
     let _ = app.emit(EV_REMOTE_STATUS, json!({ "connected": connected }));
@@ -274,7 +287,7 @@ pub fn start_remote_listener(
     drop(guard);
 
     let url = ws_url(&backend, &token);
-    eprintln!("[remote] listener starting → {url}");
+    eprintln!("[remote] listener starting → {}", ws_url_redacted(&url));
     tauri::async_runtime::spawn(listen_loop(app, url, backend, token, cancel));
     Ok(())
 }

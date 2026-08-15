@@ -98,7 +98,12 @@ pub(crate) fn resolve_bin(name: &str) -> Result<PathBuf, String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "app executable has no parent dir".to_string())?;
-    let candidate = dir.join(name);
+    // Tauri strips the target triple from an `externalBin` entry but KEEPS the
+    // platform's executable extension, so the file next to the app is `ffmpeg`
+    // on macOS and `ffmpeg.exe` on Windows. Joining the bare name found nothing
+    // on Windows and reported the sidecar as missing even when it shipped.
+    // `EXE_SUFFIX` is "" on unix and ".exe" on Windows.
+    let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if candidate.is_file() {
         return Ok(candidate);
     }
@@ -108,6 +113,30 @@ pub(crate) fn resolve_bin(name: &str) -> Result<PathBuf, String> {
          (see src-tauri/binaries/SOURCE.md).",
         candidate.display()
     ))
+}
+
+/// Build a `Command` for a sidecar binary with the console window suppressed.
+///
+/// Every `Command::new` on Windows spawns a console for a console-subsystem
+/// binary, and ffmpeg/ffprobe are console binaries — so each invocation flashes
+/// a black window over the user's desktop. That is bad anywhere, but it is
+/// specifically corrupting here: ScreenBuddy is a computer-use agent that
+/// screenshots the screen, artifact thumbnailing runs ffprobe/ffmpeg per file,
+/// and a console flashing at the wrong moment lands *in the image the model
+/// sees* and gets reasoned about as if it were part of the UI.
+///
+/// `CREATE_NO_WINDOW` (0x0800_0000) suppresses it. No-op off Windows.
+///
+/// Shared with artifacts.rs, which drives the same two binaries for thumbnails.
+pub(crate) fn sidecar_command(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 /// Per-run staging dir under app data: `app_data_dir/video_staging/<rand>`.
@@ -129,7 +158,7 @@ fn staging_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Stage 1 — probe. Returns (duration_s, note). Rejects unreadable input early;
 /// warns (non-fatally) on very long / very large inputs.
 fn probe(ffprobe: &Path, path: &str) -> Result<(f32, Option<String>), String> {
-    let out = Command::new(ffprobe)
+    let out = sidecar_command(ffprobe)
         .args([
             "-v",
             "quiet",
@@ -184,7 +213,7 @@ fn probe(ffprobe: &Path, path: &str) -> Result<(f32, Option<String>), String> {
 /// 1:1 in order to the `pts_time` lines showinfo prints, so we zip them.
 fn run_extract(ffmpeg: &Path, path: &str, vf: &str, stage: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let pattern = stage.join("cand_%05d.png");
-    let out = Command::new(ffmpeg)
+    let out = sidecar_command(ffmpeg)
         .args([
             "-hide_banner",
             "-i",
@@ -528,15 +557,40 @@ pub async fn extract_frames_from_video(
 mod tests {
     use super::*;
 
-    /// The committed GPL sidecar binary for the host arch (used to both prove
-    /// resolution and to drive the real pipeline).
-    #[cfg(target_arch = "aarch64")]
+    /// The GPL sidecar binary for the host target (used to both prove
+    /// resolution and to drive the real pipeline). The name carries the Rust
+    /// target triple because that is how Tauri's `externalBin` resolves it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     const HOST_FFMPEG: &str = "ffmpeg-aarch64-apple-darwin";
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     const HOST_FFMPEG: &str = "ffmpeg-x86_64-apple-darwin";
+    #[cfg(target_os = "windows")]
+    const HOST_FFMPEG: &str = "ffmpeg-x86_64-pc-windows-msvc.exe";
+    // Catch-all so the test module still COMPILES off the two shipping targets
+    // (e.g. `cargo test` on Linux). Keying only on target_arch, as this used to,
+    // left `HOST_FFMPEG` undefined for any OS/arch pair not listed and failed
+    // the build rather than the assertion.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const HOST_FFMPEG: &str = "ffmpeg-x86_64-unknown-linux-gnu";
 
     fn bundled(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").join(name)
+    }
+
+    /// The sidecars are deliberately NOT committed (large + GPL — see
+    /// `.gitignore` and `scripts/fetch-ffmpeg.md`), so on a fresh clone they
+    /// are simply absent. These tests need a real binary, so skip rather than
+    /// fail: a red suite on checkout tells you nothing about your own code.
+    /// Returns true when the caller should bail out.
+    fn sidecar_missing() -> bool {
+        if bundled(HOST_FFMPEG).is_file() {
+            return false;
+        }
+        eprintln!(
+            "skipping: {} not present — fetch per scripts/fetch-ffmpeg.md",
+            HOST_FFMPEG
+        );
+        true
     }
 
     /// resolve_bin returns the binary sitting next to the current exe, and
@@ -546,16 +600,26 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let dir = exe.parent().unwrap();
 
-        // A name that surely exists on $PATH ("ls") but NOT next to the exe must
-        // still error — proving there is no $PATH fallback.
+        // A name that surely exists on PATH but NOT next to the exe must still
+        // error — proving there is no PATH fallback. ("ls" is not on a stock
+        // Windows PATH, so pick the host's equivalent.) This half needs no
+        // sidecar, so it runs even on a fresh clone — hence the skip check sits
+        // BELOW it rather than at the top of the test.
+        let on_path = if cfg!(target_os = "windows") { "cmd" } else { "ls" };
         assert!(
-            resolve_bin("ls").is_err(),
-            "resolve_bin must not fall back to $PATH"
+            resolve_bin(on_path).is_err(),
+            "resolve_bin must not fall back to PATH"
         );
 
+        if sidecar_missing() {
+            return;
+        }
+
         // Drop a real binary next to the exe under the stripped name and confirm
-        // resolve_bin returns exactly that path.
-        let target = dir.join("sidecar_probe_ffmpeg");
+        // resolve_bin returns exactly that path. The name we CREATE must carry
+        // the platform's exe extension, because that is what resolve_bin looks
+        // for — it is handed the bare stem.
+        let target = dir.join(format!("sidecar_probe_ffmpeg{}", std::env::consts::EXE_SUFFIX));
         std::fs::copy(bundled(HOST_FFMPEG), &target).unwrap();
         let resolved = resolve_bin("sidecar_probe_ffmpeg").unwrap();
         assert_eq!(resolved, target);
@@ -566,9 +630,12 @@ mod tests {
     /// pipeline: generate a tiny clip with it, then probe + sample real frames.
     #[test]
     fn bundled_ffmpeg_drives_probe_and_sample() {
+        if sidecar_missing() {
+            return;
+        }
         let ffmpeg = bundled(HOST_FFMPEG);
         let ffprobe = bundled(&HOST_FFMPEG.replace("ffmpeg", "ffprobe"));
-        assert!(ffmpeg.is_file() && ffprobe.is_file(), "sidecars committed");
+        assert!(ffmpeg.is_file() && ffprobe.is_file(), "sidecars present");
 
         let tmp = std::env::temp_dir().join(format!("sb_vid_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();

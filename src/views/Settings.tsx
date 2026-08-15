@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { open } from '@tauri-apps/plugin-shell'
 import type { LayoutContext } from '../Layout'
-import { safeInvoke } from '../lib'
+import { safeInvoke, IS_WINDOWS } from '../lib'
 import { Card, Button, Badge, Spinner } from '../ui'
 
 const SETTINGS_DEEP_LINK = {
@@ -23,15 +23,17 @@ type PermLoad =
   | { state: 'unavailable'; message: string }
   | { state: 'ready'; perms: Permissions }
 
-// Settings view — read-mostly account/model/storage info plus a live macOS
-// permission check via check_permissions (wrapped; degrades if not yet wired).
+// Settings view — read-mostly account/model/storage info plus a live permission
+// check via check_permissions (wrapped; degrades if not yet wired). The
+// permission rows are macOS-only in substance; Windows renders an explanation
+// instead (see the Permissions card below).
 function Settings() {
   // Account info is provided by the router Layout via <Outlet context>.
   const { userEmail, onSignOut } = useOutletContext<LayoutContext>()
   const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
 
   // The signed-in user's stable Google id (the JWT `sub`). This is the
-  // `user_id` openfang / the remote API must target to drive THIS Mac.
+  // `user_id` openfang / the remote API must target to drive THIS machine.
   const userId = (() => {
     try {
       const t = localStorage.getItem('screen_buddy_session_token')
@@ -101,7 +103,7 @@ function Settings() {
       </Card>
 
       <Card title="Storage">
-        <Row label="Screenshots" value="Stored on this Mac" />
+        <Row label="Screenshots" value="Stored on this computer" />
         <div style={{ marginTop: 'var(--sp-3)' }}>
           <Button variant="ghost" size="sm" disabled title="Coming soon">
             Clear all
@@ -129,7 +131,28 @@ function Settings() {
           </p>
         )}
 
-        {perm.state === 'ready' && (
+        {/* Windows has no consent gate for screen capture or input synthesis, so
+            the two PermRows below (and their System Settings deep links) are
+            macOS-only. Showing them here would present two permanently-granted
+            rows plus relaunch instructions that do nothing. What actually limits
+            the agent on Windows is integrity level, which is not grantable — so
+            we state that instead. See src-tauri/src/permissions.rs. */}
+        {perm.state === 'ready' && IS_WINDOWS && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+            <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)', margin: 0 }}>
+              Windows needs no permission grants — ScreenBuddy can capture the screen and
+              control the mouse and keyboard straight away.
+            </p>
+            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)', margin: 0 }}>
+              One limit: it cannot control windows that are running as administrator
+              (Task Manager, an admin terminal) or User Account Control prompts. Clicks
+              sent there are silently ignored by Windows, so keep those out of a run's
+              path. Running ScreenBuddy as administrator is not recommended.
+            </p>
+          </div>
+        )}
+
+        {perm.state === 'ready' && !IS_WINDOWS && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
             <PermRow
               label="Accessibility"
@@ -232,7 +255,7 @@ function AnthropicKeySection() {
         ScreenBuddy runs on YOUR Anthropic key (billed to you) — a validated key is
         <strong style={{ color: 'var(--sb-text)' }}> required</strong> to start runs.
         Your key is validated and used by sending it <strong style={{ color: 'var(--sb-text)' }}>directly to Anthropic</strong>;
-        it is stored encrypted on this Mac and never sent to our servers.
+        it is stored encrypted on this computer and never sent to our servers.
       </p>
 
       {hasKey === null && (
@@ -316,7 +339,7 @@ function TelegramSection() {
   return (
     <Card title="Telegram">
       <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', margin: '0 0 var(--sp-4)', lineHeight: 1.5 }}>
-        Lets you start runs from a Telegram chat later. Stored locally on this Mac only.
+        Lets you start runs from a Telegram chat later. Stored locally on this computer only.
       </p>
 
       <Field label="Bot token">

@@ -650,7 +650,7 @@ function PinnedLibrary() {
               />
             </div>
             <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-              Runs entirely on your Mac — the video is never uploaded.
+              Runs entirely on your computer — the video is never uploaded.
             </span>
           </div>
         </Card>
