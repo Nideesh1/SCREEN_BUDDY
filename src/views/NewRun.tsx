@@ -392,7 +392,7 @@ function NewRun() {
             marginRight: 'auto',
           }}
         >
-          Pick a template, describe the task, and ScreenBuddy will carry it out on this Mac.
+          Pick a template, describe the task, and ScreenBuddy will carry it out on this computer.
         </p>
       </div>
 
@@ -743,7 +743,7 @@ function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
           }}
         >
           ScreenBuddy runs on your own Anthropic API key — it's stored encrypted on
-          this Mac and sent directly to Anthropic, never to our servers.
+          this computer and sent directly to Anthropic, never to our servers.
         </p>
       </div>
 

@@ -8,11 +8,27 @@
 // frontmost app we also activate the NSApplication
 // (`activateIgnoringOtherApps:`), which is the app-level equivalent of a Dock
 // click. The window ops below still run everywhere for the show/unminimize.
+//
+// WINDOWS: no equivalent block is needed and none should be added. Windows
+// restricts which process may take the foreground, but tao (the windowing layer
+// under Tauri) already handles that inside `set_focus()`: it calls
+// `SetForegroundWindow` and, if that is refused, falls back to a documented hack
+// that synthesizes a left-ALT press/release through `SendInput` to acquire
+// foreground permission. Hand-rolling `SetForegroundWindow` +
+// `AttachThreadInput` here would only duplicate that.
+//
+// The ALT synthesis is worth knowing about for THIS app specifically: we are a
+// computer-use agent that drives the keyboard through `SendInput` ourselves, and
+// a stray ALT keystroke lands in whatever window currently has focus — where it
+// can open a menu bar. So `bring_to_front` should be called between agent
+// actions, not concurrently with one. Today's only caller (a scheduled run
+// firing, via the frontend) satisfies that.
 
 use tauri::{AppHandle, Manager};
 
 /// Raise, unminimize, show, and focus the main window, activating the app on
-/// macOS so it becomes the frontmost application even from the background.
+/// macOS so it becomes the frontmost application even from the background. On
+/// Windows and Linux `set_focus()` is sufficient on its own (see module docs).
 #[tauri::command]
 pub fn bring_to_front(app: AppHandle) -> Result<(), String> {
     let window = app

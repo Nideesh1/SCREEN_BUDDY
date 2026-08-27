@@ -1,5 +1,14 @@
 // Shared helpers for the ScreenBuddy shell + views.
 
+// Host platform, for the handful of places the UI must differ (the Permissions
+// card, which is macOS-only in substance). Read from the webview UA rather than
+// @tauri-apps/plugin-os so this needs no new plugin, Rust registration, or
+// capability entry: WebView2 always reports "Windows" and WKWebView never does.
+//
+// Prefer platform-NEUTRAL copy over branching on this. Most user-facing strings
+// say "this computer" precisely so they read correctly on every build.
+export const IS_WINDOWS = /Windows/.test(navigator.userAgent)
+
 // The Computer-Use backend (runs history/telemetry). Same env var the auth hook
 // uses so a single override points everything at one backend.
 export const CU_BACKEND =

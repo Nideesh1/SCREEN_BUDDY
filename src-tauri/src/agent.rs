@@ -55,7 +55,31 @@ const MAX_TOKENS: u32 = 4096;
 /// zoom action cover settled-context and on-demand-detail respectively.
 const KEEP_RECENT_IMAGES: usize = 2;
 
-const SYSTEM_PROMPT: &str = "You are ScreenBuddy, a computer-use agent operating a macOS desktop on the \
+/// Host OS as the model should think of it, plus the accelerator modifier that
+/// actually works there. Getting this wrong is not cosmetic: the model picks
+/// shortcuts from it, and a model told "macOS" reaches for cmd+L, Spotlight and
+/// the Dock — none of which exist on Windows.
+#[cfg(target_os = "windows")]
+const HOST_OS: (&str, &str) = ("Windows", "ctrl");
+#[cfg(target_os = "macos")]
+const HOST_OS: (&str, &str) = ("macOS", "cmd");
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const HOST_OS: (&str, &str) = ("Linux", "ctrl");
+
+/// Build the system prompt for the host platform. Was a `const &str` hardcoded
+/// to macOS; it is a function now only so the OS name and modifier can vary.
+fn system_prompt() -> String {
+    let (os, modifier) = HOST_OS;
+    format!(
+        "{}\n\nYou are operating a {os} desktop. Use {os}-native conventions: the \
+keyboard shortcut modifier is `{modifier}` (for example `{modifier}+c` to copy, \
+`{modifier}+v` to paste), and application menus, window controls and file paths follow \
+{os} conventions. Do not use shortcuts or UI affordances from another operating system.",
+        SYSTEM_PROMPT_BASE
+    )
+}
+
+const SYSTEM_PROMPT_BASE: &str = "You are ScreenBuddy, a computer-use agent operating a desktop on the \
 user's behalf. You see the screen via screenshots and act through the `computer` tool \
 (mouse, keyboard, scroll, clipboard). Coordinates are pixels in the most recent \
 screenshot, origin top-left. Take a screenshot before acting when you are unsure of the \
@@ -1109,7 +1133,11 @@ async fn run_agent(
 
         let body = json!({
             "model": model,
-            "system": SYSTEM_PROMPT,
+            // Rebuilt per turn rather than hoisted: it is a single `format!` of
+            // a fixed string, invisible next to a screenshot upload, and it
+            // serializes byte-identically every turn so the prompt-cache prefix
+            // still hits.
+            "system": system_prompt(),
             "messages": messages,
             "tools": [tool, cred_tool],
             "max_tokens": MAX_TOKENS,

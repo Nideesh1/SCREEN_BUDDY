@@ -14,6 +14,8 @@ FFmpeg's license and cite the exact source below.
 | `ffprobe-aarch64-apple-darwin` | arm64  | 8.1 | same |
 | `ffmpeg-x86_64-apple-darwin`   | x86_64 | 8.0 | `--enable-gpl` (GPLv3+), **no** `--enable-nonfree` |
 | `ffprobe-x86_64-apple-darwin`  | x86_64 | 8.0 | same |
+| `ffmpeg-x86_64-pc-windows-msvc.exe`  | x86_64 (Windows) | master `N-126168-gb16b5f2a01` | `--enable-gpl --enable-version3`, **no** `--enable-nonfree` |
+| `ffprobe-x86_64-pc-windows-msvc.exe` | x86_64 (Windows) | same | same |
 
 These are **GPL** static builds (`--enable-gpl --enable-version3`). They are
 deliberately NOT `--enable-nonfree` builds — a `--enable-nonfree` FFmpeg may not
@@ -26,6 +28,11 @@ directory is FFmpeg's `COPYING.GPLv3` (the effective license of these builds).
   `ffprobe81arm.zip` (FFmpeg 8.1, GPL, static).
 - **x86_64 (Intel):** https://www.osxexperts.net/ — `ffmpeg80intel.zip`,
   `ffprobe80intel.zip` (FFmpeg 8.0, GPL, static).
+- **x86_64 (Windows):** https://github.com/BtbN/FFmpeg-Builds —
+  `ffmpeg-master-latest-win64-gpl.zip` from the `latest` release (GPL, static,
+  cross-built with mingw-w64). Chosen over the `-lgpl` variant to match the
+  macOS builds' GPL feature set, and it carries `--disable-libfdk-aac`, so it
+  is verifiably not a nonfree build.
 
 Verify before shipping:
 

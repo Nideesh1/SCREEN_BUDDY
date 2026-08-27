@@ -49,7 +49,7 @@ function App() {
     reconcileOrphanedRuns()
   }, [isAuthenticated])
 
-  // Request macOS notification permission once after auth so the Rust-sent
+  // Request OS notification permission once after auth so the Rust-sent
   // run-complete / run-failed notifications can actually display. Best-effort.
   useEffect(() => {
     if (!isAuthenticated) return

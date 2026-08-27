@@ -25,7 +25,6 @@ use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Mouse, Settings,
 };
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Scroll direction, matching computer.py's `scroll_direction` enum.
@@ -291,29 +290,35 @@ impl Computer {
         Ok(())
     }
 
-    // ---- clipboard (pbcopy/pbpaste, like computer.py) ---------------------
+    // ---- clipboard --------------------------------------------------------
+    //
+    // computer.py shells out to `pbcopy`/`pbpaste`, and so did we. Those are
+    // macOS-only binaries: on Windows the spawn fails and every clipboard
+    // action returns an error. `arboard` talks to the native clipboard on all
+    // three platforms (Win32 clipboard / NSPasteboard / X11+Wayland), so the
+    // behaviour is identical and we drop two subprocess spawns per action.
+    //
+    // A fresh `Clipboard` per call is deliberate: the Win32 clipboard is a
+    // global the OS expects you to open, touch, and close promptly, and holding
+    // a long-lived handle across the agent loop's threads invites contention
+    // with whatever app we're driving.
 
     pub fn read_clipboard(&self) -> R<String> {
-        let out = Command::new("pbpaste")
-            .output()
-            .map_err(|e| InputError::Exec(e.to_string()))?;
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        let mut cb = arboard::Clipboard::new().map_err(|e| InputError::Exec(e.to_string()))?;
+        match cb.get_text() {
+            Ok(s) => Ok(s),
+            // An empty or non-text clipboard is a normal state, not a failure —
+            // report it as empty so the model can carry on instead of eating a
+            // tool error.
+            Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+            Err(e) => Err(InputError::Exec(e.to_string())),
+        }
     }
 
     pub fn write_clipboard(&self, text: &str) -> R<()> {
-        use std::io::Write;
-        let mut child = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| InputError::Exec(e.to_string()))?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| InputError::Exec("pbcopy stdin".into()))?
-            .write_all(text.as_bytes())
-            .map_err(|e| InputError::Exec(e.to_string()))?;
-        child.wait().map_err(|e| InputError::Exec(e.to_string()))?;
-        Ok(())
+        let mut cb = arboard::Clipboard::new().map_err(|e| InputError::Exec(e.to_string()))?;
+        cb.set_text(text.to_owned())
+            .map_err(|e| InputError::Exec(e.to_string()))
     }
 
     pub fn wait(&self, seconds: f64) {
@@ -328,7 +333,18 @@ fn map_key(name: &str) -> R<Key> {
     let n = name.trim().to_lowercase();
     let k = match n.as_str() {
         "control" | "ctrl" => Key::Control,
-        "cmd" | "command" | "super" | "meta" | "win" | "windows" => Key::Meta,
+        // "cmd"/"command" is a macOS concept. Models are heavily primed on
+        // macOS computer-use and still emit "cmd+c" even when told the host is
+        // Windows, so translate it to the platform's real accelerator modifier
+        // rather than pressing it literally. On Windows `Key::Meta` is the
+        // Start-menu key: taking "cmd+c" at face value there pops the Start
+        // menu and silently drops the copy.
+        #[cfg(target_os = "windows")]
+        "cmd" | "command" => Key::Control,
+        #[cfg(not(target_os = "windows"))]
+        "cmd" | "command" => Key::Meta,
+        // An explicit request for the OS/super key is always honoured verbatim.
+        "super" | "meta" | "win" | "windows" => Key::Meta,
         "alt" => Key::Alt,
         "option" | "opt" => Key::Option,
         "shift" => Key::Shift,
@@ -381,7 +397,7 @@ fn map_key(name: &str) -> R<Key> {
         // TSM and is left untouched.
         s if s.chars().count() == 1 => {
             let c = s.chars().next().unwrap().to_ascii_lowercase();
-            match char_to_macos_keycode(c) {
+            match char_to_native_keycode(c) {
                 Some(code) => Key::Other(code as u32),
                 // No raw keycode for this char (e.g. a non-ASCII char in a
                 // chord). Fall back to the previous behaviour rather than
@@ -396,17 +412,64 @@ fn map_key(name: &str) -> R<Key> {
     Ok(k)
 }
 
-/// Map an ASCII character to its US-layout ("ANSI") macOS virtual keycode
-/// (`kVK_ANSI_*` / CGKeyCode). Returns `None` for characters we have no fixed
-/// keycode for.
+/// Map an ASCII character to the raw key code `Key::Other` expects on THIS
+/// platform, or `None` if we have no fixed code for it.
 ///
-/// This exists to keep the key-CHORD path off Apple's Text Input Source (TSM)
-/// APIs, which assert main-thread execution and crash when enigo resolves a
-/// `Key::Unicode` off the main thread. See the call site in `map_key`.
+/// `Key::Other(u32)` is not portable data — enigo documents it as "a keysym on
+/// Linux, a Virtual-Key on Windows, a CGKeyCode on macOS". Feeding one
+/// platform's table to another compiles cleanly and then presses the wrong
+/// keys: the macOS code for 'v' is 9, and Virtual-Key 9 on Windows is TAB, so
+/// `ctrl+v` pasted nothing and sent Ctrl+Tab instead. Hence one table per
+/// platform behind a single dispatcher.
 ///
 /// Only the base (unshifted) character of each physical key is listed; a chord
 /// carries shift as its own modifier token, so callers must lowercase letters
 /// before lookup.
+fn char_to_native_keycode(c: char) -> Option<u16> {
+    #[cfg(target_os = "windows")]
+    {
+        char_to_windows_vk(c)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        char_to_macos_keycode(c)
+    }
+}
+
+/// Windows US-layout Virtual-Key codes (`VK_*`, winuser.h).
+///
+/// Letters and digits are the ASCII value itself (`VK_A` == 0x41 == b'A'); the
+/// punctuation keys are the `VK_OEM_*` block, which is defined against the US
+/// layout exactly like the macOS `kVK_ANSI_*` table below.
+#[cfg(target_os = "windows")]
+fn char_to_windows_vk(c: char) -> Option<u16> {
+    let code: u16 = match c {
+        'a'..='z' => (c as u16) - ('a' as u16) + 0x41, // VK_A..VK_Z
+        '0'..='9' => (c as u16) - ('0' as u16) + 0x30, // VK_0..VK_9
+        ' ' => 0x20,                                   // VK_SPACE
+        ';' => 0xBA,                                   // VK_OEM_1
+        '=' => 0xBB,                                   // VK_OEM_PLUS
+        ',' => 0xBC,                                   // VK_OEM_COMMA
+        '-' => 0xBD,                                   // VK_OEM_MINUS
+        '.' => 0xBE,                                   // VK_OEM_PERIOD
+        '/' => 0xBF,                                   // VK_OEM_2
+        '`' => 0xC0,                                   // VK_OEM_3
+        '[' => 0xDB,                                   // VK_OEM_4
+        '\\' => 0xDC,                                  // VK_OEM_5
+        ']' => 0xDD,                                   // VK_OEM_6
+        '\'' => 0xDE,                                  // VK_OEM_7
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// macOS US-layout ("ANSI") virtual keycodes (`kVK_ANSI_*` / CGKeyCode).
+///
+/// This table also exists to keep the key-CHORD path off Apple's Text Input
+/// Source (TSM) APIs, which assert main-thread execution and crash when enigo
+/// resolves a `Key::Unicode` off the main thread. See the call site in
+/// `map_key`.
+#[cfg(not(target_os = "windows"))]
 fn char_to_macos_keycode(c: char) -> Option<u16> {
     let code: u16 = match c {
         'a' => 0,
@@ -464,8 +527,12 @@ fn char_to_macos_keycode(c: char) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "windows"))]
     use super::char_to_macos_keycode;
+    #[cfg(target_os = "windows")]
+    use super::char_to_windows_vk;
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn maps_common_chord_chars_to_us_keycodes() {
         assert_eq!(char_to_macos_keycode('a'), Some(0));
@@ -479,5 +546,25 @@ mod tests {
         // No fixed US-layout keycode for these.
         assert_eq!(char_to_macos_keycode('é'), None);
         assert_eq!(char_to_macos_keycode('A'), None); // callers lowercase first
+    }
+
+    /// The Windows table must yield Virtual-Key codes, NOT the macOS CGKeyCodes
+    /// above. The 'v' case is the regression that motivated the split: macOS
+    /// says 9, but VK 9 is TAB on Windows, so a shared table turned every
+    /// ctrl+v into Ctrl+Tab.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn maps_common_chord_chars_to_windows_vks() {
+        assert_eq!(char_to_windows_vk('a'), Some(0x41)); // VK_A
+        assert_eq!(char_to_windows_vk('z'), Some(0x5A)); // VK_Z
+        assert_eq!(char_to_windows_vk('v'), Some(0x56)); // VK_V, not 9/TAB
+        assert_eq!(char_to_windows_vk('0'), Some(0x30)); // VK_0
+        assert_eq!(char_to_windows_vk('9'), Some(0x39)); // VK_9
+        assert_eq!(char_to_windows_vk(' '), Some(0x20)); // VK_SPACE
+        assert_eq!(char_to_windows_vk('/'), Some(0xBF)); // VK_OEM_2
+        assert_eq!(char_to_windows_vk('`'), Some(0xC0)); // VK_OEM_3
+        // No fixed US-layout Virtual-Key for these.
+        assert_eq!(char_to_windows_vk('é'), None);
+        assert_eq!(char_to_windows_vk('A'), None); // callers lowercase first
     }
 }

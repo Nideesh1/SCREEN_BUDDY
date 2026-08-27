@@ -336,7 +336,7 @@ function Artifacts() {
             }}
           >
             Hashing, copying and generating thumbnails — large videos take a moment. Runs entirely on
-            your Mac.
+            your computer.
           </span>
         </Card>
       )}
@@ -392,7 +392,7 @@ function Artifacts() {
           <EmptyState
             icon={<ImageIcon size={28} />}
             title="No artifacts yet"
-            hint="Upload photos, videos, PDFs or notes once and reuse them across your runs. Files stay on your Mac."
+            hint="Upload photos, videos, PDFs or notes once and reuse them across your runs. Files stay on your computer."
             action={
               <Button variant="primary" onClick={importFiles} disabled={importing}>
                 ＋ Upload

@@ -66,7 +66,7 @@ function SplashLogin({ login, isLoading, error }: SplashLoginProps) {
             maxWidth: 320,
           }}
         >
-          Your AI agent for the Mac. Sign in to get started.
+          Your AI agent for your desktop. Sign in to get started.
         </p>
       </div>
 

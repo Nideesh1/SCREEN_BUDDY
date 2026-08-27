@@ -312,7 +312,7 @@ function AgentRunPanel({ initialPrompt = '', pinnedSetId, runId, onStatus, attac
               className="agent-input"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Describe the task for ScreenBuddy to perform on this Mac…"
+              placeholder="Describe the task for ScreenBuddy to perform on this computer…"
               rows={3}
               style={{
                 width: '100%',

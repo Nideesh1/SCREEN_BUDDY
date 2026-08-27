@@ -1,4 +1,4 @@
-// permissions.rs — macOS permission probe.
+// permissions.rs — OS permission probe.
 //
 // Ported from cu-input-tests/src/bin/check_permission.rs. Two SEPARATE,
 // independent macOS gates:
@@ -11,6 +11,36 @@
 // macOS only re-reads these at process launch, so a freshly-granted permission
 // won't reflect here until the app is quit & relaunched. We only *probe* (no
 // prompt) so this is cheap and side-effect-free.
+//
+// ---------------------------------------------------------------------------
+// WINDOWS: both probes report `true`, and that is accurate rather than a stub.
+// Windows has no TCC: any process may call SetWindowsHookEx-free SendInput and
+// may read the screen via the Desktop Duplication / GDI paths xcap uses. There
+// is no consent gate to query, so there is nothing to prompt for and nothing
+// that can be "denied" in the macOS sense.
+//
+// What DOES restrict the agent on Windows is UIPI (User Interface Privilege
+// Isolation), and it is not a permission — it is an integrity-level rule:
+//
+//   * A process may only send input to windows at its OWN integrity level or
+//     LOWER. ScreenBuddy runs at medium integrity, like Explorer and every
+//     normal user app, so it can drive browsers, Office, Slack and so on — the
+//     overwhelming majority of what a run targets.
+//   * It CANNOT drive windows owned by an elevated (high-integrity) process:
+//     Task Manager, an admin PowerShell, most installers. Clicks and keystrokes
+//     are silently discarded — SendInput still reports success, so this surfaces
+//     as the agent believing it acted while the screen never changes.
+//   * It can NEVER drive a UAC consent dialog. Those render on a separate secure
+//     desktop that no user-mode process can reach, elevated or not.
+//
+// We deliberately do NOT probe for elevation and surface it as a permission.
+// Doing so would frame "run ScreenBuddy as administrator" as the fix, and
+// handing an autonomous computer-use agent admin rights to dodge a silent-click
+// problem is a bad trade. The honest guidance is the opposite: keep it
+// unelevated and keep elevated windows out of a run's path. If we later want to
+// help users diagnose the silent-discard case, the right shape is a post-action
+// "screen did not change" heuristic in the agent loop, not a permission flag.
+// ---------------------------------------------------------------------------
 
 use serde::Serialize;
 
@@ -109,9 +139,12 @@ pub fn request_screen_recording() -> bool {
         unsafe { sys::CGRequestScreenCaptureAccess() }
     }
 
+    // Nothing to request: screen capture needs no consent off macOS. Returns
+    // `true` to agree with `check_permissions`, which already reports it
+    // granted — the old `false` claimed the opposite of the probe.
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        true
     }
 }
 
@@ -142,8 +175,11 @@ pub fn request_accessibility() -> bool {
         }
     }
 
+    // Nothing to request: synthesizing input needs no consent off macOS (UIPI
+    // is an integrity-level rule, not a grantable permission — see module docs).
+    // Returns `true` to agree with `check_permissions`.
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        true
     }
 }

@@ -40,8 +40,15 @@ base64 = "0.22"
 image = "0.25.5"
 enigo = "0.2"
 xcap = "0.9.6"
-core-graphics = "0.23"
-core-foundation = "0.9"
+# Native clipboard. Replaces the `pbcopy`/`pbpaste` subprocesses in computer.rs,
+# which are macOS-only binaries and simply fail to spawn on Windows.
+arboard = "3"
+# NOTE: `core-graphics` / `core-foundation` used to be listed here, but nothing
+# imports them — `permissions.rs` declares its own `extern "C"` bindings and
+# links the system frameworks directly (`#[link(name = "CoreGraphics", kind =
+# "framework")]`), which needs no crate. They sat in the UNCONDITIONAL
+# dependency block, so they failed the Windows build outright. Deleted rather
+# than gated behind cfg(target_os = "macos"): they were dead weight everywhere.
 aes-gcm = "0.10"
 rand = "0.8"
 # Artifact library (artifacts.rs): content-addressed ids (SHA-256 of the file
@@ -63,6 +70,19 @@ robius-authentication = "0.1"
 # `[NSApplication activateIgnoringOtherApps:]`, which is required to steal focus
 # from the frontmost app when a scheduled run fires in the background.
 objc = "0.2"
+
+# Windows credential-vault hardening — the mirror of the macOS block above.
+# `keyring` stores the AES master key in Credential Manager (`windows-native`
+# backend, the Win32 credential API — no DBus/secret-service involved), and
+# `robius-authentication` gates its first read per run behind Windows Hello.
+# Without these, credentials.rs falls through to the plaintext on-disk key file,
+# whose `restrict_perms` is a no-op on Windows.
+#
+# NOTE: window.rs needs NO Windows counterpart to `objc`. tao already implements
+# SetForegroundWindow (plus its ALT-synthesis fallback) inside `set_focus()`.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+robius-authentication = "0.1"
 
 # Optimize ALL third-party crates even in `tauri dev`/debug builds. `image`
 # (and its codecs) is ~157x slower when built unoptimized, which dominates

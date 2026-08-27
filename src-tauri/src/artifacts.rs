@@ -30,7 +30,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::{AppHandle, Manager};
 
 const ARTIFACTS_DIR: &str = "artifacts";
@@ -194,7 +193,7 @@ fn write_thumb(dir: &Path, img: &image::DynamicImage) -> Result<(), String> {
 /// input and also computes the extraction-pipeline's resolution warnings.
 fn probe_duration_ms(path: &Path) -> Option<u64> {
     let ffprobe = crate::video::resolve_bin("ffprobe").ok()?;
-    let out = Command::new(ffprobe)
+    let out = crate::video::sidecar_command(&ffprobe)
         .args([
             "-v",
             "quiet",
@@ -230,7 +229,7 @@ fn thumb_from_video(dir: &Path, blob: &Path) -> Result<(), String> {
     let tmp = dir.join("_thumb_src.png");
 
     let grab = |seek: &str| -> bool {
-        let out = Command::new(&ffmpeg)
+        let out = crate::video::sidecar_command(&ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", seek, "-i"])
             .arg(blob)
             .args(["-frames:v", "1"])
