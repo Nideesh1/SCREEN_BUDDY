@@ -1,15 +1,12 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { invoke } from '@tauri-apps/api/core'
-import { safeInvoke, CU_BACKEND, authHeaders } from '../lib'
+import { safeInvoke, CU_BACKEND, authHeaders, MODEL_OPTIONS, DEFAULT_MODEL } from '../lib'
 import { Card, SectionTitle, Button, Chip, Spinner } from '../ui'
 import { Link } from 'react-router-dom'
 import { createSchedule } from '../schedules'
 import CronBuilder from './CronBuilder'
 import RunsTabs from './RunsTabs'
-
-// Default model used across the launcher when no template overrides it.
-const DEFAULT_MODEL = 'claude-sonnet-5'
 
 // The browser's IANA timezone — used verbatim for any schedule we create so the
 // backend interprets the cron in the user's local zone.
@@ -524,10 +521,14 @@ function NewRun() {
 
             <Field label="Model">
               <select value={model} onChange={(e) => setModel(e.target.value)} style={selectStyle}>
-                <option value="claude-sonnet-5">Claude Sonnet 5</option>
-                <option value="claude-opus-4-8">Claude Opus 4.8</option>
+                {MODEL_OPTIONS.map((m) => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
               </select>
-              <span style={hintStyle}>Opus is more capable; Sonnet is faster.</span>
+              <span style={hintStyle}>
+                Opus is more capable; Sonnet is faster. Self-hosted models run against
+                whatever CU_ANTHROPIC_BASE points at.
+              </span>
             </Field>
           </div>
 
@@ -676,14 +677,61 @@ function NewRun() {
   )
 }
 
-// Onboarding gate shown when no Anthropic key is stored yet. Self-contained:
-// validates the key directly via Rust (which calls Anthropic, never our backend),
-// saves it encrypted, then flips the launcher open. The plaintext key is masked
-// and never logged.
+// Where model requests actually go, as reported by Rust. `is_anthropic` is
+// derived from the endpoint host, so it can never disagree with where the run
+// will send its traffic.
+type ModelEndpoint = { base: string; is_anthropic: boolean; model: string }
+
+// Onboarding gate shown when no Anthropic key is stored yet.
+//
+// TWO modes, chosen by the endpoint rather than by the user:
+//   * Anthropic  — enter a key; Rust validates it against Anthropic and stores
+//     it encrypted. The plaintext is masked and never logged.
+//   * self-hosted — there is no Anthropic credential to enter, so the gate asks
+//     the endpoint to prove itself instead: one real Messages round trip. Same
+//     shape of promise as key validation ("this will work when you press Run"),
+//     just aimed at the thing that can actually fail.
 function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
   const [apiKey, setApiKey] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [endpoint, setEndpoint] = useState<ModelEndpoint | null>(null)
+  const [verified, setVerified] = useState(false)
+
+  // Ask Rust where requests go. Until this resolves we render the Anthropic
+  // copy, which is the safe default: it asks for a key we may not need rather
+  // than waving through a run that would 401.
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      const res = await safeInvoke<ModelEndpoint>('model_endpoint')
+      if (active && res.ok) setEndpoint(res.data)
+    })()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const selfHosted = endpoint !== null && !endpoint.is_anthropic
+
+  // Self-hosted path: a live round trip through /v1/messages. A server can be
+  // listening and still not serve this API shape, so nothing short of a real
+  // request is evidence.
+  const verifyEndpoint = useCallback(async () => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke<string>('check_model_endpoint')
+      setVerified(true)
+      onConnected()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, onConnected])
 
   const validateAndSave = useCallback(async () => {
     const trimmed = apiKey.trim()
@@ -731,7 +779,7 @@ function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
             color: 'var(--sb-gold-bright)',
           }}
         >
-          Connect your Anthropic key
+          {selfHosted ? 'Connect your model endpoint' : 'Connect your Anthropic key'}
         </h1>
         <p
           style={{
@@ -742,8 +790,17 @@ function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
             lineHeight: 1.5,
           }}
         >
-          ScreenBuddy runs on your own Anthropic API key — it's stored encrypted on
-          this computer and sent directly to Anthropic, never to our servers.
+          {selfHosted ? (
+            <>
+              Requests go to <strong>{endpoint?.base}</strong> instead of Anthropic, so no
+              Anthropic key is needed. Verify the endpoint answers before starting a run.
+            </>
+          ) : (
+            <>
+              ScreenBuddy runs on your own Anthropic API key — it's stored encrypted on
+              this computer and sent directly to Anthropic, never to our servers.
+            </>
+          )}
         </p>
       </div>
 
@@ -751,21 +808,50 @@ function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}>
           <SectionTitle>Set up to start</SectionTitle>
 
-          <Field label="Anthropic API key">
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') validateAndSave()
-              }}
-              placeholder="sk-ant-…"
-              autoComplete="off"
-              spellCheck={false}
-              className="agent-input"
-              style={{ ...selectStyle, cursor: 'text', fontFamily: 'var(--font-mono)' }}
-            />
-          </Field>
+          {selfHosted ? (
+            <>
+              <Field label="Endpoint">
+                <div style={{ ...selectStyle, fontFamily: 'var(--font-mono)', cursor: 'default' }}>
+                  {endpoint?.base}
+                </div>
+              </Field>
+              <Field label="Model">
+                <div style={{ ...selectStyle, fontFamily: 'var(--font-mono)', cursor: 'default' }}>
+                  {endpoint?.model}
+                </div>
+              </Field>
+              {verified && (
+                <div
+                  style={{
+                    padding: '10px var(--sp-3)',
+                    borderRadius: 'var(--r-sm)',
+                    fontSize: 'var(--fs-md)',
+                    color: 'var(--sb-gold-bright)',
+                    background: 'rgba(212, 175, 55, 0.10)',
+                    border: '1px solid rgba(212, 175, 55, 0.35)',
+                  }}
+                >
+                  ✓ Endpoint answered — ready to run.
+                </div>
+              )}
+            </>
+          ) : (
+            <Field label="Anthropic API key">
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') validateAndSave()
+                }}
+                placeholder="sk-ant-…"
+                autoComplete="off"
+                spellCheck={false}
+                className="agent-input"
+                style={{ ...selectStyle, cursor: 'text', fontFamily: 'var(--font-mono)' }}
+              />
+            </Field>
+          )}
 
           {error && (
             <div
@@ -786,19 +872,21 @@ function KeyOnboarding({ onConnected }: { onConnected: () => void }) {
             <Button
               variant="primary"
               size="md"
-              disabled={busy || !apiKey.trim()}
-              onClick={validateAndSave}
+              disabled={busy || (!selfHosted && !apiKey.trim())}
+              onClick={selfHosted ? verifyEndpoint : validateAndSave}
               style={{
                 minWidth: 160,
-                opacity: busy || !apiKey.trim() ? 0.55 : 1,
-                cursor: busy || !apiKey.trim() ? 'not-allowed' : 'pointer',
+                opacity: busy || (!selfHosted && !apiKey.trim()) ? 0.55 : 1,
+                cursor: busy || (!selfHosted && !apiKey.trim()) ? 'not-allowed' : 'pointer',
               }}
             >
               {busy ? (
                 <>
                   <Spinner size={14} style={{ borderTopColor: '#0A0A0A', borderColor: 'rgba(0,0,0,0.25)' }} />
-                  Validating…
+                  {selfHosted ? 'Checking…' : 'Validating…'}
                 </>
+              ) : selfHosted ? (
+                'Verify & Continue'
               ) : (
                 'Validate & Save'
               )}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { safeInvoke } from '../lib'
+import { safeInvoke, MODEL_OPTIONS, DEFAULT_MODEL } from '../lib'
 import { Card, SectionTitle, Button, Spinner, Badge, Divider } from '../ui'
 import {
   getSchedule,
@@ -36,7 +36,7 @@ function ScheduleDetail() {
   const [name, setName] = useState('')
   const [cron, setCron] = useState('')
   const [task, setTask] = useState('')
-  const [model, setModel] = useState('claude-sonnet-5')
+  const [model, setModel] = useState(DEFAULT_MODEL)
   const [pinnedSetId, setPinnedSetId] = useState<string>('')
   const [requireConfirmation, setRequireConfirmation] = useState(true)
   const [snoozeMinutes, setSnoozeMinutes] = useState(5)
@@ -182,8 +182,9 @@ function ScheduleDetail() {
               >
                 <Field label="Model">
                   <select value={model} onChange={(e) => setModel(e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
-                    <option value="claude-sonnet-5">Claude Sonnet 5</option>
-                    <option value="claude-opus-4-8">Claude Opus 4.8</option>
+                    {MODEL_OPTIONS.map((m) => (
+                      <option key={m.value} value={m.value}>{m.label}</option>
+                    ))}
                   </select>
                 </Field>
 
