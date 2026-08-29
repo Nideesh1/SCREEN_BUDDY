@@ -25,7 +25,26 @@ interface Device {
   current_run_id: string | null
   online: boolean
   created_at: string
+  enrollment_state: EnrollmentState
+  /** When this machine last redeemed a key. Null when it never has. */
+  enrolled_at: string | null
 }
+
+// Whether a machine holds a working worker pass. Derived server-side (from the
+// device row's token state, which is never exposed) so two admins reading the
+// same fleet cannot disagree about it — the same reasoning as `online`.
+//
+// The two states that are not "enrolled" mean opposite things and must never
+// render alike:
+//
+//   enrolled     — redeemed a key, holds a live pass, can run agents.
+//   revoked      — held one and the operator deliberately turned it off. The row
+//                  stays in the fleet with its name, RustDesk id and notes so it
+//                  can be handed a fresh key. Not an error, and not offline.
+//   not_enrolled — never had one, and does not want one. This is the operator's
+//                  OWN machine, which signs in with Google instead; it is the
+//                  normal state for that row and nothing to flag.
+type EnrollmentState = 'enrolled' | 'revoked' | 'not_enrolled'
 
 // The current run behind a device's current_run_id. GET /runs/{id} answers with
 // { run, events } (see RunDetail); we want only the handful of run fields the
@@ -59,6 +78,7 @@ const POLL_MS = 30_000
 function Devices() {
   const navigate = useNavigate()
   const [load, setLoad] = useState<Load>({ state: 'loading' })
+  const [addingMachine, setAddingMachine] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const thisDeviceId = useThisDeviceId()
 
@@ -93,6 +113,10 @@ function Devices() {
 
   const devices = load.state === 'ready' ? load.devices : []
   const onlineCount = devices.filter((d) => d.online).length
+  // Surfaced beside the online count because a revoked machine looks entirely
+  // normal in the list otherwise — same name, same row — and "3 · 1 online"
+  // would leave the operator to work out why the other two never check in.
+  const revokedCount = devices.filter((d) => d.enrollment_state === 'revoked').length
 
   // Keep a selection alive across polls: fall back to the first device when
   // nothing is selected or the selected machine has been forgotten.
@@ -120,9 +144,10 @@ function Devices() {
         {load.state === 'ready' && devices.length > 0 && (
           <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
             {devices.length} · {onlineCount} online
+            {revokedCount > 0 && ` · ${revokedCount} revoked`}
           </span>
         )}
-        <div style={{ marginLeft: 'auto' }}>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--sp-2)' }}>
           <Button
             variant="secondary"
             size="sm"
@@ -131,8 +156,16 @@ function Devices() {
           >
             ↻ Refresh
           </Button>
+          <Button variant="primary" size="sm" onClick={() => setAddingMachine(true)}>
+            + Add machine
+          </Button>
         </div>
       </div>
+
+      {/* Remounted on every open so a dismissed key is gone for good rather than
+          sitting in state waiting to be reopened — the modal's whole premise is
+          that the key is shown once. */}
+      {addingMachine && <AddMachineModal onClose={() => setAddingMachine(false)} />}
 
       {load.state === 'loading' && (
         <Card>
@@ -162,7 +195,7 @@ function Devices() {
           <EmptyState
             icon="▱"
             title="No devices yet"
-            hint="A machine shows up here the first time ScreenBuddy runs on it and signs in to this account — laptops and VMs alike. Nothing to add by hand."
+            hint="Add machine mints an enrollment key: install ScreenBuddy on the laptop or VM, choose “Enrol this machine”, and paste the key. It appears here as soon as it checks in."
           />
         </Card>
       )}
@@ -194,11 +227,215 @@ function Devices() {
                 isThisMachine={selected.device_id === thisDeviceId}
                 onOpenRun={(runId) => navigate('/runs/' + runId)}
                 onChanged={() => fetchDevices(true)}
+                onAddMachine={() => setAddingMachine(true)}
               />
             </div>
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+// ───────────────────────────────────────────────────────── add machine
+
+// What POST /enroll/keys answers with. The key is plaintext here and nowhere
+// else — the backend stores only a hash, so this response is the single moment
+// it exists in readable form.
+interface EnrollKey {
+  key: string
+  expires_at: string
+}
+
+type Mint =
+  | { state: 'minting' }
+  | { state: 'error'; message: string }
+  | { state: 'ready'; key: EnrollKey }
+
+// "expires in 15 minutes" — the TTL as a duration, because "expires at 14:32" is
+// a number the reader then has to subtract from their own clock while standing
+// at a different machine.
+function expiresInWords(expiresAt: string): string {
+  const ms = Date.parse(expiresAt) - Date.now()
+  if (!Number.isFinite(ms) || ms <= 0) return 'expired'
+  const minutes = Math.round(ms / 60_000)
+  if (minutes < 1) return 'expires in under a minute'
+  if (minutes === 1) return 'expires in 1 minute'
+  if (minutes < 60) return `expires in ${minutes} minutes`
+  const hours = Math.round(minutes / 60)
+  return `expires in ${hours === 1 ? '1 hour' : `${hours} hours`}`
+}
+
+// Add machine: mint a one-time enrollment key and put it in front of the
+// operator once. Minting starts on open rather than behind a second button —
+// opening this is already the decision, and a key that goes unused just expires.
+//
+// Copy is the primary action, not Done: the operator is carrying this string to
+// another machine, and the key is long enough that reading it off the screen and
+// typing it is a mistake waiting to happen.
+function AddMachineModal({ onClose }: { onClose: () => void }) {
+  const [mint, setMint] = useState<Mint>({ state: 'minting' })
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const resp = await fetch(`${CU_BACKEND}/enroll/keys`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'content-type': 'application/json' },
+        })
+        if (!alive) return
+        if (!resp.ok) {
+          setMint({ state: 'error', message: `Could not mint a key (${resp.status})` })
+          return
+        }
+        const data: EnrollKey = await resp.json()
+        setMint({ state: 'ready', key: data })
+      } catch (err) {
+        if (!alive) return
+        setMint({
+          state: 'error',
+          message: err instanceof Error ? err.message : 'Network error',
+        })
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const copy = useCallback(() => {
+    if (mint.state !== 'ready') return
+    navigator.clipboard?.writeText(mint.key.key)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1600)
+  }, [mint])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add machine"
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 2000,
+        background: 'rgba(0, 0, 0, 0.72)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 'var(--sp-6)',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 480,
+          background: 'var(--sb-surface-1)',
+          border: '1px solid var(--sb-border-gold)',
+          borderRadius: 'var(--r-lg)',
+          boxShadow: 'var(--shadow-2)',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--sb-border)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-2)',
+          }}
+        >
+          <span aria-hidden style={{ fontSize: 16 }}>
+            ▱
+          </span>
+          <SectionTitle>Add machine</SectionTitle>
+        </div>
+
+        <div
+          style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}
+        >
+          {mint.state === 'minting' && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 'var(--sp-3)',
+                color: 'var(--sb-text-muted)',
+                padding: 'var(--sp-5)',
+              }}
+            >
+              <Spinner /> Minting a key…
+            </div>
+          )}
+
+          {mint.state === 'error' && <div className="error-message">{mint.message}</div>}
+
+          {mint.state === 'ready' && (
+            <>
+              <div
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 'var(--fs-lg)',
+                  lineHeight: 1.5,
+                  wordBreak: 'break-all',
+                  color: 'var(--sb-gold-bright)',
+                  background: 'var(--sb-surface-3)',
+                  border: '1px solid var(--sb-border)',
+                  borderRadius: 'var(--r-md)',
+                  padding: 'var(--sp-3)',
+                  // Selectable so copy has a manual fallback in a browser that
+                  // denies clipboard access.
+                  userSelect: 'all',
+                }}
+              >
+                {mint.key.key}
+              </div>
+
+              <Button variant="primary" onClick={copy} style={{ justifyContent: 'center' }}>
+                {copied ? '✓ Copied' : 'Copy key'}
+              </Button>
+
+              <div
+                style={{
+                  fontSize: 'var(--fs-md)',
+                  fontWeight: 600,
+                  color: 'var(--sb-danger-bright)',
+                }}
+              >
+                This key will not be shown again — {expiresInWords(mint.key.expires_at)}.
+              </div>
+
+              <ol
+                style={{
+                  margin: 0,
+                  paddingLeft: 18,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 4,
+                  fontSize: 'var(--fs-md)',
+                  lineHeight: 1.5,
+                  color: 'var(--sb-text-muted)',
+                }}
+              >
+                <li>Install ScreenBuddy on the machine.</li>
+                <li>On its sign-in screen, choose “Enrol this machine”.</li>
+                <li>Paste this key. It works once.</li>
+              </ol>
+            </>
+          )}
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button variant="secondary" onClick={onClose}>
+              {mint.state === 'ready' ? 'Done' : 'Close'}
+            </Button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -254,12 +491,47 @@ function ThisMachineTag() {
   )
 }
 
+// The "access revoked" tag. Shaped like ThisMachineTag rather than a danger
+// badge on purpose: a revoked machine is not broken and not an alert, it is a
+// machine somebody switched off deliberately, and dressing that as a warning
+// would put a red mark on the operator's own decision. The slash carries the
+// "locked out" reading that colour is not allowed to.
+//
+// Only 'revoked' gets a tag. 'not_enrolled' is the operator's own machine
+// behaving exactly as intended, and tagging it would make the normal case look
+// like the exceptional one.
+function RevokedTag() {
+  return (
+    <span
+      style={{
+        flexShrink: 0,
+        fontSize: 'var(--fs-xs)',
+        fontWeight: 600,
+        letterSpacing: '0.04em',
+        textTransform: 'uppercase',
+        color: 'var(--sb-text-muted)',
+        border: '1px solid var(--sb-text-faint)',
+        borderRadius: 'var(--r-pill)',
+        padding: '1px 7px',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      ⃠ revoked
+    </span>
+  )
+}
+
 // A machine that is offline while still holding a current_run_id did not finish
 // and did not stop — it vanished mid-task, and the run behind it will sit at
 // "running" until something reconciles it. This is the one condition on this
 // screen worth interrupting someone over.
+//
+// Not raised for a revoked machine: it went quiet because its pass was pulled,
+// which is a known cause with a known cure. Calling that a mystery would send
+// someone looking for a dead laptop that is sitting there fine. The stranded run
+// is still said out loud — in the access card, where the reason is.
 function diedMidRun(device: Device): boolean {
-  return !device.online && !!device.current_run_id
+  return !device.online && !!device.current_run_id && device.enrollment_state !== 'revoked'
 }
 
 // One row in the left list. Everything here is sized to be legible at a glance
@@ -304,7 +576,11 @@ function DeviceRow({
         if (!selected) e.currentTarget.style.background = 'transparent'
       }}
     >
-      <StatusDot online={device.online} style={{ marginTop: 5 }} />
+      <StatusDot
+        online={device.online}
+        revoked={device.enrollment_state === 'revoked'}
+        style={{ marginTop: 5 }}
+      />
       <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', minWidth: 0 }}>
           <span
@@ -319,6 +595,7 @@ function DeviceRow({
             {displayName(device)}
           </span>
           {isThisMachine && <ThisMachineTag />}
+          {device.enrollment_state === 'revoked' && <RevokedTag />}
         </span>
         <span
           style={{
@@ -353,6 +630,12 @@ function DeviceRow({
 // The single status line under a device's name: what it is doing, or how long
 // it has been gone.
 function statusLine(device: Device): string {
+  // A revoked machine reads as offline in every field the backend derives —
+  // being locked out is exactly what stops it checking in — so saying "offline"
+  // here would send someone to look at a machine that is powered on and fine.
+  if (device.enrollment_state === 'revoked') {
+    return `locked out · last seen ${relativeTime(device.last_seen)}`
+  }
   if (!device.online) return `offline · ${relativeTime(device.last_seen)}`
   if (device.current_run_id) return 'running'
   return `idle · ${relativeTime(device.last_seen)}`
@@ -361,16 +644,30 @@ function statusLine(device: Device): string {
 // Green when the machine has checked in inside the backend's liveness window,
 // grey when it hasn't. Deliberately not a StatusPill: a pill's label competes
 // with the device name, and at list scale the dot alone is the whole signal.
-function StatusDot({ online, style }: { online: boolean; style?: React.CSSProperties }) {
+//
+// A revoked machine gets a hollow ring instead of either fill. Both filled
+// states are claims about the machine — it is up, it is not — and neither is
+// what is being said about a machine that has been switched off at this end.
+function StatusDot({
+  online,
+  revoked,
+  style,
+}: {
+  online: boolean
+  revoked?: boolean
+  style?: React.CSSProperties
+}) {
   return (
     <span
       aria-hidden
       style={{
         flexShrink: 0,
+        boxSizing: 'border-box',
         width: 8,
         height: 8,
         borderRadius: '50%',
-        background: online ? 'var(--sb-success)' : 'var(--sb-text-faint)',
+        background: revoked ? 'transparent' : online ? 'var(--sb-success)' : 'var(--sb-text-faint)',
+        border: revoked ? '1.5px solid var(--sb-text-muted)' : undefined,
         ...style,
       }}
     />
@@ -387,11 +684,17 @@ function DeviceDetail({
   isThisMachine,
   onOpenRun,
   onChanged,
+  onAddMachine,
 }: {
   device: Device
   isThisMachine: boolean
   onOpenRun: (runId: string) => void
   onChanged: () => void
+  /** Open the mint-a-key modal. Reachable from here as well as the header
+   *  because a machine that was just revoked is the single most likely thing to
+   *  need a new key, and sending someone back to the top of the page to find the
+   *  button leaves the connection to make on their own. */
+  onAddMachine: () => void
 }) {
   const [name, setName] = useState(device.name ?? '')
   const [rustdeskId, setRustdeskId] = useState(device.rustdesk_id ?? '')
@@ -400,6 +703,9 @@ function DeviceDetail({
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const [forgetting, setForgetting] = useState(false)
+  const [revoking, setRevoking] = useState(false)
+
+  const revoked = device.enrollment_state === 'revoked'
 
   // Compare against the server's nulls as empty strings, so clearing a field
   // that was already null doesn't read as an unsaved change.
@@ -437,11 +743,45 @@ function DeviceDetail({
     }
   }, [device.device_id, name, rustdeskId, notes, onChanged])
 
+  // Revoke and Forget are one HTTP call apart and worlds apart in consequence,
+  // so each confirm says what the OTHER one would have done. This is the pair
+  // someone reaches for in a hurry, having decided only that a machine should
+  // stop — the choice between them is the part they have not made yet.
+  const revoke = useCallback(async () => {
+    const ok = window.confirm(
+      `Revoke access for “${displayName(device)}”?\n\n` +
+        'Its pass stops working immediately: it can no longer run agents or check in.\n\n' +
+        'It STAYS in this list, keeping its name, RustDesk ID and notes, so you can ' +
+        'hand it a new enrollment key whenever you want it back. To remove it from ' +
+        'the fleet altogether, use Forget instead.',
+    )
+    if (!ok) return
+    setRevoking(true)
+    setSaveError(null)
+    try {
+      const resp = await fetch(
+        `${CU_BACKEND}/devices/${encodeURIComponent(device.device_id)}/revoke`,
+        { method: 'POST', headers: authHeaders() },
+      )
+      if (!resp.ok) {
+        setSaveError(`Revoke failed (${resp.status})`)
+        return
+      }
+      onChanged()
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Network error')
+    } finally {
+      setRevoking(false)
+    }
+  }, [device, onChanged])
+
   const forget = useCallback(async () => {
     const ok = window.confirm(
       `Forget “${displayName(device)}”?\n\n` +
-        'It disappears from this list along with the name and notes you set. ' +
-        'If that machine signs in again it comes back as a new, unnamed device.',
+        'It leaves the fleet entirely, taking the name, RustDesk ID and notes you set ' +
+        'with it, and its pass stops working. Launching the app on that machine will ' +
+        'NOT bring it back — only a new enrollment key will, as a blank device.\n\n' +
+        'To lock it out but keep this record, use Revoke access instead.',
     )
     if (!ok) return
     setForgetting(true)
@@ -472,9 +812,9 @@ function DeviceDetail({
           </h2>
           {isThisMachine && <ThisMachineTag />}
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 'var(--sp-2)' }}>
-            <StatusDot online={device.online} />
+            <StatusDot online={device.online} revoked={revoked} />
             <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-              {device.online ? 'online' : 'offline'}
+              {revoked ? 'access revoked' : device.online ? 'online' : 'offline'}
             </span>
           </div>
         </div>
@@ -492,6 +832,14 @@ function DeviceDetail({
       </Card>
 
       <NowCard device={device} onOpenRun={onOpenRun} />
+
+      <AccessCard
+        device={device}
+        revoking={revoking}
+        busy={saving || forgetting}
+        onRevoke={revoke}
+        onAddMachine={onAddMachine}
+      />
 
       <RemoteDesktopCard
         savedId={device.rustdesk_id}
@@ -551,10 +899,115 @@ function DeviceDetail({
           </div>
         </div>
         <div style={{ marginTop: 'var(--sp-2)', fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
-          Forgetting only clears this record. The device reappears if that machine signs in again.
+          Forget removes this machine from the fleet along with everything you typed about it. To
+          cut its access but keep the record, use Revoke access above.
         </div>
       </Card>
     </div>
+  )
+}
+
+// ACCESS — whether this machine holds a working pass, and the one control that
+// changes it.
+//
+// It is a card of its own, several inches from Forget, because those two buttons
+// are the thing this screen is most likely to get wrong. Rendered side by side
+// they read as the same act at two intensities; they are not. Revoke keeps the
+// machine, its name and its notes and takes away the pass. Forget takes away the
+// machine. So Revoke sits here with the state it acts on, in the neutral
+// secondary style, and only Forget carries the danger colour.
+//
+// None of this is enforcement — the backend refuses a revoked machine's token
+// whatever this pane renders. It is here so the operator can see which machines
+// they have switched off, and switch one back on.
+function AccessCard({
+  device,
+  revoking,
+  busy,
+  onRevoke,
+  onAddMachine,
+}: {
+  device: Device
+  revoking: boolean
+  /** Another write on this device is in flight — save, forget — so the control
+   *  here doesn't race it. */
+  busy: boolean
+  onRevoke: () => void
+  onAddMachine: () => void
+}) {
+  const state = device.enrollment_state
+
+  if (state === 'not_enrolled') {
+    return (
+      <Card title={<SectionTitle>Access</SectionTitle>}>
+        <div style={{ fontSize: 'var(--fs-md)', lineHeight: 1.5, color: 'var(--sb-text-muted)' }}>
+          Not enrolled — this machine signs in with Google rather than holding a worker pass, so
+          there is nothing here to revoke.
+        </div>
+      </Card>
+    )
+  }
+
+  if (state === 'revoked') {
+    return (
+      <Card title={<SectionTitle>Access</SectionTitle>}>
+        <div style={{ fontSize: 'var(--fs-md)', lineHeight: 1.5, color: 'var(--sb-text)' }}>
+          Access revoked. This machine is still in the fleet — everything you typed about it is
+          kept — but its pass is dead, so it cannot run agents or check in.
+        </div>
+        {device.current_run_id && (
+          <div
+            style={{
+              marginTop: 'var(--sp-2)',
+              fontSize: 'var(--fs-md)',
+              lineHeight: 1.5,
+              color: 'var(--sb-text-muted)',
+            }}
+          >
+            A run was still in flight when it lost access, so that run will never report a result.
+          </div>
+        )}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-3)',
+            marginTop: 'var(--sp-4)',
+          }}
+        >
+          <Button variant="primary" onClick={onAddMachine}>
+            + Add machine
+          </Button>
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+            Mints a fresh key. Paste it on that machine to bring it straight back in.
+          </span>
+        </div>
+      </Card>
+    )
+  }
+
+  return (
+    <Card title={<SectionTitle>Access</SectionTitle>}>
+      <div style={{ fontSize: 'var(--fs-md)', lineHeight: 1.5, color: 'var(--sb-text-muted)' }}>
+        Enrolled{device.enrolled_at ? ` ${relativeTime(device.enrolled_at)}` : ''} — this machine
+        holds a worker pass and runs agents for the fleet.
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--sp-3)',
+          marginTop: 'var(--sp-4)',
+        }}
+      >
+        <Button variant="secondary" onClick={onRevoke} disabled={revoking || busy}>
+          {revoking ? 'Revoking…' : 'Revoke access'}
+        </Button>
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+          Kills the pass and stops the machine dead, but keeps it here so you can re-enrol it.
+        </span>
+      </div>
+    </Card>
   )
 }
 

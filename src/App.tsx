@@ -1,9 +1,10 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useGoogleAuth } from './hooks/useGoogleAuth'
 import { ActiveRunProvider } from './activeRun'
-import { CU_BACKEND, safeInvoke, reconcileOrphanedRuns, isTauri } from './lib'
+import { CU_BACKEND, safeInvoke, reconcileOrphanedRuns, isTauri, unenrollMachine } from './lib'
 import SplashLogin from './SplashLogin'
+import DeviceRevoked from './DeviceRevoked'
 import Layout from './Layout'
 import Dashboard from './views/Dashboard'
 import NewRun from './views/NewRun'
@@ -19,17 +20,55 @@ import ScheduleDetail from './views/ScheduleDetail'
 import ScheduleFireModal from './views/ScheduleFireModal'
 import Admin from './views/Admin'
 import { useScheduler } from './useScheduler'
-import { ModeProvider, homeRouteFor, useMode } from './mode'
+import { ModeProvider, homeRouteFor, useCredentialClass, useDeviceRejected, useMode } from './mode'
 import ModePicker from './ModePicker'
 
 // App is the auth gate (single source of truth for auth state). It calls
-// useGoogleAuth() ONCE. Not authenticated -> splash. Authenticated -> the
-// hash-routed run manager: a HashRouter (so a webview reload restores the
-// route) wrapping the NavRail Layout + its child routes, all inside the shared
-// ActiveRunProvider so the live-run hint survives navigation.
+// useGoogleAuth() ONCE. The question it asks is not "authenticated?" but
+// "authenticated as WHAT": a Google session is an operator and gets the mode
+// picker, a device token is an enrolled worker and goes straight to the worker
+// shell, and neither gets the splash. Past the gate it is the hash-routed run
+// manager: a HashRouter (so a webview reload restores the route) wrapping the
+// NavRail Layout + its child routes, all inside the shared ActiveRunProvider so
+// the live-run hint survives navigation.
 function App() {
   const { isAuthenticated, userEmail, isLoading, error, login, logout, checkAuth } =
     useGoogleAuth()
+  const { credential, refresh: refreshCredential } = useCredentialClass()
+
+  // An enrolled machine is "signed in" without ever having signed in: it holds a
+  // device token in the Rust credential store and no Google session at all. Both
+  // states get the inside of the app; they differ only in which shell.
+  const enrolled = credential === 'device'
+  const inside = isAuthenticated || enrolled
+
+  // Only a worker can be told its credential is dead; see useDeviceRejected.
+  const { rejected, clear: clearRejection } = useDeviceRejected(enrolled)
+
+  // Sign out has to mean the thing the machine can actually stop being. On an
+  // admin machine that is the Google session in localStorage, which is all
+  // `logout` has ever cleared — and on an enrolled worker there is no session
+  // there at all, so the control used to do nothing whatsoever while the machine
+  // stayed in the fleet. Un-enrolling is the equivalent act, and it is one-way
+  // (rejoining needs a key only the operator can mint), which is what the
+  // confirm is for.
+  const signOut = useCallback(async () => {
+    if (!enrolled) {
+      logout()
+      return
+    }
+    const ok = window.confirm(
+      'Sign this machine out of the fleet?\n\n' +
+        'It stops running agents and leaves the fleet. Rejoining needs a new ' +
+        'enrollment key from the operator.',
+    )
+    if (!ok) return
+    await unenrollMachine()
+    clearRejection()
+    // Whether or not the clear worked: re-reading is what turns the answer into
+    // the right screen, and a token still present simply lands back here.
+    refreshCredential()
+  }, [enrolled, logout, clearRejection, refreshCredential])
 
   // Restore any existing backend session on mount.
   useEffect(() => {
@@ -42,6 +81,10 @@ function App() {
   // "running" — a ghost that shows as live across restarts. Since the local
   // executor is single (one run at a time), any run still "running" at startup
   // is by definition orphaned. Best effort: never blocks or crashes the UI.
+  //
+  // Session machines only: reconciliation is a plain fetch, and authHeaders()
+  // has nothing to send on an enrolled worker (its device token never leaves
+  // Rust). A worker's ghosts have to be reconciled from the Rust side instead.
   const reconciledRef = useRef(false)
   useEffect(() => {
     if (!isAuthenticated || reconciledRef.current) return
@@ -58,7 +101,7 @@ function App() {
   // and the dynamic import (a static one would pull the plugin into the web
   // chunk for a call that can never run there).
   useEffect(() => {
-    if (!isAuthenticated || !isTauri()) return
+    if (!inside || !isTauri()) return
     ;(async () => {
       try {
         const { isPermissionGranted, requestPermission } = await import(
@@ -71,7 +114,7 @@ function App() {
         // notifications are non-essential — ignore
       }
     })()
-  }, [isAuthenticated])
+  }, [inside])
 
   // Once authenticated, open the always-on remote channel so the backend can
   // push run commands to this desktop. The session token doubles as the WS auth
@@ -82,22 +125,53 @@ function App() {
   // safeInvoke already refuses outside Tauri, and skipping here keeps the
   // no-op out of the console entirely.
   useEffect(() => {
-    if (!isAuthenticated || !isTauri()) return
+    if (!inside || !isTauri()) return
     const token = localStorage.getItem('screen_buddy_session_token')
-    if (!token) return
-    safeInvoke('start_remote_listener', { token, backend: CU_BACKEND })
+    if (!enrolled && !token) return
+    // An enrolled worker has no session token to hand over: remote.rs opens the
+    // socket with whichever credential the machine holds, so passing none is how
+    // we say "use your own" rather than handing it an empty bearer.
+    safeInvoke('start_remote_listener', enrolled ? { backend: CU_BACKEND } : { token, backend: CU_BACKEND })
     return () => {
       safeInvoke('stop_remote_listener')
     }
-  }, [isAuthenticated])
+  }, [inside, enrolled])
 
-  if (!isAuthenticated) {
-    return <SplashLogin login={login} isLoading={isLoading} error={error} />
+  // The credential class decides which of the three screens below renders, so
+  // there is nothing correct to show until it resolves — a splash flashed at a
+  // worker for one frame is worse than a frame of nothing.
+  if (credential === null) return null
+
+  // A worker the backend has stopped accepting is a state of its own: it is not
+  // signed out (it still holds a token) and it is not working (nothing it sends
+  // is accepted). Rendering the worker shell over that would show a machine
+  // quietly failing every call with no explanation anywhere on screen.
+  if (enrolled && rejected) {
+    return (
+      <DeviceRevoked
+        onCredentialChanged={() => {
+          clearRejection()
+          refreshCredential()
+        }}
+        onDismiss={clearRejection}
+      />
+    )
+  }
+
+  if (!inside) {
+    return (
+      <SplashLogin
+        login={login}
+        isLoading={isLoading}
+        error={error}
+        onEnrolled={refreshCredential}
+      />
+    )
   }
 
   return (
-    <ModeProvider>
-      <ModedShell userEmail={userEmail} onSignOut={logout} />
+    <ModeProvider credential={credential}>
+      <ModedShell userEmail={userEmail} onSignOut={signOut} />
     </ModeProvider>
   )
 }

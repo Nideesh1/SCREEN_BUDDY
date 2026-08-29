@@ -198,6 +198,13 @@ async fn run_connection(app: &AppHandle, url: &str, backend: &str, auth: &str, t
             Ok((s, _resp)) => s,
             Err(e) => {
                 eprintln!("[remote] connect failed: {e}");
+                // A refused HANDSHAKE is how a worker finds out its enrollment is
+                // dead — there is no other authenticated call it makes on its own.
+                // Surface it and keep backing off; we do not clear the token and
+                // we do NOT reopen the socket with anything else.
+                if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+                    crate::device::note_rejection(app, resp.status().as_u16(), "agent/listen");
+                }
                 return false;
             }
         },
@@ -291,8 +298,14 @@ async fn listen_loop(app: AppHandle, url: String, backend: String, auth: String,
 
 /// Start (or restart) the always-on remote listener. Idempotent: cancels any
 /// prior task before spawning a fresh one, so calling twice never opens two
-/// sockets. `token` is the backend session token (WS auth + run bearer);
-/// `backend` is the HTTP(S) base (http→ws / https→wss).
+/// sockets. `token` is the session token the frontend holds, if any; `backend` is
+/// the HTTP(S) base (http→ws / https→wss).
+///
+/// What actually goes on the wire is whatever `credentials::backend_credential`
+/// returns — the stored device token on an enrolled worker, the session token
+/// otherwise. The URL is fixed for the life of the task, so a machine that
+/// enrols mid-session reconnects with the new credential when the frontend
+/// restarts the listener (which it does on the credential class changing).
 #[tauri::command]
 pub fn start_remote_listener(
     app: AppHandle,
@@ -315,6 +328,9 @@ pub fn start_remote_listener(
         eprintln!("[remote] no device id ({e}); connecting without one");
         String::new()
     });
+    // One credential choice, made here and carried through both the socket and
+    // any run this socket starts.
+    let token = crate::credentials::backend_credential(&app, &token).unwrap_or_default();
     let url = ws_url(&backend, &token, &device_id);
     eprintln!(
         "[remote] listener starting → {} (device {device_id})",

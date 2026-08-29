@@ -26,7 +26,7 @@ use crate::{capture, with_computer, ComputerState};
 
 // ---- configuration (env-overridable) --------------------------------------
 
-fn backend_url() -> String {
+pub(crate) fn backend_url() -> String {
     std::env::var("CU_BACKEND_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 /// BYOK: the per-turn model call goes DIRECTLY to Anthropic with the user's own
@@ -1130,12 +1130,21 @@ fn set_rolling_cache(messages: &mut Vec<Value>) {
 // a halt) the actual computer-use loop. All calls reuse the same Bearer session
 // token already sent to `cu-stream`.
 
-/// Attach the session bearer (if any) to an outgoing request.
-fn with_bearer(req: reqwest::RequestBuilder, auth: &str) -> reqwest::RequestBuilder {
-    if auth.is_empty() {
-        req
-    } else {
-        req.header("authorization", format!("Bearer {auth}"))
+/// Attach this machine's bearer credential (if any) to an outgoing request.
+///
+/// The single place run persistence decides what it is authenticating AS. `auth`
+/// is the session token the frontend passed down; `credentials::backend_credential`
+/// overrides it with the stored device token on an enrolled worker. Call sites
+/// stay ignorant of which — there is one credential, chosen once, and adding a
+/// second answer here is how the two classes would start to blur.
+fn with_bearer(
+    app: &AppHandle,
+    req: reqwest::RequestBuilder,
+    auth: &str,
+) -> reqwest::RequestBuilder {
+    match crate::credentials::backend_credential(app, auth) {
+        Some(cred) => req.header("authorization", format!("Bearer {cred}")),
+        None => req,
     }
 }
 
@@ -1166,6 +1175,7 @@ fn assistant_text(content: &[Value]) -> String {
 /// `POST /runs` before the agent task is spawned; this only stamps the status so
 /// the backend records `started_at`.
 async fn runs_patch_status(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1174,9 +1184,12 @@ async fn runs_patch_status(
 ) {
     let url = format!("{base}/runs/{run_id}");
     let body = json!({ "status": status });
-    match with_bearer(client.patch(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.patch(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
-        Ok(r) => eprintln!("[runs] status '{status}': HTTP {}", r.status()),
+        Ok(r) => {
+            eprintln!("[runs] status '{status}': HTTP {}", r.status());
+            crate::device::note_rejection(app, r.status().as_u16(), "runs");
+        }
         Err(e) => eprintln!("[runs] status '{status}': request failed: {e}"),
     }
 }
@@ -1184,6 +1197,7 @@ async fn runs_patch_status(
 /// `POST /runs/{id}/events` — best effort, logs and swallows failures.
 #[allow(clippy::too_many_arguments)]
 async fn runs_event(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1202,7 +1216,7 @@ async fn runs_event(
     if let Some(kind) = artifact_kind {
         body["artifact_kind"] = json!(kind);
     }
-    match with_bearer(client.post(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.post(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => eprintln!("[runs] event '{ev_type}': HTTP {}", r.status()),
         Err(e) => eprintln!("[runs] event '{ev_type}': request failed: {e}"),
@@ -1257,6 +1271,7 @@ fn runs_save_screenshot_local(
 /// `PATCH /runs/{id}` terminal status update — best effort, logs failures.
 #[allow(clippy::too_many_arguments)]
 async fn runs_finalize(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1281,7 +1296,7 @@ async fn runs_finalize(
         "result": result,
         "error_message": error_message,
     });
-    match with_bearer(client.patch(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.patch(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => eprintln!("[runs] finalize '{status}': HTTP {}", r.status()),
         Err(e) => eprintln!("[runs] finalize '{status}': request failed: {e}"),
@@ -1319,7 +1334,7 @@ async fn run_agent(
     // status to "running" (the backend stamps `started_at`). All downstream
     // persistence keeps the `Option<String>` shape so it stays best-effort.
     let _ = app.emit(EV_RUN_STARTED, json!({ "run_id": run_id }));
-    runs_patch_status(&client, &base, &auth, &run_id, "running").await;
+    runs_patch_status(&app, &client, &base, &auth, &run_id, "running").await;
     let run_id: Option<String> = Some(run_id);
     let mut seq: i64 = 0;
     // Monotonic per-run screenshot index, used for the local file name
@@ -1349,7 +1364,7 @@ async fn run_agent(
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                    &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
                     total_cache_create, total_cache_read, Value::Null, Some(msg),
                 )
                 .await;
@@ -1456,7 +1471,7 @@ async fn run_agent(
             let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                     Value::Null, Some("cancelled by user"),
                 )
                 .await;
@@ -1470,7 +1485,7 @@ async fn run_agent(
         if let Some(rid) = &run_id {
             let s = bump(&mut seq);
             runs_event(
-                &client, &base, &auth, rid, s, "status",
+                &app, &client, &base, &auth, rid, s, "status",
                 json!({"turn": turn, "state": "running"}), None, None,
             )
             .await;
@@ -1533,7 +1548,7 @@ async fn run_agent(
                 let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
                 if let Some(rid) = &run_id {
                     runs_finalize(
-                        &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                        &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                         Value::Null, Some("cancelled by user"),
                     )
                     .await;
@@ -1550,7 +1565,7 @@ async fn run_agent(
                     .show();
                 if let Some(rid) = &run_id {
                     runs_finalize(
-                        &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
+                        &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
                         Value::Null, Some(&e),
                     )
                     .await;
@@ -1580,7 +1595,7 @@ async fn run_agent(
             if !turn_text.is_empty() {
                 let s = bump(&mut seq);
                 runs_event(
-                    &client, &base, &auth, rid, s, "text",
+                    &app, &client, &base, &auth, rid, s, "text",
                     json!({"text": turn_text}), None, None,
                 )
                 .await;
@@ -1609,7 +1624,7 @@ async fn run_agent(
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                    &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
                     total_cache_create, total_cache_read, Value::Null, Some(msg),
                 )
                 .await;
@@ -1637,7 +1652,7 @@ async fn run_agent(
                 .show();
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "completed", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "completed", steps, total_in, total_out, total_cache_create, total_cache_read,
                     json!({"summary": last_text}), None,
                 )
                 .await;
@@ -1766,7 +1781,7 @@ async fn run_agent(
             let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                     Value::Null, Some("cancelled by user"),
                 )
                 .await;
@@ -1780,7 +1795,7 @@ async fn run_agent(
             for (name, input, shots) in &persisted {
                 let s = bump(&mut seq);
                 runs_event(
-                    &client, &base, &auth, rid, s, "tool_use",
+                    &app, &client, &base, &auth, rid, s, "tool_use",
                     json!({"name": name, "input": input}), None, None,
                 )
                 .await;
@@ -1794,7 +1809,7 @@ async fn run_agent(
                     {
                         let s = bump(&mut seq);
                         runs_event(
-                            &client, &base, &auth, rid, s, "screenshot",
+                            &app, &client, &base, &auth, rid, s, "screenshot",
                             json!({}), Some(&local_path), Some("screenshot_local"),
                         )
                         .await;
@@ -1825,7 +1840,7 @@ async fn run_agent(
         .show();
     if let Some(rid) = &run_id {
         runs_finalize(
-            &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
+            &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
             Value::Null, Some(&msg),
         )
         .await;

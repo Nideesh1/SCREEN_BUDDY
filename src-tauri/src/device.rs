@@ -19,9 +19,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Where the minted id lives, inside the app data dir. Same directory and same
 /// "one small file, one value" convention as `credentials.rs`'s `.cred_key` —
@@ -32,6 +32,23 @@ const DEVICE_ID_FILE: &str = "device_id";
 /// How long a registration attempt may hang before we give up. Registration is
 /// decorative; it must never keep a socket task alive waiting on a dead server.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `POST /enroll` may hang. Shorter than the enrollment key's 15-minute
+/// life by four orders of magnitude, and long enough for a cold backend: the
+/// operator is standing at the machine waiting for an answer, so a stuck spinner
+/// is worse than "couldn't reach the server, try again".
+const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Emitted when the backend refuses this machine's DEVICE token — the enrollment
+/// is dead (revoked, expired, or the device row was forgotten) and the machine
+/// must be re-enrolled with a fresh key.
+///
+/// This event exists so that refusal is LOUD. There is deliberately no automatic
+/// recovery behind it: the machine does not clear its token, does not retry with
+/// some other credential, and above all does not offer Google sign-in. See
+/// `credentials::backend_credential` for why that fallback is the one thing this
+/// design must not do.
+pub const EV_DEVICE_REJECTED: &str = "device://rejected";
 
 /// This machine's identity, as reported to the backend and to the UI.
 #[derive(Debug, Clone, Serialize)]
@@ -228,17 +245,43 @@ pub async fn register(app: AppHandle, backend: String, auth: String) {
         "os_version": info.os_version,
         "app_version": info.app_version,
     });
+    // One credential choice for the whole app: a stored device token if this
+    // machine is enrolled, otherwise the session token the frontend handed down.
+    // Never both, never a fallback from one to the other.
     let mut req = client.post(&url).json(&body);
-    if !auth.is_empty() {
-        req = req.header("authorization", format!("Bearer {auth}"));
+    if let Some(cred) = crate::credentials::backend_credential(&app, &auth) {
+        req = req.header("authorization", format!("Bearer {cred}"));
     }
     match req.send().await {
         Ok(r) if r.status().is_success() => {
             eprintln!("[device] registered {} ({})", info.device_id, info.hostname)
         }
-        Ok(r) => eprintln!("[device] register: HTTP {}", r.status()),
+        Ok(r) => {
+            let status = r.status();
+            eprintln!("[device] register: HTTP {status}");
+            note_rejection(&app, status.as_u16(), "register");
+        }
         Err(e) => eprintln!("[device] register: request failed: {e}"),
     }
+}
+
+/// Tell the UI when an authenticated call was refused *while holding a device
+/// token*, so a worker can say "this machine is no longer enrolled" instead of
+/// failing silently forever.
+///
+/// Gated on `is_enrolled` because 401/403 means something entirely different on
+/// an admin machine — an expired Google session, which the existing sign-in flow
+/// already handles. Only a worker is un-enrollable, and only a worker must never
+/// be offered sign-in as the cure.
+pub(crate) fn note_rejection(app: &AppHandle, status: u16, whence: &str) {
+    if !matches!(status, 401 | 403) || !crate::credentials::is_enrolled(app) {
+        return;
+    }
+    eprintln!("[device] enrollment refused by backend (HTTP {status} from {whence})");
+    let _ = app.emit(
+        EV_DEVICE_REJECTED,
+        json!({ "status": status, "source": whence }),
+    );
 }
 
 // ---- Tauri commands -------------------------------------------------------
@@ -249,6 +292,168 @@ pub async fn register(app: AppHandle, backend: String, auth: String) {
 #[tauri::command]
 pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
     info(&app)
+}
+
+// ---- enrollment -----------------------------------------------------------
+
+/// What `POST /enroll` returns. `device_token` is deserialized and immediately
+/// handed to the credential store; it is NOT part of `EnrollOk`, so it never
+/// crosses back over the command boundary — same rule the vault applies to
+/// passwords and the BYOK key.
+#[derive(Debug, Deserialize)]
+struct EnrollResponse {
+    device_token: String,
+    expires_at: Option<String>,
+    scope: Option<String>,
+    jti: Option<String>,
+}
+
+/// The successful half of enrollment, as the UI needs it: enough to confirm what
+/// just happened, with no credential in it.
+#[derive(Debug, Serialize)]
+pub struct EnrollOk {
+    pub device_id: String,
+    pub hostname: String,
+    pub expires_at: Option<String>,
+    pub scope: Option<String>,
+    pub jti: Option<String>,
+}
+
+/// The failing half. `kind` is the load-bearing field: the UI says two very
+/// different things depending on it.
+///
+/// - `"rejected"` — the backend answered, and said no. The key is unknown,
+///   expired, or already redeemed; the server returns one indistinguishable 401
+///   for all three on purpose, so we cannot say which. Actionable by the human:
+///   check the key, or ask the operator to mint a fresh one.
+/// - `"unreachable"` — we never got an answer (DNS, TLS, timeout, connection
+///   refused). The key is very likely still good and still ticking down its
+///   15-minute life; the fix is to retry, not to retype.
+/// - `"internal"` — this machine could not hold up its end (no device id, no
+///   HTTP client, could not persist the token). Retyping the key will not help.
+///
+/// Collapsing these into one string would make the UI guess, and the wrong guess
+/// costs the operator a walk back to the admin machine for a key that was fine.
+#[derive(Debug, Serialize)]
+pub struct EnrollError {
+    pub kind: &'static str,
+    pub message: String,
+}
+
+impl EnrollError {
+    fn rejected(message: impl Into<String>) -> Self {
+        Self { kind: "rejected", message: message.into() }
+    }
+    fn unreachable(message: impl Into<String>) -> Self {
+        Self { kind: "unreachable", message: message.into() }
+    }
+    fn internal(message: impl Into<String>) -> Self {
+        Self { kind: "internal", message: message.into() }
+    }
+}
+
+/// Classify a non-2xx answer from `/enroll`.
+///
+/// A 5xx is the SERVER failing, not the key failing. Reporting it as a rejection
+/// would send the operator back for a replacement key while the one in their hand
+/// is still perfectly good and still ticking — so it is reported as unreachable,
+/// which is what it functionally is: no verdict was reached.
+///
+/// Everything else in the 4xx range is a verdict. The backend answers unknown,
+/// expired and already-used with one identical 401 by design, so the message here
+/// names all three possibilities rather than pretending to know which.
+fn enroll_failure(status: u16) -> EnrollError {
+    if (500..600).contains(&status) {
+        EnrollError::unreachable(format!("backend error (HTTP {status})"))
+    } else {
+        EnrollError::rejected(
+            "that key was not accepted — it may be mistyped, expired, or already used",
+        )
+    }
+}
+
+/// Redeem a one-time enrollment key for this machine's device token.
+///
+/// `POST {backend}/enroll` is the one backend call in the app that carries NO
+/// bearer — the key itself is the auth — so it deliberately does not go through
+/// `credentials::backend_credential`. On success the returned token is persisted
+/// and this machine is a worker from that moment on: `credential_class` answers
+/// `"device"`, and every subsequent backend call picks the device token up
+/// automatically.
+///
+/// The facts sent are exactly what `info()` reports, so a machine that enrols and
+/// a machine that re-registers describe themselves identically and land in the
+/// same `Device` row.
+///
+/// The key is never logged, not even on failure — it is a bearer credential for
+/// joining a fleet for as long as it lives.
+#[tauri::command]
+pub async fn enroll(
+    app: AppHandle,
+    key: String,
+    backend: Option<String>,
+) -> Result<EnrollOk, EnrollError> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err(EnrollError::rejected("enter the enrollment key"));
+    }
+
+    let info = info(&app).map_err(EnrollError::internal)?;
+    // Same precedence as `start_agent_task`: the frontend's configured base when
+    // it has one (correct in release builds), env/localhost otherwise.
+    let base = backend.unwrap_or_else(crate::agent::backend_url);
+    let url = format!("{}/enroll", base.trim_end_matches('/'));
+
+    let client = reqwest::Client::builder()
+        .timeout(ENROLL_TIMEOUT)
+        .build()
+        .map_err(|e| EnrollError::internal(format!("http client: {e}")))?;
+
+    let body = json!({
+        "key": key,
+        "device_id": info.device_id,
+        "hostname": info.hostname,
+        "os": info.os,
+        "os_version": info.os_version,
+        "app_version": info.app_version,
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        // No response at all: transport, not judgement. Report the endpoint so a
+        // misconfigured backend URL is visible, never the key.
+        .map_err(|e| EnrollError::unreachable(format!("could not reach {url}: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(enroll_failure(status.as_u16()));
+    }
+
+    let parsed: EnrollResponse = resp
+        .json()
+        .await
+        .map_err(|e| EnrollError::internal(format!("unreadable enroll response: {e}")))?;
+    if parsed.device_token.is_empty() {
+        return Err(EnrollError::internal("enroll returned an empty device token"));
+    }
+
+    crate::credentials::set_device_token(&app, &parsed.device_token)
+        .map_err(|e| EnrollError::internal(format!("could not store device token: {e}")))?;
+
+    eprintln!(
+        "[device] enrolled {} ({}) scope={:?}",
+        info.device_id, info.hostname, parsed.scope
+    );
+    Ok(EnrollOk {
+        device_id: info.device_id,
+        hostname: info.hostname,
+        expires_at: parsed.expires_at,
+        scope: parsed.scope,
+        jti: parsed.jti,
+    })
 }
 
 #[cfg(test)]
@@ -282,6 +487,30 @@ mod tests {
         );
         // An unrecognised shape falls back to the whole line rather than "".
         assert_eq!(parse_windows_ver("something else"), "something else");
+    }
+
+    /// The whole reason `EnrollError` carries a `kind`: a rejected key sends the
+    /// operator back for a new one, an unreachable backend tells them to retry
+    /// with the key they already have. Getting 401 and 503 the same way round is
+    /// the mistake this pins.
+    #[test]
+    fn separates_a_rejected_key_from_a_backend_that_did_not_answer() {
+        assert_eq!(enroll_failure(401).kind, "rejected");
+        assert_eq!(enroll_failure(404).kind, "rejected");
+        assert_eq!(enroll_failure(429).kind, "rejected");
+        assert_eq!(enroll_failure(500).kind, "unreachable");
+        assert_eq!(enroll_failure(502).kind, "unreachable");
+        assert_eq!(enroll_failure(503).kind, "unreachable");
+    }
+
+    /// The backend answers unknown / expired / already-used with one
+    /// indistinguishable 401, so the copy must not claim to know which it was.
+    #[test]
+    fn rejection_message_names_every_cause_it_cannot_distinguish() {
+        let m = enroll_failure(401).message;
+        assert!(m.contains("mistyped"), "{m}");
+        assert!(m.contains("expired"), "{m}");
+        assert!(m.contains("already used"), "{m}");
     }
 
     #[test]

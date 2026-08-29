@@ -519,15 +519,29 @@ function PermRow({
 // app — otherwise picking "admin" once means reinstalling to get the launcher
 // back. Switching only changes which shell renders: it grants nothing, and the
 // backend authorizes every request the same way in all three.
+//
+// An enrolled machine is the exception and gets no switcher: it holds a worker
+// credential and nothing else, so the other two shells have no backend behind
+// them here. Saying so beats rendering cards that would only produce 403s.
 function ModeCard() {
-  const { mode, setMode } = useMode()
+  const { mode, setMode, locked } = useMode()
   return (
     <Card title="Mode">
-      <p style={{ marginBottom: 'var(--sp-4)', fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-        Which ScreenBuddy you see. This changes the layout only — your access is
-        the same in every mode.
-      </p>
-      <ModeCards current={mode} onPick={setMode} />
+      {locked ? (
+        <p style={{ margin: 0, fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+          This machine was enrolled into a fleet with an enrollment key, so it
+          runs as a worker. Sign-in and the other shells belong to the account
+          that owns the fleet, not to this machine.
+        </p>
+      ) : (
+        <>
+          <p style={{ marginBottom: 'var(--sp-4)', fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+            Which ScreenBuddy you see. This changes the layout only — your access is
+            the same in every mode.
+          </p>
+          <ModeCards current={mode} onPick={setMode} />
+        </>
+      )}
     </Card>
   )
 }
