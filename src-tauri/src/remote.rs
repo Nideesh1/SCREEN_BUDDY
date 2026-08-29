@@ -24,6 +24,7 @@
 //! cancels the prior task first). A `remote://status` event with `{connected}`
 //! is emitted on every connect/disconnect so the UI can show an indicator.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -51,6 +52,17 @@ const WS_PING_EVERY: Duration = Duration::from_secs(20);
 /// a second socket. Managed as Tauri state.
 #[derive(Default)]
 pub struct RemoteState(pub Mutex<Option<CancellationToken>>);
+
+/// Last value pushed to `remote://status`, so a view that mounts between
+/// connect/disconnect events can ask instead of waiting for the next one.
+///
+/// The event alone is enough for an indicator that lives for the life of the
+/// app, but the worker machine panel is opened cold and the link is the one
+/// thing on it that says whether the machine can receive work at all — leaving
+/// that reading "checking..." until the socket next changes state is the wrong
+/// answer for the longest, and a machine that has been happily connected for an
+/// hour is exactly the case that never fires an event.
+pub static CONNECTED: AtomicBool = AtomicBool::new(false);
 
 /// Derive the WebSocket URL from the backend HTTP(S) base: http→ws, https→wss,
 /// and append the listen path with the session token as a query param.
@@ -91,8 +103,19 @@ fn ws_url_redacted(url: &str) -> &str {
 }
 
 /// Emit the `remote://status` event so the UI indicator can reflect the link.
+/// Also records it for `remote_status`, so the push and the pull can never
+/// disagree — every state change goes through here.
 fn emit_status(app: &AppHandle, connected: bool) {
+    CONNECTED.store(connected, Ordering::Relaxed);
     let _ = app.emit(EV_REMOTE_STATUS, json!({ "connected": connected }));
+}
+
+/// Whether the command channel is up right now. Pull counterpart to the
+/// `remote://status` event; a view should read this on mount and subscribe for
+/// changes.
+#[tauri::command]
+pub fn remote_status() -> bool {
+    CONNECTED.load(Ordering::Relaxed)
 }
 
 /// Handle one decoded text frame. Returns the reply string to send back (if

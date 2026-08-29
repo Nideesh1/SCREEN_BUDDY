@@ -66,9 +66,15 @@ export function inferMode(): AppMode | null {
   return null
 }
 
-// Where each mode lands, and what "unknown route" falls back to.
+// Where each mode lands, and what "unknown route" falls back to. Worker gets
+// /machine rather than the generic Dashboard: the Dashboard reads the backend
+// over `authHeaders()`, which an enrolled machine has nothing to put in, so it
+// was landing every worker in the fleet on a screen that could only ever be
+// empty.
 export function homeRouteFor(mode: AppMode): string {
-  return mode === 'admin' ? '/admin' : '/dashboard'
+  if (mode === 'admin') return '/admin'
+  if (mode === 'worker') return '/machine'
+  return '/dashboard'
 }
 
 interface ModeContextValue {

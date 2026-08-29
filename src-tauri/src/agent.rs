@@ -1333,7 +1333,12 @@ async fn run_agent(
     // spawned; we receive the pre-created `run_id`, announce it, and stamp the
     // status to "running" (the backend stamps `started_at`). All downstream
     // persistence keeps the `Option<String>` shape so it stays best-effort.
-    let _ = app.emit(EV_RUN_STARTED, json!({ "run_id": run_id }));
+    // `task` rides along because a worker's UI cannot ask the backend what it is
+    // running: its device token never leaves Rust, so the machine panel is built
+    // entirely from these events. Without it that panel can only name the run's
+    // id and its last tool call — true, and useless to someone who walked up to
+    // the machine wanting to know what it is doing.
+    let _ = app.emit(EV_RUN_STARTED, json!({ "run_id": run_id, "task": prompt }));
     runs_patch_status(&app, &client, &base, &auth, &run_id, "running").await;
     let run_id: Option<String> = Some(run_id);
     let mut seq: i64 = 0;

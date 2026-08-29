@@ -60,6 +60,7 @@ function RemoteIndicator() {
 // caller that still thinks in view ids has one source of truth.
 export type ViewId =
   | 'dashboard'
+  | 'machine'
   | 'admin'
   | 'artifacts'
   | 'pinned'
@@ -77,6 +78,7 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
+  { id: 'machine', Icon: MachineIcon, label: 'This machine' },
   { id: 'admin', Icon: DeviceIcon, label: 'Devices' },
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
@@ -91,16 +93,20 @@ const ITEMS: NavItem[] = [
 // removes it from the rail, not from the router or from what the backend will
 // answer, so nothing about this map is a permission boundary.
 //
-// worker and consumer are the SAME views today: both are the current desktop
-// app, and worker is simply the reduced rail a fleet node needs (what's running,
-// is it connected, does it have permissions). Worker is expected to diverge into
-// its own purpose-built views later — until it does, two parallel nav trees
-// rendering identical screens would be pure duplication.
+// Worker is down to two entries, and that is the point of the mode rather than
+// an oversight: nobody is sitting in front of a fleet node, so the only screens
+// worth reaching are the machine itself and the settings that fix it. The views
+// it lost were not merely surplus — Dashboard and History read the backend with
+// `authHeaders()`, which an enrolled machine has nothing to put in, so they
+// could only ever render empty there.
 const MODE_ITEMS: Record<AppMode, ViewId[]> = {
   admin: ['admin', 'settings'],
-  worker: ['dashboard', 'history', 'settings'],
+  worker: ['machine', 'settings'],
   consumer: [
     'dashboard',
+    // ...and This machine: the person running agents on their own desktop is
+    // the person who wants to know whether it has the permissions to.
+    'machine',
     // Consumer keeps the Devices entry: the person running their own agents is
     // also the person who wants to see which of their machines are up. Worker
     // doesn't — a fleet node has no business supervising the fleet.
@@ -316,6 +322,18 @@ function ArtifactIcon() {
       <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
       <path d="M3 12.5 12 17l9-4.5" />
       <path d="M3 17 12 21.5 21 17" />
+    </IconBase>
+  )
+}
+
+function MachineIcon() {
+  // A single tower/box, distinct from the fleet's monitor: this is the machine
+  // you are standing on, not the machines you are looking at.
+  return (
+    <IconBase>
+      <rect x="6" y="3" width="12" height="18" rx="2" />
+      <line x1="9" y1="7" x2="15" y2="7" />
+      <circle cx="12" cy="16" r="1.6" />
     </IconBase>
   )
 }

@@ -20,6 +20,7 @@ import Templates from './views/Templates'
 import ScheduleDetail from './views/ScheduleDetail'
 import ScheduleFireModal from './views/ScheduleFireModal'
 import Admin from './views/Admin'
+import Machine from './views/Machine'
 import { useScheduler } from './useScheduler'
 import { ModeProvider, homeRouteFor, useCredentialClass, useDeviceRejected, useMode } from './mode'
 import ModePicker from './ModePicker'
@@ -239,6 +240,12 @@ function ModedShell({
                 a plain browser as well as the desktop app, so nothing in it may
                 depend on the Tauri bridge. */}
             <Route path="admin" element={<Admin />} />
+            {/* This machine — worker mode's home. Reads only local Tauri
+                commands and events, so it is the one fleet screen an enrolled
+                worker can render at all (its device token never reaches the
+                webview). Registered in every mode: a personal or admin user
+                visiting it sees their own machine, which is correct. */}
+            <Route path="machine" element={<Machine />} />
             <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />
             <Route path="credentials" element={<Credentials />} />

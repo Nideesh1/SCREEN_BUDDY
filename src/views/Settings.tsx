@@ -32,7 +32,6 @@ type PermLoad =
 function Settings() {
   // Account info is provided by the router Layout via <Outlet context>.
   const { userEmail, onSignOut } = useOutletContext<LayoutContext>()
-  const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
 
   // The signed-in user's stable Google id (the JWT `sub`). This is the
   // `user_id` openfang / the remote API must target to drive THIS machine.
@@ -52,17 +51,6 @@ function Settings() {
     setCopied(true)
     setTimeout(() => setCopied(false), 1200)
   }, [userId])
-
-  const fetchPerms = useCallback(async () => {
-    setPerm({ state: 'loading' })
-    const res = await safeInvoke<Permissions>('check_permissions')
-    if (res.ok) setPerm({ state: 'ready', perms: res.data })
-    else setPerm({ state: 'unavailable', message: res.error })
-  }, [])
-
-  useEffect(() => {
-    fetchPerms()
-  }, [fetchPerms])
 
   return (
     <div
@@ -115,77 +103,100 @@ function Settings() {
         </div>
       </Card>
 
-      <Card
-        title="Permissions"
-        actions={
-          <Button variant="secondary" size="sm" onClick={fetchPerms}>
-            ↻ Re-check
-          </Button>
-        }
-      >
-        {perm.state === 'loading' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-            <Spinner size={14} /> Checking…
-          </div>
-        )}
-
-        {perm.state === 'unavailable' && (
-          <p style={{ color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-            Permission check unavailable. <span style={{ opacity: 0.8 }}>{perm.message}</span>
-          </p>
-        )}
-
-        {/* Windows has no consent gate for screen capture or input synthesis, so
-            the two PermRows below (and their System Settings deep links) are
-            macOS-only. Showing them here would present two permanently-granted
-            rows plus relaunch instructions that do nothing. What actually limits
-            the agent on Windows is integrity level, which is not grantable — so
-            we state that instead. See src-tauri/src/permissions.rs. */}
-        {perm.state === 'ready' && IS_WINDOWS && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
-            <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)', margin: 0 }}>
-              Windows needs no permission grants — ScreenBuddy can capture the screen and
-              control the mouse and keyboard straight away.
-            </p>
-            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)', margin: 0 }}>
-              One limit: it cannot control windows that are running as administrator
-              (Task Manager, an admin terminal) or User Account Control prompts. Clicks
-              sent there are silently ignored by Windows, so keep those out of a run's
-              path. Running ScreenBuddy as administrator is not recommended.
-            </p>
-          </div>
-        )}
-
-        {perm.state === 'ready' && !IS_WINDOWS && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
-            <PermRow
-              label="Accessibility"
-              granted={perm.perms.accessibility}
-              requestCommand="request_accessibility"
-              deepLink={SETTINGS_DEEP_LINK.accessibility}
-              onAfter={fetchPerms}
-            />
-            <PermRow
-              label="Screen Recording"
-              granted={perm.perms.screenRecording}
-              requestCommand="request_screen_recording"
-              deepLink={SETTINGS_DEEP_LINK.screenRecording}
-              onAfter={fetchPerms}
-            />
-            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-1)' }}>
-              After granting, you must quit and relaunch ScreenBuddy for the change to take effect.
-            </p>
-            <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)', marginTop: -8 }}>
-              In development builds the grant can reset on rebuild; a signed release build is stable.
-            </p>
-          </div>
-        )}
-      </Card>
+      <PermissionsCard />
 
       <AnthropicKeySection />
 
       <TelegramSection />
     </div>
+  )
+}
+
+// The two macOS grants an agent cannot act without, and the controls that fix
+// them. Extracted from the Settings screen because a worker needs exactly this
+// block on its own home: the machine that is missing a grant is the one with
+// nobody sitting at it to notice the run doing nothing.
+export function PermissionsCard() {
+  const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
+
+  const fetchPerms = useCallback(async () => {
+    setPerm({ state: 'loading' })
+    const res = await safeInvoke<Permissions>('check_permissions')
+    if (res.ok) setPerm({ state: 'ready', perms: res.data })
+    else setPerm({ state: 'unavailable', message: res.error })
+  }, [])
+
+  useEffect(() => {
+    fetchPerms()
+  }, [fetchPerms])
+
+  return (
+    <Card
+      title="Permissions"
+      actions={
+        <Button variant="secondary" size="sm" onClick={fetchPerms}>
+          ↻ Re-check
+        </Button>
+      }
+    >
+      {perm.state === 'loading' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          <Spinner size={14} /> Checking…
+        </div>
+      )}
+
+      {perm.state === 'unavailable' && (
+        <p style={{ color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          Permission check unavailable. <span style={{ opacity: 0.8 }}>{perm.message}</span>
+        </p>
+      )}
+
+      {/* Windows has no consent gate for screen capture or input synthesis, so
+          the two PermRows below (and their System Settings deep links) are
+          macOS-only. Showing them here would present two permanently-granted
+          rows plus relaunch instructions that do nothing. What actually limits
+          the agent on Windows is integrity level, which is not grantable — so
+          we state that instead. See src-tauri/src/permissions.rs. */}
+      {perm.state === 'ready' && IS_WINDOWS && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+          <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)', margin: 0 }}>
+            Windows needs no permission grants — ScreenBuddy can capture the screen and
+            control the mouse and keyboard straight away.
+          </p>
+          <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)', margin: 0 }}>
+            One limit: it cannot control windows that are running as administrator
+            (Task Manager, an admin terminal) or User Account Control prompts. Clicks
+            sent there are silently ignored by Windows, so keep those out of a run's
+            path. Running ScreenBuddy as administrator is not recommended.
+          </p>
+        </div>
+      )}
+
+      {perm.state === 'ready' && !IS_WINDOWS && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+          <PermRow
+            label="Accessibility"
+            granted={perm.perms.accessibility}
+            requestCommand="request_accessibility"
+            deepLink={SETTINGS_DEEP_LINK.accessibility}
+            onAfter={fetchPerms}
+          />
+          <PermRow
+            label="Screen Recording"
+            granted={perm.perms.screenRecording}
+            requestCommand="request_screen_recording"
+            deepLink={SETTINGS_DEEP_LINK.screenRecording}
+            onAfter={fetchPerms}
+          />
+          <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-1)' }}>
+            After granting, you must quit and relaunch ScreenBuddy for the change to take effect.
+          </p>
+          <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)', marginTop: -8 }}>
+            In development builds the grant can reset on rebuild; a signed release build is stable.
+          </p>
+        </div>
+      )}
+    </Card>
   )
 }
 

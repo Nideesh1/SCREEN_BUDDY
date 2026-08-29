@@ -230,6 +230,7 @@ pub fn run() {
         device::enroll,
         remote::start_remote_listener,
         remote::stop_remote_listener,
+        remote::remote_status,
         credentials::cred_list,
         credentials::cred_add,
         credentials::cred_delete,
