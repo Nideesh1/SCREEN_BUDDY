@@ -147,10 +147,9 @@ function ModedShell({
             <Route path="history" element={<History />} />
             {/* Templates manager — a Runs sub-view alongside New / Scheduled / History. */}
             <Route path="templates" element={<Templates />} />
-            {/* Admin panel — the human-in-the-loop surface. Mobile-first, and
-                reachable from a phone browser as well as the desktop app: the
-                decisions it will carry happen away from the desk. A placeholder
-                for now; the approval protocol behind it is still being designed. */}
+            {/* Devices — the fleet supervisor, and admin mode's home. Served in
+                a plain browser as well as the desktop app, so nothing in it may
+                depend on the Tauri bridge. */}
             <Route path="admin" element={<Admin />} />
             <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />

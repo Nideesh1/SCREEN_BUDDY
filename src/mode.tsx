@@ -9,8 +9,8 @@ import { isTauri } from './lib'
 // didn't already have. Keep it that way: no `if (mode === 'admin')` guard may
 // ever stand in for an authorization check.
 //
-//   admin    — the checkpoint inbox / decision screen / nudge. Mobile-first,
-//              and the only mode that works in a plain browser on a phone.
+//   admin    — supervises the fleet: which machines are up, what they are
+//              running, and how to take one over. Works in a plain browser.
 //   worker   — this machine as a fleet node. Sparse: what's running, whether
 //              it's connected, whether it has the permissions it needs.
 //   consumer — the full desktop ScreenBuddy: launch, history, templates,
@@ -21,7 +21,7 @@ export const MODES: { id: AppMode; label: string; blurb: string; icon: string }[
   {
     id: 'admin',
     label: 'Admin',
-    blurb: 'Approve or reject what agents claim they finished, and steer runs in flight. Works on a phone.',
+    blurb: 'Supervise the fleet: which machines are up, what each is running, and remote access to any of them.',
     icon: '✓',
   },
   {

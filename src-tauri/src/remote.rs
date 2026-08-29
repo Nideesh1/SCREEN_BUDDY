@@ -54,7 +54,13 @@ pub struct RemoteState(pub Mutex<Option<CancellationToken>>);
 
 /// Derive the WebSocket URL from the backend HTTP(S) base: http→ws, https→wss,
 /// and append the listen path with the session token as a query param.
-fn ws_url(backend: &str, token: &str) -> String {
+///
+/// `device_id` rides along so the backend can stamp liveness against the right
+/// machine: the token identifies the *user*, and one user can have several
+/// desktops connected at once. It stays SECOND in the query string on purpose —
+/// `ws_url_redacted` truncates at `?token=`, so anything after the token is
+/// hidden along with it and the redaction keeps working unchanged.
+fn ws_url(backend: &str, token: &str, device_id: &str) -> String {
     let base = backend.trim_end_matches('/');
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -64,7 +70,11 @@ fn ws_url(backend: &str, token: &str) -> String {
         // Already a ws(s) scheme or bare host — pass through untouched.
         base.to_string()
     };
-    format!("{ws_base}/agent/listen?token={}", urlencoding::encode(token))
+    format!(
+        "{ws_base}/agent/listen?token={}&device_id={}",
+        urlencoding::encode(token),
+        urlencoding::encode(device_id)
+    )
 }
 
 /// The same URL with the token query stripped, for logging.
@@ -195,6 +205,19 @@ async fn run_connection(app: &AppHandle, url: &str, backend: &str, auth: &str, t
 
     emit_status(app, true);
     eprintln!("[remote] connected");
+
+    // Announce this machine to the fleet. Fired on every successful connect
+    // rather than once at listener start, because that is the moment we know the
+    // backend is actually reachable — and it gives the retry for free: a
+    // registration lost to a server restart is re-sent by the next reconnect,
+    // with no retry loop of its own. Detached and never awaited, so a slow or
+    // dead `/devices` cannot delay serving run frames.
+    tauri::async_runtime::spawn(crate::device::register(
+        app.clone(),
+        backend.to_string(),
+        auth.to_string(),
+    ));
+
     let (mut write, mut read) = stream.split();
     let mut ping = interval(WS_PING_EVERY);
     ping.tick().await; // consume the immediate first tick
@@ -286,8 +309,17 @@ pub fn start_remote_listener(
     *guard = Some(cancel.clone());
     drop(guard);
 
-    let url = ws_url(&backend, &token);
-    eprintln!("[remote] listener starting → {}", ws_url_redacted(&url));
+    // A device id we cannot read is not worth refusing to connect over: the
+    // socket still works without it, the backend just can't attribute liveness.
+    let device_id = crate::device::device_id(&app).unwrap_or_else(|e| {
+        eprintln!("[remote] no device id ({e}); connecting without one");
+        String::new()
+    });
+    let url = ws_url(&backend, &token, &device_id);
+    eprintln!(
+        "[remote] listener starting → {} (device {device_id})",
+        ws_url_redacted(&url)
+    );
     tauri::async_runtime::spawn(listen_loop(app, url, backend, token, cancel));
     Ok(())
 }
@@ -309,12 +341,22 @@ mod tests {
     #[test]
     fn derives_ws_scheme_and_path() {
         assert_eq!(
-            ws_url("https://api.example.com", "abc"),
-            "wss://api.example.com/agent/listen?token=abc"
+            ws_url("https://api.example.com", "abc", "dev-1"),
+            "wss://api.example.com/agent/listen?token=abc&device_id=dev-1"
         );
         assert_eq!(
-            ws_url("http://localhost:8000/", "a b"),
-            "ws://localhost:8000/agent/listen?token=a%20b"
+            ws_url("http://localhost:8000/", "a b", "dev 1"),
+            "ws://localhost:8000/agent/listen?token=a%20b&device_id=dev%201"
         );
+    }
+
+    /// The redaction predates the `device_id` param; this pins the fact that a
+    /// second query param did not sneak the credential back into the logs.
+    #[test]
+    fn redaction_still_hides_the_token_with_a_second_param() {
+        let url = ws_url("https://api.example.com", "s3cret", "dev-1");
+        let shown = ws_url_redacted(&url);
+        assert_eq!(shown, "wss://api.example.com/agent/listen");
+        assert!(!shown.contains("s3cret"));
     }
 }

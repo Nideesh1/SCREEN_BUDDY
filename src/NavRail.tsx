@@ -77,7 +77,7 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
-  { id: 'admin', Icon: ApprovalIcon, label: 'Approvals' },
+  { id: 'admin', Icon: DeviceIcon, label: 'Devices' },
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
   { id: 'runs', Icon: PlusIcon, label: 'Runs' },
@@ -101,9 +101,9 @@ const MODE_ITEMS: Record<AppMode, ViewId[]> = {
   worker: ['dashboard', 'history', 'settings'],
   consumer: [
     'dashboard',
-    // Consumer keeps the Approvals entry: the person running
-    // their own agents is also the person those agents wait on. Worker doesn't
-    // — nobody is sitting in front of a fleet node to decide anything.
+    // Consumer keeps the Devices entry: the person running their own agents is
+    // also the person who wants to see which of their machines are up. Worker
+    // doesn't — a fleet node has no business supervising the fleet.
     'admin',
     'artifacts',
     'pinned',
@@ -320,13 +320,13 @@ function ArtifactIcon() {
   )
 }
 
-function ApprovalIcon() {
-  // A checkmark inside a document — a claim of "done" awaiting a signature.
+function DeviceIcon() {
+  // A monitor on a stand — the fleet, seen one machine at a time.
   return (
     <IconBase>
-      <path d="M6 3h8l4 4v14H6z" />
-      <path d="M14 3v4h4" />
-      <polyline points="9 14 11 16 15 12" />
+      <rect x="3" y="4" width="18" height="12" rx="1.5" />
+      <path d="M9 20h6" />
+      <path d="M12 16v4" />
     </IconBase>
   )
 }

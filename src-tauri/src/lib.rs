@@ -7,6 +7,7 @@ mod artifacts;
 mod capture;
 mod computer;
 mod credentials;
+mod device;
 mod permissions;
 mod pinned;
 mod remote;
@@ -225,6 +226,7 @@ pub fn run() {
         agent::stop_agent_task,
         agent::model_endpoint,
         agent::check_model_endpoint,
+        device::device_info,
         remote::start_remote_listener,
         remote::stop_remote_listener,
         credentials::cred_list,
