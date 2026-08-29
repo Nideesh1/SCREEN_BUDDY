@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
+import { CU_BACKEND, authHeaders, isTauri, relativeTime, safeInvoke } from '../lib'
 import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
 
 // One machine in the fleet, field-for-field the backend contract for
@@ -1129,6 +1129,12 @@ function NowCard({
 // not a convenience but the fallback that keeps the pane useful. Copy is always
 // offered, never hidden behind the Take-over button having failed.
 //
+// Inside Tauri the handoff MUST go through the shell plugin. Assigning
+// window.location.href to a custom scheme is swallowed by the webview — it
+// navigates nowhere and launches nothing, which is indistinguishable from an
+// unregistered scheme and was exactly the bug here. In a browser the plugin
+// does not exist, so the assignment remains the right call there.
+//
 // The id is edited HERE rather than in the Details card below because filling it
 // in is the whole reason this pane is writable: a machine with no id is a
 // machine nobody can reach when its run goes wrong.
@@ -1252,11 +1258,20 @@ function RemoteDesktopCard({
         <div style={{ marginLeft: 'auto' }}>
           <Button
             variant="primary"
-            onClick={() => {
-              // Hands off to the OS handler. If nothing has registered
-              // `rustdesk://` this is silently inert — which is exactly why the
-              // id above stays copyable.
-              window.location.href = `rustdesk://${encodeURIComponent(id)}`
+            onClick={async () => {
+              const url = `rustdesk://${encodeURIComponent(id)}`
+              if (isTauri()) {
+                try {
+                  const { open } = await import('@tauri-apps/plugin-shell')
+                  await open(url)
+                  return
+                } catch {
+                  // Plugin missing or the OS has no handler — fall through to
+                  // the browser path, which fails the same silent way. Either
+                  // way the id above is still copyable.
+                }
+              }
+              window.location.href = url
             }}
           >
             Take over
