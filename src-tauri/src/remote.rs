@@ -324,6 +324,13 @@ async fn listen_loop(app: AppHandle, url: String, backend: String, auth: String,
 /// sockets. `token` is the session token the frontend holds, if any; `backend` is
 /// the HTTP(S) base (http→ws / https→wss).
 ///
+/// `token` is OPTIONAL because an enrolled worker genuinely has none — its
+/// credential lives in the Rust store and never reaches the webview, so the
+/// frontend calls this with `backend` alone. Requiring it made Tauri reject the
+/// invocation before the command ever ran, and since the call site is
+/// best-effort the socket simply never opened: the machine sat there enrolled,
+/// idle and unreachable, with nothing anywhere saying why.
+///
 /// What actually goes on the wire is whatever `credentials::backend_credential`
 /// returns — the stored device token on an enrolled worker, the session token
 /// otherwise. The URL is fixed for the life of the task, so a machine that
@@ -333,7 +340,7 @@ async fn listen_loop(app: AppHandle, url: String, backend: String, auth: String,
 pub fn start_remote_listener(
     app: AppHandle,
     state: tauri::State<'_, RemoteState>,
-    token: String,
+    token: Option<String>,
     backend: String,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|e| format!("remote state poisoned: {e}"))?;
@@ -353,7 +360,8 @@ pub fn start_remote_listener(
     });
     // One credential choice, made here and carried through both the socket and
     // any run this socket starts.
-    let token = crate::credentials::backend_credential(&app, &token).unwrap_or_default();
+    let token = crate::credentials::backend_credential(&app, &token.unwrap_or_default())
+        .unwrap_or_default();
     let url = ws_url(&backend, &token, &device_id);
     eprintln!(
         "[remote] listener starting → {} (device {device_id})",
