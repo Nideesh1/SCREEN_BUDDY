@@ -35,6 +35,127 @@ fn backend_url() -> String {
 fn anthropic_base() -> String {
     std::env::var("CU_ANTHROPIC_BASE").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
 }
+/// Whether the configured model endpoint is Anthropic's own API.
+///
+/// This is the ONLY thing that decides whether a BYOK key is required. The key
+/// requirement exists because the key travels to Anthropic; point
+/// `CU_ANTHROPIC_BASE` at a self-hosted server and there is no Anthropic
+/// credential involved, so demanding one just blocks the run.
+///
+/// Deliberately derived from the endpoint rather than a user-facing "skip the
+/// key" toggle: a toggle can be left on after switching back to Anthropic, and
+/// the symptom is then an opaque 401 instead of a clear prompt. Host-based, so
+/// it cannot fall out of sync with where requests actually go.
+fn endpoint_is_anthropic(base: &str) -> bool {
+    let host = base
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = host.split(['/', ':']).next().unwrap_or("");
+    host.eq_ignore_ascii_case("api.anthropic.com") || host.is_empty()
+}
+
+/// What the UI needs to decide between "enter your Anthropic key" and "verify
+/// your self-hosted endpoint": the base URL to show, and which mode we're in.
+#[derive(serde::Serialize)]
+pub struct ModelEndpoint {
+    pub base: String,
+    pub is_anthropic: bool,
+    pub model: String,
+}
+
+#[tauri::command]
+pub fn model_endpoint() -> ModelEndpoint {
+    let base = anthropic_base();
+    ModelEndpoint {
+        is_anthropic: endpoint_is_anthropic(&base),
+        base,
+        model: model(),
+    }
+}
+
+/// Reachability probe for a self-hosted endpoint — the counterpart to
+/// `validate_anthropic_key` on the BYOK path. Sends the smallest possible real
+/// Messages request rather than pinging a health route, because a server can be
+/// listening and still be unable to serve this API shape; only a round trip
+/// through `/v1/messages` proves a run would work.
+#[tauri::command]
+pub async fn check_model_endpoint() -> Result<String, String> {
+    let base = anthropic_base();
+    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let body = json!({
+        "model": model(),
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "hi" }],
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let txt = resp.text().await.unwrap_or_default();
+        let txt: String = txt.chars().take(300).collect();
+        return Err(format!("{url} returned {status}: {txt}"));
+    }
+    Ok(model())
+}
+
+/// Whether to attach a fresh screenshot to the tool_result of every action that
+/// changes what is on screen, instead of waiting for the model to ask for one.
+///
+/// Anthropic's models reliably call `screenshot` between actions, so the extra
+/// image would be pure token cost there and this defaults OFF for them. Other
+/// models frequently do not: a run that types, presses Return and types again
+/// without ever looking is flying blind, and it *reports success* because
+/// nothing ever contradicted it. Defaults ON for any non-Anthropic endpoint.
+///
+/// `CU_AUTO_SCREENSHOT=1/0` forces it either way.
+fn auto_screenshot_enabled() -> bool {
+    match std::env::var("CU_AUTO_SCREENSHOT").ok().as_deref() {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => !endpoint_is_anthropic(&anthropic_base()),
+    }
+}
+
+/// Actions after which the screen may look different. `screenshot` and `zoom`
+/// already return an image; `wait` is how a model asks to observe a settling UI,
+/// so it is included deliberately.
+fn action_changes_screen(action: &str) -> bool {
+    matches!(
+        action,
+        "left_click"
+            | "right_click"
+            | "middle_click"
+            | "double_click"
+            | "triple_click"
+            | "left_click_drag"
+            | "left_mouse_down"
+            | "left_mouse_up"
+            | "mouse_move"
+            | "type"
+            | "key"
+            | "hold_key"
+            | "scroll"
+            | "wait"
+    )
+}
+
+/// How long to let the UI settle before the auto-screenshot. A capture taken the
+/// instant after a click routinely shows the PREVIOUS frame — which is worse
+/// than no screenshot, because the model then "sees" that its action did
+/// nothing and undoes or repeats it.
+const AUTO_SCREENSHOT_SETTLE: Duration = Duration::from_millis(600);
+
 /// Anthropic Messages API version header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header enabling the official enhanced computer-use tool
@@ -46,8 +167,36 @@ fn model() -> String {
     std::env::var("CU_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
 }
 
-const MAX_ITERS: usize = 150;
+/// Default hard iteration cap. Long unattended runs routinely need more than
+/// this, so it is only a default — see `max_iters`.
+const DEFAULT_MAX_ITERS: usize = 150;
+/// Hard iteration cap for one run. Overridable because a 24/7 unattended run
+/// against a self-hosted model can legitimately need hundreds of turns, while
+/// an interactive run wants a low ceiling. `CU_MAX_ITERS=0` means UNBOUNDED —
+/// only set that when something else (cancellation, a watchdog) can stop the
+/// run, since nothing else will.
+fn max_iters() -> usize {
+    std::env::var("CU_MAX_ITERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_ITERS)
+}
+/// Consecutive assistant turns with zero content blocks before we abort the run
+/// as FAILED. See the guard in `run_agent` — an empty turn is a dropped turn,
+/// not a finish, and must never be reported as a completion.
+const MAX_EMPTY_TURNS: usize = 3;
 const MAX_TOKENS: u32 = 4096;
+/// Retries for a failed model call before the run is failed. Unattended runs
+/// span hours, so a single transport hiccup must not be terminal — but a
+/// genuinely broken endpoint should still surface quickly rather than spin.
+const MAX_TURN_RETRIES: usize = 3;
+/// Retries for a failed screen capture. Capture fails transiently while a
+/// display sleeps, a Space switches or a monitor is re-configured; a moment
+/// later it succeeds.
+const MAX_CAPTURE_RETRIES: usize = 2;
+/// Pause between capture retries. Deliberately short: `dispatch_action` is
+/// synchronous (it holds the Computer mutex), so this blocks its thread.
+const CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// Keep only the N most recent screenshots in context; older ones are replaced
 /// with a placeholder so the conversation doesn't balloon (loop.py's
 /// keep-N-recent image pruning). Set to 2 (was 3): one fewer live full image per
@@ -245,6 +394,19 @@ impl SseAccumulator {
                     Some("text") => {
                         let init = cb.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         self.blocks.insert(idx, BlockAcc::Text(init.to_string()));
+                        // Anthropic opens a text block empty and streams the body
+                        // as `text_delta`s, so this is normally "". A server that
+                        // synthesizes its stream from a non-streamed upstream can
+                        // instead put the WHOLE text here and send no deltas at
+                        // all — and then the live timeline stayed blank while the
+                        // persisted transcript (assembled from the final content
+                        // array, not from deltas) had every line. Emit it here too
+                        // so both paths see the same text either way.
+                        if !init.is_empty() {
+                            if let Some(app) = app {
+                                let _ = app.emit(EV_TEXT, json!({ "delta": init }));
+                            }
+                        }
                     }
                     Some("tool_use") => {
                         let id = cb.get("id").and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -486,6 +648,28 @@ fn modifiers(input: &Value) -> Vec<String> {
         .collect()
 }
 
+/// `capture::take_screenshot` with bounded retries. A capture is the one thing
+/// every turn depends on, and its failures are usually momentary (the display
+/// asleep, a Space mid-switch); surfacing the first one as a tool error costs
+/// the model a turn and can derail a long run. Blocking sleeps because the only
+/// callers are synchronous (`dispatch_action` holds the Computer mutex).
+fn take_screenshot_retrying() -> Result<capture::Capture, capture::CaptureError> {
+    let mut attempt: usize = 0;
+    loop {
+        match capture::take_screenshot() {
+            Ok(cap) => return Ok(cap),
+            Err(e) if attempt < MAX_CAPTURE_RETRIES => {
+                attempt += 1;
+                eprintln!(
+                    "[agent] capture failed ({e}); retry {attempt}/{MAX_CAPTURE_RETRIES}"
+                );
+                std::thread::sleep(CAPTURE_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Map a single `computer` tool action onto the driver/capture and build the
 /// tool_result content. `last_sent` tracks the most recent screenshot's
 /// (sent_w, sent_h) so clicks can re-assert the coordinate contract.
@@ -507,7 +691,7 @@ fn dispatch_action(
     };
 
     match action {
-        "screenshot" => match capture::take_screenshot() {
+        "screenshot" => match take_screenshot_retrying() {
             Ok(cap) => {
                 *last_sent = Some((cap.sent_w, cap.sent_h));
                 // Opportunistically update an already-initialized driver.
@@ -766,6 +950,118 @@ fn prune_images(messages: &mut [Value], keep: usize) {
 /// Text we replace pruned screenshots with. Also the marker `set_rolling_cache`
 /// scans for to find the permanently-settled prefix.
 const IMAGE_STUB: &str = "[screenshot removed to save context]";
+
+/// Marker appended to a truncated text block. Distinct from `IMAGE_STUB` on
+/// purpose: `set_rolling_cache` keys the cache frontier off `IMAGE_STUB`, and a
+/// truncated text block must never be mistaken for a pruned screenshot.
+const TEXT_STUB: &str = " […truncated to save context]";
+/// Turns whose text is kept verbatim. Assistant reasoning and tool_result text
+/// are what the model steers by in the near term; further back only the gist
+/// matters, and on a 24/7 run the tail is what fills the context window.
+const KEEP_RECENT_TURNS: usize = 40;
+/// Only text blocks longer than this are worth truncating — short ones cost
+/// nothing and truncating them would lose whole tool results (an error string,
+/// a coordinate confirmation) for no gain.
+const MAX_TEXT_CHARS: usize = 2000;
+/// How much of the head of a long block survives. Enough that the block still
+/// says what it was about; the rest is what actually costs tokens.
+const TEXT_HEAD_CHARS: usize = 240;
+/// Minimum number of blocks that must be truncatable before we truncate ANY.
+///
+/// WHY batch: every mutation behind the rolling cache breakpoint invalidates
+/// the cached prefix. Truncating the one block that crossed the window each
+/// turn would therefore cost a full prefix re-write EVERY turn. Waiting until a
+/// batch has accumulated pays that cost once per ~batch turns instead. The
+/// count only ever grows by a turn's worth of blocks, so this self-paces.
+const TEXT_PRUNE_BATCH: usize = 20;
+
+/// Keep the conversation's TEXT bounded the way `prune_images` bounds its
+/// images: truncate long text blocks in turns older than `keep_turns`, leaving
+/// a short marker behind.
+///
+/// Same exemption as `prune_images`: index 0 carries the pinned reference set
+/// and the STATIC cache breakpoint, so it is never touched — mutating it would
+/// bust the once-per-run cached prefix.
+///
+/// Structure is preserved exactly: no message and no block is ever removed, and
+/// only the `text` field of a `text` block is rewritten. Deleting a message
+/// would orphan a later `tool_result`'s `tool_use_id` and the API would reject
+/// the conversation; dropping blocks would break the assistant/user alternation
+/// and the tool_use/tool_result pairing. When in doubt this truncates less.
+fn prune_text(messages: &mut [Value], keep_turns: usize) {
+    // Two messages per turn: the assistant message and the user message
+    // carrying its tool_results.
+    let keep = keep_turns.saturating_mul(2);
+    // Index 0 is exempt, so only messages[1..cutoff] are candidates.
+    let cutoff = messages.len().saturating_sub(keep);
+    if cutoff <= 1 {
+        return;
+    }
+
+    // Collect (message, block, inner-block) positions of every long text block:
+    // `None` inner index = a top-level assistant/user text block, `Some(ci)` =
+    // a text block nested in a tool_result's content.
+    let mut positions: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    for (mi, msg) in messages.iter().enumerate().take(cutoff).skip(1) {
+        let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for (bi, block) in blocks.iter().enumerate() {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if is_long_text(block) {
+                        positions.push((mi, bi, None));
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
+                        for (ci, ib) in inner.iter().enumerate() {
+                            if ib.get("type").and_then(|t| t.as_str()) == Some("text")
+                                && is_long_text(ib)
+                            {
+                                positions.push((mi, bi, Some(ci)));
+                            }
+                        }
+                    }
+                }
+                // tool_use inputs are the model's own arguments (coordinates,
+                // keys) — small, and mangling them would corrupt the pairing.
+                _ => {}
+            }
+        }
+    }
+    if positions.len() < TEXT_PRUNE_BATCH {
+        return;
+    }
+    for (mi, bi, ci) in positions {
+        let slot = match ci {
+            Some(ci) => &mut messages[mi]["content"][bi]["content"][ci]["text"],
+            None => &mut messages[mi]["content"][bi]["text"],
+        };
+        if let Some(s) = slot.as_str() {
+            *slot = Value::String(truncate_text(s));
+        }
+    }
+}
+
+/// A text block long enough to be worth truncating. Already-truncated blocks
+/// are short by construction, so this is what makes `prune_text` idempotent.
+fn is_long_text(block: &Value) -> bool {
+    block
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map_or(false, |s| s.chars().count() > MAX_TEXT_CHARS)
+}
+
+/// Head of `s` plus `TEXT_STUB`, cut on a char boundary (byte slicing would
+/// panic mid-UTF-8, and model text is full of non-ASCII).
+fn truncate_text(s: &str) -> String {
+    let end = s
+        .char_indices()
+        .nth(TEXT_HEAD_CHARS)
+        .map_or(s.len(), |(i, _)| i);
+    format!("{}{}", &s[..end], TEXT_STUB)
+}
 
 /// Maintain ONE rolling `cache_control` breakpoint that tracks the pruning
 /// frontier, so the cached conversation prefix matches turn-over-turn.
@@ -1042,6 +1338,12 @@ async fn run_agent(
     // user-facing error (not a raw 401 from a later request).
     let api_key = match crate::credentials::anthropic_key(&app) {
         Some(k) => k,
+        // A self-hosted endpoint has no Anthropic credential to supply, so a
+        // missing key is not an error there — send an empty `x-api-key` and let
+        // the endpoint decide. Only the real Anthropic API can actually be
+        // blocked by this, so only it refuses up front. See
+        // `endpoint_is_anthropic`.
+        None if !endpoint_is_anthropic(&anthropic_base()) => String::new(),
         None => {
             let msg = "No Anthropic API key set — add one in Settings";
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
@@ -1088,7 +1390,10 @@ async fn run_agent(
     // those dims (and seed `last_sent` + the driver size belt-and-suspenders); if
     // capture fails (e.g. Screen Recording permission missing), fall back to
     // computing the would-be sent size from the primary monitor.
-    let (disp_w, disp_h) = match capture::take_screenshot() {
+    // We also KEEP this capture's jpeg (see `initial_shot` below) — it is a
+    // free, correctly-sized picture of the screen the run starts on.
+    let mut initial_shot: Option<String> = None;
+    let (disp_w, disp_h) = match take_screenshot_retrying() {
         Ok(cap) => {
             last_sent = Some((cap.sent_w, cap.sent_h));
             let comp_state = app.state::<ComputerState>();
@@ -1097,6 +1402,7 @@ async fn run_agent(
                     c.set_screenshot_size(cap.sent_w as i32, cap.sent_h as i32);
                 }
             }
+            initial_shot = Some(cap.jpeg_base64);
             (cap.sent_w, cap.sent_h)
         }
         Err(e) => {
@@ -1106,7 +1412,46 @@ async fn run_agent(
     };
     let tool = computer_tool(disp_w, disp_h);
 
-    for turn in 1..=MAX_ITERS {
+    // Consecutive empty assistant turns; reset by any turn that carries content.
+    let mut empty_turns: usize = 0;
+
+    // Resolved once per run so a mid-run env change can't make some turns carry
+    // an auto-screenshot and others not.
+    let auto_screenshot = auto_screenshot_enabled();
+    eprintln!("[agent] auto-screenshot after actions: {auto_screenshot}");
+
+    // Give the model the starting screen BEFORE its first move. Auto-screenshots
+    // only cover turns that follow an action, so without this turn 1 is blind and
+    // the model must spend a turn asking for a picture — which also makes the run
+    // depend on the endpoint supporting the `screenshot` action at all. The image
+    // is the capture we already took to size the tool, so it costs nothing extra.
+    //
+    // A SEPARATE message, deliberately not folded into messages[0]: that message
+    // owns the static cache breakpoint and is exempt from `prune_images`, so an
+    // image placed there would be re-sent verbatim on every turn for the whole
+    // run. Here it retires normally once newer screenshots arrive.
+    if auto_screenshot {
+        if let Some(shot) = initial_shot.take() {
+            messages.push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here is the current screen before you begin."},
+                    image_block(&shot),
+                ],
+            }));
+        }
+    }
+
+    // Resolved once per run so a mid-run env change can't shift the ceiling
+    // under us. 0 == unbounded (see `max_iters`), expressed as a `loop` because
+    // a range can't say "no end".
+    let max_iters = max_iters();
+    let mut turn: usize = 0;
+    loop {
+        turn += 1;
+        if max_iters != 0 && turn > max_iters {
+            break;
+        }
         if token.is_cancelled() {
             let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
             if let Some(rid) = &run_id {
@@ -1147,7 +1492,42 @@ async fn run_agent(
             "stream": true,
         });
 
-        let turn_ok = match stream_turn(&client, &url, &api_key, &body, &app, &token).await {
+        // A 500, an overloaded backend or a dropped connection is a blip, not a
+        // reason to abandon a multi-hour run — retry the turn with exponential
+        // backoff before surfacing the failure. The request is idempotent from
+        // our side (nothing has been appended to `messages` yet), so a retry
+        // simply re-asks for the same turn. Cancellation is NOT retried: it is
+        // the user's decision, and it ends the run immediately as before.
+        let mut attempt: usize = 0;
+        let attempted = loop {
+            match stream_turn(&client, &url, &api_key, &body, &app, &token).await {
+                Ok(r) => break Ok(r),
+                Err(TurnError::Cancelled) => break Err(TurnError::Cancelled),
+                Err(TurnError::Http(e)) => {
+                    if attempt >= MAX_TURN_RETRIES {
+                        break Err(TurnError::Http(e));
+                    }
+                    attempt += 1;
+                    // 1s, 2s, 4s — long enough to ride out a restart or a rate
+                    // limit, short enough that a wedged run is still visible.
+                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    eprintln!(
+                        "[agent] turn {turn} failed ({e}); retry {attempt}/{MAX_TURN_RETRIES} in {}s",
+                        delay.as_secs()
+                    );
+                    // A stop pressed during backoff must take effect now, not
+                    // after the sleep — fold it into the same cancelled path.
+                    let cancelled = tokio::select! {
+                        _ = token.cancelled() => true,
+                        _ = tokio::time::sleep(delay) => false,
+                    };
+                    if cancelled {
+                        break Err(TurnError::Cancelled);
+                    }
+                }
+            }
+        };
+        let turn_ok = match attempted {
             Ok(r) => r,
             Err(TurnError::Cancelled) => {
                 let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
@@ -1207,6 +1587,37 @@ async fn run_agent(
             }
         }
 
+        // An assistant turn with ZERO content blocks is never a legitimate
+        // finish — the model spent output tokens and we got nothing back. It
+        // means the turn was dropped somewhere in transport (a proxy that maps
+        // a terminal action to `end_turn` and discards its text does exactly
+        // this). Left alone it is indistinguishable from success: the
+        // `tool_uses.is_empty()` branch below would finalize the run as
+        // "completed" with an empty summary, and we would also push an
+        // empty-content assistant message that the next request rejects.
+        //
+        // Retry the turn instead. Only after `MAX_EMPTY_TURNS` consecutive
+        // empties do we give up, and then as a FAILURE — never as a silent
+        // completion. Any non-empty turn resets the counter.
+        if content.is_empty() {
+            empty_turns += 1;
+            eprintln!("[agent] empty assistant turn ({empty_turns}/{MAX_EMPTY_TURNS}); retrying");
+            if empty_turns < MAX_EMPTY_TURNS {
+                continue;
+            }
+            let msg = "model returned empty responses; run aborted";
+            let _ = app.emit(EV_ERROR, json!({ "error": msg }));
+            if let Some(rid) = &run_id {
+                runs_finalize(
+                    &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                    total_cache_create, total_cache_read, Value::Null, Some(msg),
+                )
+                .await;
+            }
+            return;
+        }
+        empty_turns = 0;
+
         messages.push(json!({"role": "assistant", "content": content.clone()}));
 
         let tool_uses: Vec<&Value> = content
@@ -1253,8 +1664,50 @@ async fn run_agent(
                 if name == "computer" {
                     let action =
                         tu["input"].get("action").and_then(|a| a.as_str()).unwrap_or("");
-                    let outcome =
+                    let mut outcome =
                         dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent);
+
+                    // Show the model what its action did. Without this, a model
+                    // that never calls `screenshot` acts on a stale view for the
+                    // whole run and then reports success — see
+                    // `auto_screenshot_enabled`. Skipped when the outcome already
+                    // carries an image (`screenshot`/`zoom`) so we never send two,
+                    // and skipped on failure so an error keeps its own message.
+                    if auto_screenshot && !outcome.is_error && action_changes_screen(action) {
+                        let has_image = outcome.content.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("image")
+                        });
+                        if !has_image {
+                            std::thread::sleep(AUTO_SCREENSHOT_SETTLE);
+                            match take_screenshot_retrying() {
+                                Ok(cap) => {
+                                    last_sent = Some((cap.sent_w, cap.sent_h));
+                                    if let Ok(mut g) = comp_state.0.lock() {
+                                        if let Some(c) = g.as_mut() {
+                                            c.set_screenshot_size(
+                                                cap.sent_w as i32,
+                                                cap.sent_h as i32,
+                                            );
+                                        }
+                                    }
+                                    let _ = app.emit(
+                                        EV_SCREENSHOT,
+                                        json!({
+                                            "jpeg_base64": cap.jpeg_base64,
+                                            "sent_w": cap.sent_w, "sent_h": cap.sent_h,
+                                            "screen_w": cap.screen_w, "screen_h": cap.screen_h
+                                        }),
+                                    );
+                                    outcome.content.push(image_block(&cap.jpeg_base64));
+                                }
+                                // A failed auto-capture must not fail the action
+                                // the model actually asked for; it just means this
+                                // turn carries no image.
+                                Err(e) => eprintln!("[agent] auto-screenshot failed: {e}"),
+                            }
+                        }
+                    }
+
                     // Pull any screenshot (jpeg base64) out of the tool_result
                     // image blocks before the outcome is moved into tool_result.
                     let shots: Vec<String> = outcome
@@ -1352,22 +1805,28 @@ async fn run_agent(
 
         messages.push(json!({"role": "user", "content": results}));
         prune_images(&mut messages, KEEP_RECENT_IMAGES);
+        // Images are the bulk, but on a run of hundreds of turns assistant and
+        // tool_result TEXT alone will fill the window; bound it too.
+        prune_text(&mut messages, KEEP_RECENT_TURNS);
         // Re-place the rolling cache breakpoint on the newest settled (stubbed)
         // message AFTER pruning advances the frontier this turn.
         set_rolling_cache(&mut messages);
     }
 
-    let _ = app.emit(EV_ERROR, json!({"error": "reached max iterations without finishing"}));
+    // Only reachable with a bounded cap; name the number, since it is now
+    // configurable and "max iterations" alone no longer says which one was hit.
+    let msg = format!("reached max iterations ({max_iters}) without finishing");
+    let _ = app.emit(EV_ERROR, json!({ "error": msg.clone() }));
     let _ = app
         .notification()
         .builder()
         .title("ScreenBuddy — run failed")
-        .body("reached max iterations without finishing")
+        .body(msg.clone())
         .show();
     if let Some(rid) = &run_id {
         runs_finalize(
             &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
-            Value::Null, Some("reached max iterations without finishing"),
+            Value::Null, Some(&msg),
         )
         .await;
     }
@@ -1599,6 +2058,101 @@ data: {\"type\":\"message_stop\"}
         }
         assert_eq!(images, 2, "two most recent images kept");
         assert_eq!(placeholders, 3, "three older images replaced");
+    }
+
+    /// Build a conversation of `turns` assistant/tool_result pairs, each
+    /// carrying one long text block (assistant text + tool_result text), after
+    /// the exempt seed at index 0.
+    fn text_convo(turns: usize) -> Vec<Value> {
+        let long = |tag: &str| format!("{tag} {}", "x".repeat(MAX_TEXT_CHARS + 10));
+        let mut messages =
+            vec![json!({"role": "user", "content": [{"type": "text", "text": long("seed")}]})];
+        for i in 0..turns {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": long(&format!("think{i}"))},
+                    {"type": "tool_use", "id": format!("t{i}"), "name": "computer",
+                     "input": {"action": "screenshot"}}
+                ]
+            }));
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("t{i}"),
+                    "is_error": false,
+                    "content": [{"type": "text", "text": long(&format!("result{i}"))}]
+                }]
+            }));
+        }
+        messages
+    }
+
+    /// Text pruning truncates old blocks, leaves the recent window and the
+    /// exempt seed verbatim, and never touches message/block structure.
+    #[test]
+    fn prunes_old_text() {
+        // Two turns kept; enough older turns to clear the batch threshold.
+        let turns = 2 + TEXT_PRUNE_BATCH;
+        let mut messages = text_convo(turns);
+        let before = messages.len();
+        prune_text(&mut messages, 2);
+
+        assert_eq!(messages.len(), before, "no message added or removed");
+        // Seed is exempt.
+        assert!(!messages[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(TEXT_STUB));
+        // The oldest turn's assistant text and tool_result text are truncated.
+        assert!(messages[1]["content"][0]["text"].as_str().unwrap().ends_with(TEXT_STUB));
+        assert!(messages[2]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(TEXT_STUB));
+        // The two most recent turns (last 4 messages) are untouched.
+        for m in &messages[before - 4..] {
+            let s = serde_json::to_string(m).unwrap();
+            assert!(!s.contains(TEXT_STUB), "recent turns kept verbatim");
+        }
+        // tool_use / tool_result pairing survives intact.
+        for i in 0..turns {
+            let id = format!("t{i}");
+            assert_eq!(messages[1 + i * 2]["content"][1]["id"], json!(id));
+            assert_eq!(messages[2 + i * 2]["content"][0]["tool_use_id"], json!(id));
+        }
+
+        // Idempotent: a second pass finds nothing long enough left to batch.
+        let snapshot = messages.clone();
+        prune_text(&mut messages, 2);
+        assert_eq!(messages, snapshot, "second pass is a no-op");
+    }
+
+    /// Below the batch threshold nothing is truncated — we pay the cached-prefix
+    /// invalidation once per batch, not once per turn.
+    #[test]
+    fn prune_text_batches() {
+        // One prunable turn == 2 long blocks, well under TEXT_PRUNE_BATCH.
+        let mut messages = text_convo(3);
+        let snapshot = messages.clone();
+        prune_text(&mut messages, 2);
+        assert_eq!(messages, snapshot, "under the batch threshold: no-op");
+    }
+
+    /// Short text is never truncated, however old, and the truncation marker is
+    /// distinct from IMAGE_STUB so the rolling cache frontier is unaffected.
+    #[test]
+    fn prune_text_leaves_short_blocks_and_stubs() {
+        let mut messages = text_convo(2 + TEXT_PRUNE_BATCH);
+        // Turn 0's tool_result is a pruned screenshot, not long text.
+        messages[2]["content"][0]["content"][0] = json!({"type": "text", "text": IMAGE_STUB});
+        // Turn 1's assistant text is short.
+        messages[3]["content"][0]["text"] = json!("ok");
+        prune_text(&mut messages, 2);
+        assert_eq!(messages[2]["content"][0]["content"][0]["text"], json!(IMAGE_STUB));
+        assert_eq!(messages[3]["content"][0]["text"], json!("ok"));
+        assert!(!IMAGE_STUB.contains(TEXT_STUB.trim()));
     }
 
     /// The rolling cache breakpoint lands on exactly ONE message (index >= 1) —

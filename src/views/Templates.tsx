@@ -5,6 +5,8 @@ import {
   updateTemplate,
   deleteTemplate,
   seedTemplates,
+  MODEL_OPTIONS,
+  DEFAULT_MODEL,
   type Template,
   type CreateTemplateBody,
 } from '../lib'
@@ -21,13 +23,9 @@ import {
 } from '../ui'
 import RunsTabs from './RunsTabs'
 
-// The model options offered in the editor. Kept in lockstep with NewRun's model
-// picker so a template's model always resolves to a launchable model there.
-const MODEL_OPTIONS: { value: string; label: string }[] = [
-  { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
-  { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
-]
-const DEFAULT_MODEL = MODEL_OPTIONS[0].value
+// The model options offered in the editor come from the shared list in lib.ts,
+// so a template's model always resolves to something New Run can launch. This
+// used to be a hand-maintained copy of that list.
 
 type Load =
   | { state: 'loading' }
