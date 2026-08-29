@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
-import { isTauri } from './lib'
+import { isTauri, safeInvoke } from './lib'
 import type { AppMode } from './mode'
 import sbLogo from './assets/sb-logo.svg'
 
@@ -16,10 +16,20 @@ function RemoteIndicator() {
     // served for the admin panel), and `listen` would reject there with an
     // unhandled promise rejection — so stay dim and subscribe to nothing.
     if (!isTauri()) return
+    let alive = true
+    // Subscribe first, then ask. The event alone only reports CHANGES, so a
+    // machine that connected before this mounted — which is every reload, and
+    // any long-running session — showed "offline" while it was in fact
+    // connected and taking work. Subscribing first means a change landing
+    // between the two is not lost; the read only seeds what the events cannot.
     const unlisten = listen<{ connected: boolean }>('remote://status', (e) => {
-      setConnected(!!e.payload?.connected)
+      if (alive) setConnected(!!e.payload?.connected)
+    })
+    safeInvoke<boolean>('remote_status').then((res) => {
+      if (alive && res.ok) setConnected(res.data)
     })
     return () => {
+      alive = false
       unlisten.then((un) => un())
     }
   }, [])
