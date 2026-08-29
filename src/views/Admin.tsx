@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { CU_BACKEND, authHeaders, isTauri, relativeTime, safeInvoke } from '../lib'
+import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
 import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
 
 // One machine in the fleet, field-for-field the backend contract for
@@ -1121,19 +1121,16 @@ function NowCard({
   )
 }
 
-// REMOTE DESKTOP — the machine's RustDesk id, and the two ways to act on it.
+// REMOTE DESKTOP — where the machine's RustDesk id is kept, so it is at hand
+// when a run goes wrong and someone has to take the screen back.
 //
-// Both affordances exist on purpose. `rustdesk://` only launches anything on a
-// desktop that has registered the scheme; when it hasn't, the click does
-// NOTHING and there is no event to detect that from, so copy-to-clipboard is
-// not a convenience but the fallback that keeps the pane useful. Copy is always
-// offered, never hidden behind the Take-over button having failed.
-//
-// Inside Tauri the handoff MUST go through the shell plugin. Assigning
-// window.location.href to a custom scheme is swallowed by the webview — it
-// navigates nowhere and launches nothing, which is indistinguishable from an
-// unregistered scheme and was exactly the bug here. In a browser the plugin
-// does not exist, so the assignment remains the right call there.
+// Copy-to-clipboard is the only action, deliberately. There WAS a "Take over"
+// button that opened `rustdesk://<id>`; it never launched anything, first
+// because the webview swallowed the navigation and then, once handed to the OS
+// properly, because nothing had registered the scheme. A launcher that silently
+// does nothing is worse than no launcher: it makes the operator doubt the id
+// rather than reach for RustDesk. Opening RustDesk and pasting is a few seconds
+// and always works.
 //
 // The id is edited HERE rather than in the Details card below because filling it
 // in is the whole reason this pane is writable: a machine with no id is a
@@ -1255,29 +1252,16 @@ function RemoteDesktopCard({
         <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
           Change
         </Button>
-        <div style={{ marginLeft: 'auto' }}>
-          <Button
-            variant="primary"
-            onClick={async () => {
-              const url = `rustdesk://${encodeURIComponent(id)}`
-              if (isTauri()) {
-                try {
-                  const { open } = await import('@tauri-apps/plugin-shell')
-                  await open(url)
-                  return
-                } catch {
-                  // Plugin missing or the OS has no handler — fall through to
-                  // the browser path, which fails the same silent way. Either
-                  // way the id above is still copyable.
-                }
-              }
-              window.location.href = url
-            }}
-          >
-            Take over
-          </Button>
-        </div>
       </div>
+      <p
+        style={{
+          marginTop: 'var(--sp-3)',
+          fontSize: 'var(--fs-sm)',
+          color: 'var(--sb-text-muted)',
+        }}
+      >
+        Copy this into RustDesk to take the screen back from an agent.
+      </p>
     </Card>
   )
 }
