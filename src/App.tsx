@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useGoogleAuth } from './hooks/useGoogleAuth'
 import { ActiveRunProvider } from './activeRun'
 import { CU_BACKEND, safeInvoke, reconcileOrphanedRuns, isTauri, unenrollMachine } from './lib'
 import SplashLogin from './SplashLogin'
 import DeviceRevoked from './DeviceRevoked'
+import { ConfirmModal } from './ui'
 import Layout from './Layout'
 import Dashboard from './views/Dashboard'
 import NewRun from './views/NewRun'
@@ -44,6 +45,7 @@ function App() {
 
   // Only a worker can be told its credential is dead; see useDeviceRejected.
   const { rejected, clear: clearRejection } = useDeviceRejected(enrolled)
+  const [confirmUnenrol, setConfirmUnenrol] = useState(false)
 
   // Sign out has to mean the thing the machine can actually stop being. On an
   // admin machine that is the Google session in localStorage, which is all
@@ -57,18 +59,17 @@ function App() {
       logout()
       return
     }
-    const ok = window.confirm(
-      'Sign this machine out of the fleet?\n\n' +
-        'It stops running agents and leaves the fleet. Rejoining needs a new ' +
-        'enrollment key from the operator.',
-    )
-    if (!ok) return
+    setConfirmUnenrol(true)
+  }, [enrolled, logout])
+
+  const confirmUnenrolNow = useCallback(async () => {
+    setConfirmUnenrol(false)
     await unenrollMachine()
     clearRejection()
     // Whether or not the clear worked: re-reading is what turns the answer into
     // the right screen, and a token still present simply lands back here.
     refreshCredential()
-  }, [enrolled, logout, clearRejection, refreshCredential])
+  }, [clearRejection, refreshCredential])
 
   // Restore any existing backend session on mount.
   useEffect(() => {
@@ -171,6 +172,19 @@ function App() {
 
   return (
     <ModeProvider credential={credential}>
+      {confirmUnenrol && (
+        <ConfirmModal
+          title="Sign this machine out of the fleet?"
+          body={[
+            'It stops running agents and leaves the fleet.',
+            'Rejoining needs a new enrollment key, which only the operator can mint.',
+          ]}
+          confirmLabel="Sign out of fleet"
+          danger
+          onConfirm={confirmUnenrolNow}
+          onCancel={() => setConfirmUnenrol(false)}
+        />
+      )}
       <ModedShell userEmail={userEmail} onSignOut={signOut} />
     </ModeProvider>
   )

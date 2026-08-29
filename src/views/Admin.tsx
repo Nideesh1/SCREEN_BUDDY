@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
-import { Badge, Button, Card, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
+import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
 
 // One machine in the fleet, field-for-field the backend contract for
 // GET /devices. Everything except name / rustdesk_id / notes is REPORTED by the
@@ -703,6 +703,11 @@ function DeviceDetail({
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const [forgetting, setForgetting] = useState(false)
+  // Which destructive action is awaiting confirmation, if any. Revoke and Forget
+  // are one click apart and only one is reversible, so each dialog also says
+  // what the OTHER would have done — the choice between them is the part the
+  // operator has usually not made yet.
+  const [confirming, setConfirming] = useState<'revoke' | 'forget' | null>(null)
   const [revoking, setRevoking] = useState(false)
 
   const revoked = device.enrollment_state === 'revoked'
@@ -748,14 +753,7 @@ function DeviceDetail({
   // someone reaches for in a hurry, having decided only that a machine should
   // stop — the choice between them is the part they have not made yet.
   const revoke = useCallback(async () => {
-    const ok = window.confirm(
-      `Revoke access for “${displayName(device)}”?\n\n` +
-        'Its pass stops working immediately: it can no longer run agents or check in.\n\n' +
-        'It STAYS in this list, keeping its name, RustDesk ID and notes, so you can ' +
-        'hand it a new enrollment key whenever you want it back. To remove it from ' +
-        'the fleet altogether, use Forget instead.',
-    )
-    if (!ok) return
+    setConfirming(null)
     setRevoking(true)
     setSaveError(null)
     try {
@@ -776,14 +774,7 @@ function DeviceDetail({
   }, [device, onChanged])
 
   const forget = useCallback(async () => {
-    const ok = window.confirm(
-      `Forget “${displayName(device)}”?\n\n` +
-        'It leaves the fleet entirely, taking the name, RustDesk ID and notes you set ' +
-        'with it, and its pass stops working. Launching the app on that machine will ' +
-        'NOT bring it back — only a new enrollment key will, as a blank device.\n\n' +
-        'To lock it out but keep this record, use Revoke access instead.',
-    )
-    if (!ok) return
+    setConfirming(null)
     setForgetting(true)
     setSaveError(null)
     try {
@@ -805,6 +796,38 @@ function DeviceDetail({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}>
+      {confirming === 'revoke' && (
+        <ConfirmModal
+          title={`Revoke access for “${displayName(device)}”?`}
+          body={[
+            'Its pass stops working immediately: it can no longer run agents or check in.',
+            'It stays in this list, keeping its name, RustDesk ID and notes, so you can hand ' +
+              'it a new enrollment key whenever you want it back.',
+            'To remove it from the fleet altogether, use Forget instead.',
+          ]}
+          confirmLabel="Revoke access"
+          busy={revoking}
+          onConfirm={revoke}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
+      {confirming === 'forget' && (
+        <ConfirmModal
+          title={`Forget “${displayName(device)}”?`}
+          body={[
+            'It leaves the fleet entirely, taking the name, RustDesk ID and notes you set with ' +
+              'it, and its pass stops working.',
+            'Launching the app on that machine will NOT bring it back — only a new enrollment ' +
+              'key will, as a blank device.',
+            'To lock it out but keep this record, use Revoke access instead.',
+          ]}
+          confirmLabel="Forget device"
+          danger
+          busy={forgetting}
+          onConfirm={forget}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
       <Card>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
           <h2 style={{ margin: 0, fontSize: 'var(--fs-xl)', fontWeight: 700, color: 'var(--sb-text)' }}>
@@ -837,7 +860,7 @@ function DeviceDetail({
         device={device}
         revoking={revoking}
         busy={saving || forgetting}
-        onRevoke={revoke}
+        onRevoke={() => setConfirming('revoke')}
         onAddMachine={onAddMachine}
       />
 
@@ -893,7 +916,7 @@ function DeviceDetail({
             <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-success)' }}>Saved</span>
           )}
           <div style={{ marginLeft: 'auto' }}>
-            <Button variant="danger" onClick={forget} disabled={saving || forgetting}>
+            <Button variant="danger" onClick={() => setConfirming('forget')} disabled={saving || forgetting}>
               {forgetting ? 'Forgetting…' : 'Forget'}
             </Button>
           </div>
