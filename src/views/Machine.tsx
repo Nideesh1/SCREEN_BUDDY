@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { isTauri, safeInvoke, type CredentialClass } from '../lib'
+import { CU_BACKEND, isTauri, safeInvoke, type CredentialClass } from '../lib'
 import { Badge, Button, Card, EmptyState, SectionTitle, Spinner } from '../ui'
 import { PermissionsCard } from './Settings'
 
@@ -35,9 +35,86 @@ interface ModelEndpoint {
   base: string
   is_anthropic: boolean
   model: string
+  /** Who chose it — see `agent.rs::EndpointSource`. */
+  source: 'fleet' | 'env' | 'default'
+  /** The guard would refuse the next dispatched run. */
+  blocked: boolean
 }
 
+// How long "Reconnecting…" stays up when nothing on the socket answers. The
+// listener's own connect attempt is bounded by the TCP/TLS handshake, not by us,
+// so this is only a floor for the button's busy state: it must not spin forever
+// on a machine whose backend is a black hole, and it must not clear so fast that
+// the click looks like it did nothing.
+const RECONNECT_BUSY_MS = 6000
+
 function Machine() {
+  // Bumping this re-runs every card's read effect. A nonce rather than a set of
+  // callbacks because the cards are independent and each already knows how to
+  // read itself once — the button's job is to say "again", not to re-implement
+  // five reads at the top level.
+  const [nonce, setNonce] = useState(0)
+  const [reconnecting, setReconnecting] = useState(false)
+  const [reconnectError, setReconnectError] = useState<string | null>(null)
+
+  // While a reconnect is in flight, ANY link state change is the answer — clear
+  // the busy state on the real `remote://status` event rather than on the invoke
+  // returning, which only means the Rust task spawned.
+  useEffect(() => {
+    if (!isTauri()) return
+    let alive = true
+    const unlisten = listen('remote://status', () => {
+      if (alive) setReconnecting(false)
+    })
+    return () => {
+      alive = false
+      unlisten.then((un) => un())
+    }
+  }, [])
+
+  // REFRESH — re-read the screen, and force the command channel to retry now.
+  //
+  // The reads are all cheap local commands. The reconnect is the part that
+  // earns the button: the listener backs off up to 30s between attempts, so a
+  // machine whose network just came back sits unreachable for up to half a
+  // minute with nothing to do about it but restart the app — over a laggy
+  // remote-desktop session, from someone who opened this screen precisely
+  // because the machine was not taking work.
+  //
+  // Safe against a live run: `start_remote_listener` cancels and respawns only
+  // the socket task (RemoteState). A run's cancellation token lives in a
+  // separate AgentState and `run_agent` is its own spawned task holding a
+  // RunLease, so dropping the socket neither cancels nor orphans it — the run
+  // keeps streaming and keeps persisting through `backend`, which is a different
+  // server from the model endpoint anyway.
+  const refresh = useCallback(async () => {
+    setReconnectError(null)
+    setNonce((n) => n + 1)
+    if (!isTauri()) return
+
+    setReconnecting(true)
+    // Mirror App.tsx exactly. An enrolled worker has NO session token to hand
+    // over — its credential lives in the Rust store — so it passes `backend`
+    // alone and lets remote.rs pick. Passing `token: null` here instead is what
+    // once left an enrolled Windows machine silently unreachable.
+    const hasSession = !!localStorage.getItem('screen_buddy_session_token')
+    const cls = await safeInvoke<CredentialClass>('credential_class', { hasSession })
+    const enrolled = cls.ok && cls.data === 'device'
+    const token = localStorage.getItem('screen_buddy_session_token')
+    const res = await safeInvoke(
+      'start_remote_listener',
+      enrolled ? { backend: CU_BACKEND } : { token, backend: CU_BACKEND },
+    )
+    if (!res.ok) {
+      setReconnecting(false)
+      setReconnectError(res.error)
+      return
+    }
+    // The socket may connect, fail, or hang. Only the event above can say which,
+    // so this is purely a ceiling on the spinner.
+    setTimeout(() => setReconnecting(false), RECONNECT_BUSY_MS)
+  }, [])
+
   return (
     <div
       style={{
@@ -49,15 +126,39 @@ function Machine() {
         gap: 'var(--sp-4)',
       }}
     >
-      <IdentityCard />
-      <LinkCard />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
+        <h1
+          style={{
+            margin: 0,
+            fontSize: 'var(--fs-2xl)',
+            fontWeight: 700,
+            color: 'var(--sb-gold-bright)',
+          }}
+        >
+          This machine
+        </h1>
+        <div style={{ marginLeft: 'auto' }}>
+          <Button variant="secondary" size="sm" onClick={refresh} disabled={reconnecting}>
+            {reconnecting ? 'Reconnecting…' : '↻ Refresh'}
+          </Button>
+        </div>
+      </div>
+
+      {reconnectError && (
+        <p style={{ margin: 0, fontSize: 'var(--fs-md)', color: 'var(--sb-danger-bright)' }}>
+          Could not restart the command channel. {reconnectError}
+        </p>
+      )}
+
+      <IdentityCard refreshKey={nonce} />
+      <LinkCard refreshKey={nonce} />
       <NowCard />
       {/* Readiness. The same card Settings shows, deliberately not a variant of
           it: a worker missing Screen Recording looks exactly like a worker with
           nothing to do, and nobody is sitting at it to tell the difference. */}
-      <PermissionsCard />
-      <ModelEndpointCard />
-      <EnrollmentCard />
+      <PermissionsCard refreshKey={nonce} />
+      <ModelEndpointCard refreshKey={nonce} />
+      <EnrollmentCard refreshKey={nonce} />
     </div>
   )
 }
@@ -67,7 +168,7 @@ function Machine() {
 // IDENTITY — which machine this is, in the same words the admin's device list
 // uses for it, so a name read here and a row read there are recognisably the
 // same box.
-function IdentityCard() {
+function IdentityCard({ refreshKey }: { refreshKey: number }) {
   const [info, setInfo] = useState<DeviceInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -81,21 +182,10 @@ function IdentityCard() {
     return () => {
       active = false
     }
-  }, [])
+  }, [refreshKey])
 
   return (
     <>
-      <h1
-        style={{
-          margin: 0,
-          fontSize: 'var(--fs-2xl)',
-          fontWeight: 700,
-          color: 'var(--sb-gold-bright)',
-        }}
-      >
-        This machine
-      </h1>
-
       <Card>
         {!info && !error && (
           <div
@@ -175,12 +265,16 @@ function prettyOs(os: string): string {
 // stays null until the first answer arrives rather than defaulting to either —
 // claiming "not connected" about a machine that is fine sends someone to the
 // wrong box.
-function LinkCard() {
+function LinkCard({ refreshKey }: { refreshKey: number }) {
   const [connected, setConnected] = useState<boolean | null>(null)
 
   useEffect(() => {
     if (!isTauri()) return
     let alive = true
+    // A refresh drops back to "Checking…" first. Holding the previous answer
+    // while re-reading would let the card say "Connected" about a socket that is
+    // at that moment being torn down and rebuilt.
+    if (refreshKey > 0) setConnected(null)
     // Subscribe BEFORE the read, so a change landing between the two is not
     // missed — an event arriving first simply gets overwritten by a read of the
     // same value, which is harmless.
@@ -195,7 +289,7 @@ function LinkCard() {
       alive = false
       unlisten.then((un) => un())
     }
-  }, [])
+  }, [refreshKey])
 
   return (
     <Card title={<SectionTitle>Link</SectionTitle>}>
@@ -502,7 +596,7 @@ function formatElapsed(ms: number): string {
 // that proves it works. `check_model_endpoint` sends a real /v1/messages round
 // trip rather than pinging a health route, because a server can be listening and
 // still not serve this API shape; only the round trip is evidence.
-function ModelEndpointCard() {
+function ModelEndpointCard({ refreshKey }: { refreshKey: number }) {
   const [endpoint, setEndpoint] = useState<ModelEndpoint | null>(null)
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null)
@@ -515,7 +609,7 @@ function ModelEndpointCard() {
     return () => {
       active = false
     }
-  }, [])
+  }, [refreshKey])
 
   const verify = useCallback(async () => {
     setBusy(true)
@@ -573,7 +667,43 @@ function ModelEndpointCard() {
               {endpoint.model}
             </Badge>
             <Badge>{endpoint.is_anthropic ? 'Anthropic' : 'Self-hosted'}</Badge>
+            <Badge tone={endpoint.source === 'fleet' ? 'success' : 'neutral'}>
+              {SOURCE_LABEL[endpoint.source]}
+            </Badge>
           </div>
+
+          {/* WHERE IT CAME FROM, in words. The URL alone does not tell whoever is
+              reading this over a remote desktop which knob to turn — a fleet
+              value is fixed once in Settings for every machine, an env value is
+              a shell on this box that somebody has to go and change. */}
+          <p
+            style={{
+              margin: 'var(--sp-3) 0 0',
+              fontSize: 'var(--fs-md)',
+              lineHeight: 1.5,
+              color: 'var(--sb-text-muted)',
+            }}
+          >
+            {SOURCE_BLURB[endpoint.source]}
+          </p>
+
+          {/* The whole point of the guard, said before a run fails rather than
+              after: this machine would bill Anthropic, so it will refuse. */}
+          {endpoint.blocked && (
+            <p
+              style={{
+                margin: 'var(--sp-2) 0 0',
+                fontSize: 'var(--fs-md)',
+                lineHeight: 1.5,
+                color: 'var(--sb-danger-bright)',
+              }}
+            >
+              Runs dispatched to this machine will be REFUSED. It is an enrolled worker
+              and this endpoint is Anthropic's own API, so a run would bill Anthropic
+              while looking self-hosted. Set the fleet model endpoint in Settings, or set
+              CU_ALLOW_ANTHROPIC=1 on this machine to allow it deliberately.
+            </p>
+          )}
         </>
       )}
 
@@ -594,6 +724,22 @@ function ModelEndpointCard() {
   )
 }
 
+const SOURCE_LABEL: Record<ModelEndpoint['source'], string> = {
+  fleet: 'Fleet setting',
+  env: 'Local env var',
+  default: 'Default',
+}
+
+// A worker cannot read `/settings` — its device token is not a session
+// credential — so the only fleet value it ever holds is the one that arrived on
+// a dispatched run frame. Before the first such run it genuinely does not know,
+// and saying so is more use than showing the env var as though it were settled.
+const SOURCE_BLURB: Record<ModelEndpoint['source'], string> = {
+  fleet: 'Set by the fleet operator in Settings and sent with the last run. Change it there, once, for every machine.',
+  env: "From CU_ANTHROPIC_BASE in this machine's own environment. No fleet endpoint has arrived yet — a dispatched run carrying one would override this.",
+  default: 'Nothing configured — neither the fleet nor this machine names an endpoint, so runs would go to Anthropic. Set the fleet model endpoint in Settings.',
+}
+
 // ───────────────────────────────────────────────────────── enrollment
 
 // ENROLLMENT — that this machine holds a worker pass, and nothing more.
@@ -607,7 +753,7 @@ function ModelEndpointCard() {
 // fact about the machine rather than a claim about the backend's opinion of it —
 // a revoked worker still holds its dead token, and hears about the refusal
 // through `device://rejected` instead.
-function EnrollmentCard() {
+function EnrollmentCard({ refreshKey }: { refreshKey: number }) {
   const [credential, setCredential] = useState<CredentialClass | null>(null)
 
   useEffect(() => {
@@ -621,7 +767,7 @@ function EnrollmentCard() {
     return () => {
       active = false
     }
-  }, [])
+  }, [refreshKey])
 
   return (
     <Card title={<SectionTitle>Enrollment</SectionTitle>}>

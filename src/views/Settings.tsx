@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { open } from '@tauri-apps/plugin-shell'
 import type { LayoutContext } from '../Layout'
-import { safeInvoke, IS_WINDOWS } from '../lib'
+import { safeInvoke, authHeaders, CU_BACKEND, IS_WINDOWS } from '../lib'
 import { Card, Button, Badge, Spinner } from '../ui'
 import { useMode } from '../mode'
 import { ModeCards } from '../ModePicker'
@@ -105,6 +105,8 @@ function Settings() {
 
       <PermissionsCard />
 
+      <FleetModelCard />
+
       <AnthropicKeySection />
 
       <TelegramSection />
@@ -116,7 +118,7 @@ function Settings() {
 // them. Extracted from the Settings screen because a worker needs exactly this
 // block on its own home: the machine that is missing a grant is the one with
 // nobody sitting at it to notice the run doing nothing.
-export function PermissionsCard() {
+export function PermissionsCard({ refreshKey }: { refreshKey?: number } = {}) {
   const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
 
   const fetchPerms = useCallback(async () => {
@@ -126,9 +128,12 @@ export function PermissionsCard() {
     else setPerm({ state: 'unavailable', message: res.error })
   }, [])
 
+  // `refreshKey` is how a host screen (the worker's Machine panel) folds this
+  // card into its own Refresh without duplicating the check. Optional, because
+  // Settings has the ↻ Re-check button right here and needs no such handle.
   useEffect(() => {
     fetchPerms()
-  }, [fetchPerms])
+  }, [fetchPerms, refreshKey])
 
   return (
     <Card
@@ -195,6 +200,154 @@ export function PermissionsCard() {
             In development builds the grant can reset on rebuild; a signed release build is stable.
           </p>
         </div>
+      )}
+    </Card>
+  )
+}
+
+// FLEET MODEL ENDPOINT — the endpoint and default model every machine in this
+// account drives, held server-side on the account (`/settings`) and sent to a
+// worker on the dispatched `run` frame.
+//
+// This exists because the endpoint used to be per-machine, per-shell env vars:
+// invisible from here, retyped on every launch, and — the damage — when someone
+// forgot, the run still WORKED, against api.anthropic.com, and quietly billed
+// Anthropic while everyone believed it was self-hosted. Configuring it once here
+// and letting it travel with the work is the fix; `agent.rs`'s worker guard is
+// the backstop for when this is left empty.
+//
+// Worker shells do not render it: a fleet node does not configure the fleet, and
+// its device token could not authenticate `/settings` if it tried.
+//
+// Wire fields are camelCase (`modelEndpoint` / `model`), matching the
+// thresholds already on this route. Both are optional server-side — clearing a
+// field is meaningful (it means "let each machine decide"), so an empty string
+// is sent rather than being skipped.
+function FleetModelCard() {
+  const { mode } = useMode()
+  const [endpoint, setEndpoint] = useState('')
+  const [model, setModel] = useState('')
+  const [load, setLoad] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  const isWorker = mode === 'worker'
+
+  useEffect(() => {
+    if (isWorker) return
+    let active = true
+    ;(async () => {
+      try {
+        const resp = await fetch(`${CU_BACKEND}/settings`, { headers: authHeaders() })
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const body = await resp.json()
+        if (!active) return
+        // A backend that predates these fields answers 200 with neither — that
+        // is "unset", not an error, and the blank fields say so correctly.
+        setEndpoint(typeof body?.modelEndpoint === 'string' ? body.modelEndpoint : '')
+        setModel(typeof body?.model === 'string' ? body.model : '')
+        setLoad('ready')
+      } catch (e) {
+        if (!active) return
+        setError(e instanceof Error ? e.message : String(e))
+        setLoad('error')
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [isWorker])
+
+  const save = useCallback(async () => {
+    setSaving(true)
+    setError('')
+    try {
+      const resp = await fetch(`${CU_BACKEND}/settings`, {
+        method: 'PATCH',
+        headers: { ...authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify({ modelEndpoint: endpoint.trim(), model: model.trim() }),
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }, [endpoint, model])
+
+  if (isWorker) return null
+
+  return (
+    <Card title="Fleet model endpoint">
+      <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', margin: '0 0 var(--sp-4)', lineHeight: 1.5 }}>
+        Where every machine on this account sends its model calls. Set once here; it
+        travels to each worker with the work, so nobody has to set an environment
+        variable on the machine itself. Leave blank to let each machine use its own
+        CU_ANTHROPIC_BASE.
+      </p>
+
+      {load === 'loading' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          <Spinner size={14} /> Loading…
+        </div>
+      )}
+
+      {load !== 'loading' && (
+        <>
+          <Field label="Model endpoint">
+            <input
+              type="text"
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder="https://llm.internal.example.com"
+              autoComplete="off"
+              spellCheck={false}
+              className="agent-input"
+              style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+            />
+          </Field>
+
+          <Field label="Default model">
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="claude-opus-4-8"
+              autoComplete="off"
+              spellCheck={false}
+              className="agent-input"
+              style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+            />
+          </Field>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)', marginTop: 'var(--sp-4)' }}>
+            <Button variant="primary" size="sm" onClick={save} disabled={saving}>
+              {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
+            </Button>
+          </div>
+
+          {/* Blank is a real, and dangerous, choice: a worker left on the default
+              drives Anthropic. It will refuse the run rather than bill silently
+              (see agent.rs::anthropic_guard_error), which is why saying so here
+              is a warning and not a failure. */}
+          {!endpoint.trim() && (
+            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-3)', lineHeight: 1.5 }}>
+              With this blank, a worker that has no CU_ANTHROPIC_BASE of its own would
+              fall through to Anthropic's API — so it refuses the run instead of billing
+              Anthropic without anyone choosing to.
+            </p>
+          )}
+        </>
+      )}
+
+      {error && (
+        <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-danger-bright)', marginTop: 'var(--sp-3)' }}>
+          {load === 'error' ? 'Could not load the fleet settings. ' : 'Could not save. '}
+          {error}
+        </p>
       )}
     </Card>
   )

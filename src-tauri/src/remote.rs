@@ -5,6 +5,7 @@
 //! a locally-launched run takes. The wire is deliberately tiny:
 //!
 //!   backend → desktop  {"type":"run","run_id":"uuid","task":"…","model":"…",
+//!                       "model_endpoint":"https://…",
 //!                       "pinned_set_names":"[\"Set name\"]"}
 //!                      {"type":"ping"}
 //!   desktop → backend  {"type":"ack","run_id":"uuid"}
@@ -17,6 +18,11 @@
 //! identically to a normal one. If a run is already in flight we still ack and
 //! skip — the backend learns the desktop is busy via the absence of progress,
 //! not a dropped frame.
+//!
+//! `model_endpoint` is the operator's fleet setting, travelling with the work so
+//! the machine no longer has to be told separately what to drive. It is OPTIONAL
+//! on the wire: an older backend omits it and this desktop then falls back to
+//! its own `CU_ANTHROPIC_BASE` exactly as before (see `agent::resolve_endpoint`).
 //!
 //! Resilience: the task reconnects with exponential backoff (1s → 30s) on any
 //! close/error and loops forever until the managed `RemoteState` token is
@@ -134,6 +140,17 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
             let run_id = v.get("run_id").and_then(|r| r.as_str()).unwrap_or("").to_string();
             let task = v.get("task").and_then(|t| t.as_str()).unwrap_or("").to_string();
             let model = v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+            // `model_endpoint` (optional): where the operator wants this run's
+            // model calls to go. Accepted under either casing because the wire is
+            // snake_case but the account-settings field it is sourced from is
+            // camelCase, and a backend that forwards the settings value verbatim
+            // is a plausible mistake we would rather absorb than fail a fleet on.
+            // Absent → the desktop's own env var wins; see `agent::resolve_endpoint`.
+            let model_endpoint = v
+                .get("model_endpoint")
+                .or_else(|| v.get("modelEndpoint"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string());
             // `pinned_set_ids` (optional) is a JSON-encoded STRING holding a list
             // of LOCAL set UUIDs, e.g. "[\"a1b2…\"]". These are already local set
             // ids (the backend registry stores the desktop's own uuids), so when
@@ -194,6 +211,7 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
                     pinned_set_ids,
                     run_id.clone(),
                     model,
+                    model_endpoint,
                     backend.to_string(),
                 ) {
                     Ok(()) => eprintln!("[remote] started run {run_id}"),

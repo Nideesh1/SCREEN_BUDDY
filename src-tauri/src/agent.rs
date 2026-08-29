@@ -17,6 +17,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -29,12 +30,16 @@ use crate::{capture, with_computer, ComputerState};
 pub(crate) fn backend_url() -> String {
     std::env::var("CU_BACKEND_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
-/// BYOK: the per-turn model call goes DIRECTLY to Anthropic with the user's own
-/// key — it never touches our backend. The backend (`backend_url`) is still used
-/// for run persistence only.
-fn anthropic_base() -> String {
-    std::env::var("CU_ANTHROPIC_BASE").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
-}
+/// BYOK: the per-turn model call goes DIRECTLY to the model endpoint with the
+/// user's own key — it never touches our backend. The backend (`backend_url`) is
+/// still used for run persistence only. This is that endpoint when nothing else
+/// names one; see `resolve_endpoint` for the precedence ladder.
+const DEFAULT_ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+
+/// Env opt-out for the worker guard (`anthropic_guard_error`). Set to `1`/`true`
+/// on a worker that is *meant* to bill Anthropic directly.
+const ALLOW_ANTHROPIC_ENV: &str = "CU_ALLOW_ANTHROPIC";
+
 /// Whether the configured model endpoint is Anthropic's own API.
 ///
 /// This is the ONLY thing that decides whether a BYOK key is required. The key
@@ -46,6 +51,10 @@ fn anthropic_base() -> String {
 /// key" toggle: a toggle can be left on after switching back to Anthropic, and
 /// the symptom is then an opaque 401 instead of a clear prompt. Host-based, so
 /// it cannot fall out of sync with where requests actually go.
+///
+/// Takes the base as an ARGUMENT rather than reading the env itself, because the
+/// endpoint is per-run now (see `ResolvedEndpoint`): every caller must answer
+/// this about the endpoint THIS run drives, never the process-wide one.
 fn endpoint_is_anthropic(base: &str) -> bool {
     let host = base
         .trim()
@@ -55,23 +64,181 @@ fn endpoint_is_anthropic(base: &str) -> bool {
     host.eq_ignore_ascii_case("api.anthropic.com") || host.is_empty()
 }
 
+/// Where the endpoint a run drives actually came from.
+///
+/// Reported to the UI because "which endpoint" and "who chose it" are different
+/// questions with different fixes: a wrong `Fleet` value is corrected once in
+/// Settings for every machine, a wrong `Env` value is one shell on one box that
+/// somebody has to walk over to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSource {
+    /// Carried on the dispatched `run` frame — the operator's fleet setting.
+    Fleet,
+    /// This machine's `CU_ANTHROPIC_BASE`.
+    Env,
+    /// Nobody said; Anthropic's own API.
+    Default,
+}
+
+/// The model endpoint ONE run drives, resolved once at run start and then passed
+/// around instead of being re-derived. Everything that used to ask the process
+/// "where do model calls go?" asks this instead — a run dispatched at a
+/// self-hosted server and a shell holding a stale `CU_ANTHROPIC_BASE` disagree,
+/// and silently answering with the shell's value is the exact class of bug this
+/// type exists to make unrepresentable.
+#[derive(Clone, Debug)]
+pub struct ResolvedEndpoint {
+    pub base: String,
+    pub model: String,
+    pub source: EndpointSource,
+}
+
+impl ResolvedEndpoint {
+    fn is_anthropic(&self) -> bool {
+        endpoint_is_anthropic(&self.base)
+    }
+    /// `{base}/v1/messages` — the only URL a turn is ever sent to.
+    fn messages_url(&self) -> String {
+        format!("{}/v1/messages", self.base.trim_end_matches('/'))
+    }
+}
+
+/// PRECEDENCE: **frame > env var > default**.
+///
+/// The frame wins because the operator configured it centrally and it travelled
+/// here with the work. The env var stays second so an older backend — or an
+/// unset fleet setting — behaves exactly as it did before any of this existed.
+/// The default is Anthropic's own API, which is the whole reason
+/// `anthropic_guard_error` has to exist. `model` walks the same ladder
+/// independently, so a fleet that sets an endpoint but no model still honours
+/// this machine's `CU_MODEL`.
+///
+/// Blank/whitespace values count as absent, so a settings field the operator
+/// cleared falls through to the env var instead of resolving to `""`.
+fn resolve_endpoint(frame_base: Option<&str>, frame_model: Option<&str>) -> ResolvedEndpoint {
+    let present = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let (base, source) = match present(frame_base) {
+        Some(b) => (b, EndpointSource::Fleet),
+        None => match env("CU_ANTHROPIC_BASE") {
+            Some(b) => (b, EndpointSource::Env),
+            None => (DEFAULT_ANTHROPIC_BASE.to_string(), EndpointSource::Default),
+        },
+    };
+    let model = present(frame_model)
+        .or_else(|| env("CU_MODEL"))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+    ResolvedEndpoint { base, model, source }
+}
+
+/// The last endpoint a dispatched `run` frame carried, remembered so the machine
+/// panel can answer "what will this box drive?" between runs.
+///
+/// A worker cannot ask the backend for the fleet setting — its device token
+/// never leaves Rust and `/settings` is session-scoped — so the only fleet value
+/// it will ever hold is the one that rode in on a frame. Without this the panel
+/// could show only the env var, which on a correctly-configured fleet is exactly
+/// the wrong answer: it would read `api.anthropic.com` on a machine that has
+/// been driving a self-hosted server all week. Empty until the first dispatched
+/// run, and the panel says so rather than guessing.
+static LAST_FLEET_ENDPOINT: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+fn note_fleet_endpoint(base: &str, model: Option<&str>) {
+    if let Ok(mut g) = LAST_FLEET_ENDPOINT.lock() {
+        *g = Some((base.to_string(), model.map(str::to_string)));
+    }
+}
+
+fn last_fleet_endpoint() -> Option<(String, Option<String>)> {
+    LAST_FLEET_ENDPOINT.lock().ok().and_then(|g| g.clone())
+}
+
+/// Resolve exactly as a run would, for the read-only UI commands. Shares one
+/// code path with the real thing so "what would happen" and "what happens"
+/// cannot drift.
+fn endpoint_for_display() -> ResolvedEndpoint {
+    let fleet = last_fleet_endpoint();
+    resolve_endpoint(
+        fleet.as_ref().map(|(b, _)| b.as_str()),
+        fleet.as_ref().and_then(|(_, m)| m.as_deref()),
+    )
+}
+
 /// What the UI needs to decide between "enter your Anthropic key" and "verify
-/// your self-hosted endpoint": the base URL to show, and which mode we're in.
+/// your self-hosted endpoint": the base URL to show, which mode we are in, and
+/// — since the fleet can now override the shell — who chose it.
 #[derive(serde::Serialize)]
 pub struct ModelEndpoint {
     pub base: String,
     pub is_anthropic: bool,
     pub model: String,
+    pub source: EndpointSource,
+    /// True when this machine holds a worker enrollment AND the resolved
+    /// endpoint is Anthropic's own API with no opt-out — i.e. the next
+    /// dispatched run will be refused. Surfaced so the panel can say so before
+    /// a run fails rather than after.
+    pub blocked: bool,
 }
 
 #[tauri::command]
-pub fn model_endpoint() -> ModelEndpoint {
-    let base = anthropic_base();
+pub fn model_endpoint(app: AppHandle) -> ModelEndpoint {
+    let ep = endpoint_for_display();
+    let blocked = anthropic_guard_error(
+        &ep.base,
+        crate::credentials::is_enrolled(&app),
+        allow_anthropic_env(),
+    )
+    .is_some();
     ModelEndpoint {
-        is_anthropic: endpoint_is_anthropic(&base),
-        base,
-        model: model(),
+        is_anthropic: ep.is_anthropic(),
+        base: ep.base,
+        model: ep.model,
+        source: ep.source,
+        blocked,
     }
+}
+
+/// Whether `CU_ALLOW_ANTHROPIC` opts this machine out of the worker guard.
+fn allow_anthropic_env() -> bool {
+    matches!(
+        std::env::var(ALLOW_ANTHROPIC_ENV).ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// The guard: an enrolled worker must not silently drive `api.anthropic.com`.
+///
+/// Returns the refusal message, or `None` to proceed. What this prevents is a
+/// failure that *succeeds*: with the fleet endpoint missing, the run still
+/// works, still produces a normal transcript, and quietly bills Anthropic —
+/// nothing in the product ever contradicts the belief that it was self-hosted.
+/// Nobody catches that. So the silent success is converted into a loud failure.
+///
+/// THE ASYMMETRY IS DELIBERATE. This applies only to an ENROLLED WORKER (a
+/// machine holding a device token), never to an operator on a session
+/// credential. An operator spending their own BYOK key on their own laptop is
+/// the normal case and always was; a fleet node doing it is an unattended
+/// machine spending someone else's money on a choice nobody made. Same endpoint,
+/// different blast radius — hence different rules. If you are here to "simplify"
+/// by applying it to everyone, you will break every personal install.
+fn anthropic_guard_error(base: &str, is_worker: bool, allowed: bool) -> Option<String> {
+    if !is_worker || allowed || !endpoint_is_anthropic(base) {
+        return None;
+    }
+    Some(format!(
+        "Refusing to run: this machine is an enrolled fleet worker and the model \
+endpoint resolved to Anthropic's own API ({base}), so the run would bill \
+Anthropic while looking self-hosted. Set the fleet model endpoint in Settings, \
+or set {ALLOW_ANTHROPIC_ENV}=1 on this machine to allow it deliberately."
+    ))
 }
 
 /// Reachability probe for a self-hosted endpoint — the counterpart to
@@ -81,10 +248,12 @@ pub fn model_endpoint() -> ModelEndpoint {
 /// through `/v1/messages` proves a run would work.
 #[tauri::command]
 pub async fn check_model_endpoint() -> Result<String, String> {
-    let base = anthropic_base();
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    // Probe the endpoint a run would ACTUALLY use — a fleet value that arrived on
+    // a frame included — so "verify" and "run" can never test different hosts.
+    let ep = endpoint_for_display();
+    let url = ep.messages_url();
     let body = json!({
-        "model": model(),
+        "model": ep.model,
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "hi" }],
     });
@@ -106,7 +275,7 @@ pub async fn check_model_endpoint() -> Result<String, String> {
         let txt: String = txt.chars().take(300).collect();
         return Err(format!("{url} returned {status}: {txt}"));
     }
-    Ok(model())
+    Ok(ep.model)
 }
 
 /// Whether to attach a fresh screenshot to the tool_result of every action that
@@ -119,11 +288,16 @@ pub async fn check_model_endpoint() -> Result<String, String> {
 /// nothing ever contradicted it. Defaults ON for any non-Anthropic endpoint.
 ///
 /// `CU_AUTO_SCREENSHOT=1/0` forces it either way.
-fn auto_screenshot_enabled() -> bool {
+///
+/// `base` is the endpoint THIS run resolved to, not the process-wide one: a run
+/// dispatched at a self-hosted server from a machine whose shell still points at
+/// Anthropic needs the auto-screenshots, and deciding off the env var would hand
+/// it the Anthropic default and leave the run flying blind.
+fn auto_screenshot_enabled(base: &str) -> bool {
     match std::env::var("CU_AUTO_SCREENSHOT").ok().as_deref() {
         Some("1") | Some("true") => true,
         Some("0") | Some("false") => false,
-        _ => !endpoint_is_anthropic(&anthropic_base()),
+        _ => !endpoint_is_anthropic(base),
     }
 }
 
@@ -161,11 +335,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header enabling the official enhanced computer-use tool
 /// (`computer_20251124`). We send this directly now (the backend used to add it).
 const ANTHROPIC_BETA: &str = "computer-use-2025-11-24";
-fn model() -> String {
-    // Default to Claude Opus 4.8 (claude-opus-4-8); we send a concrete id in the
-    // Messages body straight to Anthropic.
-    std::env::var("CU_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
-}
+/// Default model id: Claude Opus 4.8. We send a concrete id in the Messages body
+/// straight to the endpoint; `resolve_endpoint` owns the precedence ladder.
+const DEFAULT_MODEL: &str = "claude-opus-4-8";
 
 /// Default hard iteration cap. Long unattended runs routinely need more than
 /// this, so it is only a default — see `max_iters`.
@@ -1313,6 +1485,7 @@ async fn run_agent(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model_arg: Option<String>,
+    endpoint_arg: Option<String>,
     token: CancellationToken,
 ) {
     // Release the AgentState lock when this run ends, however it ends.
@@ -1320,13 +1493,21 @@ async fn run_agent(
 
     let client = reqwest::Client::new();
     let base = backend;
-    // BYOK: the per-turn model call goes DIRECTLY to Anthropic. `base` is kept
-    // for run persistence (POST /runs, events, PATCH) with the session token.
-    let url = format!("{}/v1/messages", anthropic_base());
-    // Honor the caller-selected model (launcher's picker); fall back to the
-    // env/default when none was supplied.
-    let model = model_arg.unwrap_or_else(model);
+    // Resolve the model endpoint ONCE, here, and use nothing else for the rest
+    // of the run. `endpoint_arg`/`model_arg` are what the dispatched `run` frame
+    // carried (or what the local launcher picked); everything below reads the
+    // resolution rather than the environment. PRECEDENCE: frame > env > default.
+    let ep = resolve_endpoint(endpoint_arg.as_deref(), model_arg.as_deref());
+    if ep.source == EndpointSource::Fleet {
+        note_fleet_endpoint(&ep.base, Some(&ep.model));
+    }
+    // BYOK: the per-turn model call goes DIRECTLY to that endpoint. `base` is
+    // kept for run persistence (POST /runs, events, PATCH) with the session
+    // token — two different servers, deliberately.
+    let url = ep.messages_url();
+    let model = ep.model.clone();
     let cred_tool = use_credential_tool();
+    eprintln!("[agent] model endpoint {} ({:?})", ep.base, ep.source);
 
     // --- persistence bootstrap ---
     // The run row is minted by the FRONTEND via `POST /runs` before this task is
@@ -1352,8 +1533,30 @@ async fn run_agent(
     let mut last_text = String::new();
     let mut steps: i64 = 0;
 
+    // The worker guard, BEFORE the key read: a worker that must not drive
+    // Anthropic should be told so, not asked for an Anthropic key first (which
+    // on a cold cache costs a biometric prompt on a machine nobody is at).
+    // Failing here rather than in `start_run_internal` is deliberate — this path
+    // finalizes the run row as "failed" with the reason, so the refusal shows up
+    // in the admin's run list instead of only in the worker's stderr.
+    if let Some(msg) = anthropic_guard_error(
+        &ep.base,
+        crate::credentials::is_enrolled(&app),
+        allow_anthropic_env(),
+    ) {
+        let _ = app.emit(EV_ERROR, json!({ "error": msg }));
+        if let Some(rid) = &run_id {
+            runs_finalize(
+                &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                total_cache_create, total_cache_read, Value::Null, Some(&msg),
+            )
+            .await;
+        }
+        return;
+    }
+
     // BYOK is mandatory: read the user's own Anthropic key once, up front. The
-    // per-turn model call goes DIRECTLY to Anthropic with this key — it never
+    // per-turn model call goes DIRECTLY to the endpoint with this key — it never
     // touches our backend. If no key is stored, fail fast with a clear,
     // user-facing error (not a raw 401 from a later request).
     let api_key = match crate::credentials::anthropic_key(&app) {
@@ -1361,9 +1564,11 @@ async fn run_agent(
         // A self-hosted endpoint has no Anthropic credential to supply, so a
         // missing key is not an error there — send an empty `x-api-key` and let
         // the endpoint decide. Only the real Anthropic API can actually be
-        // blocked by this, so only it refuses up front. See
-        // `endpoint_is_anthropic`.
-        None if !endpoint_is_anthropic(&anthropic_base()) => String::new(),
+        // blocked by this, so only it refuses up front. Keyed off THIS run's
+        // resolved endpoint, not the env var: a run dispatched at a self-hosted
+        // server from a shell with no `CU_ANTHROPIC_BASE` would otherwise be
+        // refused for want of a key it does not need. See `endpoint_is_anthropic`.
+        None if !ep.is_anthropic() => String::new(),
         None => {
             let msg = "No Anthropic API key set — add one in Settings";
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
@@ -1437,7 +1642,7 @@ async fn run_agent(
 
     // Resolved once per run so a mid-run env change can't make some turns carry
     // an auto-screenshot and others not.
-    let auto_screenshot = auto_screenshot_enabled();
+    let auto_screenshot = auto_screenshot_enabled(&ep.base);
     eprintln!("[agent] auto-screenshot after actions: {auto_screenshot}");
 
     // Give the model the starting screen BEFORE its first move. Auto-screenshots
@@ -1861,6 +2066,11 @@ async fn run_agent(
 /// a remotely-started run is indistinguishable from a normal one — same lock,
 /// same RunLease, same persistence. Returns "an agent task is already running"
 /// (verbatim) when busy, so callers can detect contention.
+///
+/// `endpoint` is the model endpoint the caller was told to use — the dispatched
+/// `run` frame's value for a remote run, `None` for a local launch that has no
+/// opinion. It is passed through untouched; `run_agent` resolves it against the
+/// env var and the default (frame > env var > default).
 pub(crate) fn start_run_internal(
     app: &AppHandle,
     state: &AgentState,
@@ -1869,6 +2079,7 @@ pub(crate) fn start_run_internal(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model: Option<String>,
+    endpoint: Option<String>,
     backend: String,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|e| format!("agent state poisoned: {e}"))?;
@@ -1889,6 +2100,7 @@ pub(crate) fn start_run_internal(
         pinned_set_ids,
         run_id,
         model,
+        endpoint,
         token,
     ));
     Ok(())
@@ -1906,6 +2118,7 @@ pub fn start_agent_task(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model: Option<String>,
+    model_endpoint: Option<String>,
     backend: Option<String>,
 ) -> Result<(), String> {
     // Run-persistence base comes from the frontend (its VITE_CU_BACKEND_URL, which
@@ -1921,6 +2134,7 @@ pub fn start_agent_task(
         pinned_set_ids,
         run_id,
         model,
+        model_endpoint,
         backend,
     )
 }
@@ -1940,6 +2154,169 @@ pub fn stop_agent_task(state: tauri::State<'_, AgentState>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- model endpoint resolution + the worker guard ---------------------
+
+    /// `resolve_endpoint` and `auto_screenshot_enabled` read process env, which
+    /// is shared by every test thread. Serialize the ones that set it and put it
+    /// back afterwards, so a test can neither see another test's value nor leave
+    /// one behind for the rest of the suite.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                    (*k, prev)
+                })
+                .collect();
+            EnvGuard(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, prev) in &self.0 {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The whole point of the change: a dispatched run drives the endpoint it was
+    /// told to, even on a machine whose shell says something else. Before this,
+    /// the env var won and the frame was not carried at all.
+    #[test]
+    fn frame_endpoint_beats_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://stale-shell:9999")),
+            ("CU_MODEL", Some("shell-model")),
+        ]);
+        let ep = resolve_endpoint(Some("http://fleet-llm:8080"), Some("fleet-model"));
+        assert_eq!(ep.base, "http://fleet-llm:8080");
+        assert_eq!(ep.model, "fleet-model");
+        assert_eq!(ep.source, EndpointSource::Fleet);
+    }
+
+    /// An older backend omits the field entirely; that machine must behave
+    /// exactly as it did before, which means the env var.
+    #[test]
+    fn env_var_used_when_the_frame_omits_the_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://self-hosted:8080")),
+            ("CU_MODEL", None),
+        ]);
+        let ep = resolve_endpoint(None, None);
+        assert_eq!(ep.base, "http://self-hosted:8080");
+        assert_eq!(ep.model, DEFAULT_MODEL);
+        assert_eq!(ep.source, EndpointSource::Env);
+    }
+
+    #[test]
+    fn default_endpoint_when_nothing_says_otherwise() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_ANTHROPIC_BASE", None), ("CU_MODEL", None)]);
+        let ep = resolve_endpoint(None, None);
+        assert_eq!(ep.base, DEFAULT_ANTHROPIC_BASE);
+        assert_eq!(ep.source, EndpointSource::Default);
+        assert!(ep.is_anthropic());
+    }
+
+    /// An operator who clears the settings field sends `""`, not nothing. That
+    /// must fall through the ladder rather than resolve to an empty base — an
+    /// empty base builds the URL "/v1/messages" and fails with a transport error
+    /// that names nothing.
+    #[test]
+    fn blank_frame_endpoint_falls_through_to_the_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_ANTHROPIC_BASE", Some("http://self-hosted:8080"))]);
+        let ep = resolve_endpoint(Some("   "), None);
+        assert_eq!(ep.base, "http://self-hosted:8080");
+        assert_eq!(ep.source, EndpointSource::Env);
+    }
+
+    /// Endpoint and model walk the ladder independently: a fleet that sets one
+    /// and not the other must not drag the machine's value for the other along.
+    #[test]
+    fn model_resolves_independently_of_the_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://stale-shell:9999")),
+            ("CU_MODEL", Some("shell-model")),
+        ]);
+        let ep = resolve_endpoint(Some("http://fleet-llm:8080"), None);
+        assert_eq!(ep.base, "http://fleet-llm:8080");
+        assert_eq!(ep.model, "shell-model");
+        assert_eq!(ep.source, EndpointSource::Fleet);
+    }
+
+    #[test]
+    fn messages_url_does_not_double_the_slash() {
+        let ep = ResolvedEndpoint {
+            base: "http://self-hosted:8080/".into(),
+            model: DEFAULT_MODEL.into(),
+            source: EndpointSource::Fleet,
+        };
+        assert_eq!(ep.messages_url(), "http://self-hosted:8080/v1/messages");
+    }
+
+    /// Auto-screenshot follows THIS run's endpoint. A fleet run at a self-hosted
+    /// server from a shell with no override used to get the Anthropic default
+    /// (off) and fly blind.
+    #[test]
+    fn auto_screenshot_follows_the_runs_endpoint_not_the_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_AUTO_SCREENSHOT", None), ("CU_ANTHROPIC_BASE", None)]);
+        assert!(!auto_screenshot_enabled(DEFAULT_ANTHROPIC_BASE));
+        assert!(auto_screenshot_enabled("http://self-hosted:8080"));
+    }
+
+    /// The failure this whole change exists to stop: a fleet worker pointed at
+    /// Anthropic. It must refuse, not succeed quietly.
+    #[test]
+    fn worker_pointed_at_anthropic_is_refused() {
+        let err = anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, true, false)
+            .expect("an enrolled worker on api.anthropic.com must be refused");
+        assert!(err.contains("api.anthropic.com"), "names the endpoint: {err}");
+        assert!(err.contains(ALLOW_ANTHROPIC_ENV), "names the opt-out: {err}");
+    }
+
+    /// The asymmetry. Same endpoint, operator machine (session credential): this
+    /// is BYOK on your own laptop and has always been the normal case.
+    #[test]
+    fn operator_on_anthropic_is_unaffected() {
+        assert!(anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, false, false).is_none());
+    }
+
+    #[test]
+    fn worker_on_a_self_hosted_endpoint_runs() {
+        assert!(anthropic_guard_error("http://self-hosted:8080", true, false).is_none());
+    }
+
+    #[test]
+    fn worker_may_opt_in_to_anthropic_explicitly() {
+        assert!(anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, true, true).is_none());
+    }
+
+    /// An empty base is treated as Anthropic by `endpoint_is_anthropic` (it is
+    /// what the default resolves to), so the guard must catch that too rather
+    /// than waving through a misconfiguration that lands on the default host.
+    #[test]
+    fn worker_with_an_empty_base_is_refused_too() {
+        assert!(anthropic_guard_error("", true, false).is_some());
+    }
 
     fn feed(blob: &str) -> SseAccumulator {
         let mut acc = SseAccumulator::new();
