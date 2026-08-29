@@ -252,7 +252,7 @@ type Mint =
   | { state: 'error'; message: string }
   | { state: 'ready'; key: EnrollKey }
 
-// "expires in 15 minutes" — the TTL as a duration, because "expires at 14:32" is
+// "expires in 58 minutes" — the TTL as a duration, because "expires at 14:32" is
 // a number the reader then has to subtract from their own clock while standing
 // at a different machine.
 function expiresInWords(expiresAt: string): string {

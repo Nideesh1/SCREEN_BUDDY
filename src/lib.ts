@@ -519,9 +519,9 @@ export async function enrollMachine(key: string): Promise<EnrollResult> {
 // regex covers only the paths that cannot produce one: safeInvoke refusing
 // outside Tauri, or a desktop build whose Rust half predates the struct.
 // Anything naming a transport failure is worth retrying; everything else is
-// treated as a refused key, which is the safer default — a key lives 15 minutes,
+// treated as a refused key, which is the safer default — a key is single-use,
 // and telling someone to keep retrying one the backend has already rejected
-// burns the whole window.
+// wastes the only attempt it had.
 function enrollFailureKind(raw: unknown, message: string): EnrollFailureKind {
   const kind = (raw as { kind?: unknown } | null | undefined)?.kind
   if (kind === 'rejected' || kind === 'unreachable' || kind === 'internal') return kind

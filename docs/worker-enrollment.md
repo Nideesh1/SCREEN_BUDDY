@@ -109,7 +109,10 @@ Mints a one-time key. Returns `{key, expires_at}`.
 - The key is a high-entropy random string, shown **once**. Store only a hash
   (the codebase has `encrypt_decrypt.py` — check what it offers before adding a
   hashing approach).
-- Short TTL. **15 minutes** — it is copied from one screen to another, not saved.
+- Short TTL. **One hour** — it is copied from one screen to another, not saved.
+  Started at 15 minutes, which routinely expired while a new machine was still
+  building ScreenBuddy; a key that dies before it can be used just teaches the
+  operator to mint spares and leave them lying around.
 - Single use. Redemption must be atomic (`find_one_and_update` on
   `used_at: None`), so two machines racing the same key cannot both enrol.
 - Rate-limit minting per user. A key is a bearer credential for joining a fleet.
@@ -243,7 +246,7 @@ Sequential where the contract must exist first, parallel where it need not.
 
 - **A worker can still exhaust its own run budget or report false telemetry about
   its own runs.** In scope for the checkpoint protocol, not for this.
-- **Key interception.** Anyone holding the key for its 15-minute life can enrol a
+- **Key interception.** Anyone holding the key for its one-hour life can enrol a
   machine into the fleet. Acceptable: it is short-lived, single-use, and grants
   only worker scope.
 - **Multiple humans supervising one fleet.** Still one account, one operator.

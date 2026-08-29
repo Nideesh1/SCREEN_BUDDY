@@ -136,7 +136,7 @@ function EnrolMachine({ onEnrolled, onCancel }: { onEnrolled: () => void; onCanc
             <>Enrollment failed on this machine: {failure.message}</>
           ) : (
             <>
-              That key wasn't accepted. A key works once and expires 15 minutes
+              That key wasn't accepted. A key works once and expires an hour
               after it is made, so ask for a fresh one.
             </>
           )}
