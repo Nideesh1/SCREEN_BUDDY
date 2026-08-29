@@ -14,6 +14,24 @@ export const IS_WINDOWS = /Windows/.test(navigator.userAgent)
 export const CU_BACKEND =
   import.meta.env.VITE_CU_BACKEND_URL || 'http://localhost:8000'
 
+// The models the launcher offers. ONE list, imported by every picker (New Run,
+// Templates, Schedule detail) — they were three copies before, with a comment
+// asking the next editor to keep them "in lockstep" by hand.
+//
+// `value` is sent verbatim as the Messages request's `model`. It reaches
+// whatever `CU_ANTHROPIC_BASE` points at, so a self-hosted endpoint that routes
+// by its own configuration will ignore it — but the run history records this
+// string, so an entry that lies about which model ran is a debugging trap. Add
+// an option here for any endpoint you actually run against.
+export const MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
+  { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
+  { value: 'qwen38', label: 'Qwen3.8 27B (self-hosted)' },
+]
+
+// Fallback when nothing else (a template, a schedule) specifies one.
+export const DEFAULT_MODEL = MODEL_OPTIONS[0].value
+
 // Deadline for the best-effort artifact metadata mirror. `fetch` has no default
 // timeout, so without this a stalled connection never settles and any caller
 // awaiting it hangs forever — which is indistinguishable, from the UI's side,

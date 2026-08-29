@@ -28,7 +28,7 @@ type AgentStatus = 'idle' | 'running' | 'done' | 'error'
 
 interface LogLine {
   id: number
-  kind: 'turn' | 'text' | 'action' | 'done' | 'error' | 'info'
+  kind: 'turn' | 'text' | 'action' | 'done' | 'error' | 'info' | 'shot'
   text: string
   ts: number
   // For 'action' lines: the structured name/input so the timeline can render a
@@ -36,6 +36,14 @@ interface LogLine {
   // the legacy `text` is still populated so behavior is unchanged.
   name?: string
   input?: unknown
+  // For 'shot' lines: the full data: URI, rendered inline in the timeline.
+  //
+  // The side pane only ever shows the LATEST frame, which is the wrong shape for
+  // reviewing a run in flight — what the agent saw three actions ago is exactly
+  // what explains the action it just took. Held only in component state, so it
+  // is dropped when the panel unmounts; the durable copies are the jpgs the Rust
+  // side writes to disk and records as run events.
+  src?: string
 }
 
 // Format an epoch-ms timestamp as a muted HH:MM:SS clock prefix.
@@ -168,8 +176,9 @@ function AgentRunPanel({ initialPrompt = '', pinnedSetId, runId, onStatus, attac
 
       await reg<ScreenshotPayload>('agent://screenshot', (p) => {
         textLineId.current = null
-        setScreenshot(`data:image/jpeg;base64,${p.jpeg_base64}`)
-        append('info', `📸 screenshot ${p.sent_w}×${p.sent_h} (screen ${p.screen_w}×${p.screen_h})`)
+        const src = `data:image/jpeg;base64,${p.jpeg_base64}`
+        setScreenshot(src)
+        append('shot', `${p.sent_w}×${p.sent_h} (screen ${p.screen_w}×${p.screen_h})`, { src })
       })
 
       await reg<DonePayload>('agent://done', (p) => {
@@ -199,11 +208,15 @@ function AgentRunPanel({ initialPrompt = '', pinnedSetId, runId, onStatus, attac
     }
   }, [append])
 
-  // Auto-scroll the log.
+  // Follow the newest line. The list renders newest-first, so that is the TOP —
+  // scrolling to scrollHeight here would chase the oldest entry instead.
+  //
+  // Only auto-scroll when already at (or near) the top: once the user scrolls
+  // down to read earlier turns, yanking them back on every event makes the log
+  // unreadable during a live run.
   useEffect(() => {
-    if (logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight
-    }
+    const el = logRef.current
+    if (el && el.scrollTop < 80) el.scrollTop = 0
   }, [log])
 
   const handleRun = async () => {
@@ -359,7 +372,13 @@ function AgentRunPanel({ initialPrompt = '', pinnedSetId, runId, onStatus, attac
                 Waiting for the agent stream…
               </span>
             ) : (
-              log.map((l) => <TimelineRow key={l.id} line={l} />)
+              // NEWEST FIRST. A run can go for hours, and what matters while it
+              // is live is what the agent just did — which in append order sits
+              // at the bottom of a list you have to keep chasing. Rendering the
+              // reverse keeps the current action pinned at the top and lets
+              // history scroll away beneath it. `log` itself stays in append
+              // order; only the render is reversed.
+              [...log].reverse().map((l) => <TimelineRow key={l.id} line={l} />)
             )}
           </div>
         </Card>
@@ -452,6 +471,29 @@ function TimelineRow({ line }: { line: LogLine }) {
       <span style={{ color: 'var(--sb-text)', fontSize: 'var(--fs-md)', lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
         {line.text}
       </span>
+    )
+  } else if (line.kind === 'shot' && line.src) {
+    // Inline thumbnail, capped so a long run stays scannable. Clicking opens the
+    // full frame in a new tab — a data: URI needs no server round trip.
+    content = (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <a href={line.src} target="_blank" rel="noreferrer" style={{ display: 'inline-block', lineHeight: 0 }}>
+          <img
+            src={line.src}
+            alt="screenshot"
+            style={{
+              maxWidth: 320,
+              width: '100%',
+              borderRadius: 'var(--r-sm)',
+              border: '1px solid var(--sb-border)',
+              display: 'block',
+            }}
+          />
+        </a>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
+          📸 {line.text}
+        </span>
+      </div>
     )
   } else if (line.kind === 'done') {
     content = <StatusPill status="done" label={line.text.replace(/^✓\s*/, '')} />

@@ -223,6 +223,8 @@ pub fn run() {
         type_text,
         agent::start_agent_task,
         agent::stop_agent_task,
+        agent::model_endpoint,
+        agent::check_model_endpoint,
         remote::start_remote_listener,
         remote::stop_remote_listener,
         credentials::cred_list,
