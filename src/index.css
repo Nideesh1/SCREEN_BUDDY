@@ -608,3 +608,62 @@ body {
   font-weight: 400;
   color: var(--sb-text-muted);
 }
+
+/* ── Admin panel ───────────────────────────────────────────────────────────
+   Admin is the one shell used AWAY from the desk — on a phone, one-handed,
+   deciding whether an agent actually finished. It is laid out single-column at
+   a 390px design width and widens from there. These are the only rules in the
+   app that need media queries (every other view is inline-styled), so they live
+   here rather than as style objects. */
+
+.admin-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  /* Fluid on a phone; --page-max-narrow is still far wider than the content
+     wants, so the column is capped tighter for comfortable line length. */
+  max-width: 680px;
+  margin: 0 auto;
+  padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  padding-left: max(var(--sp-4), env(safe-area-inset-left));
+  padding-right: max(var(--sp-4), env(safe-area-inset-right));
+}
+
+@media (min-width: 700px) {
+  .admin-page {
+    padding: var(--sp-5) var(--sp-5) var(--sp-6);
+  }
+}
+
+/* The nav rail's 68px is a meaningful slice of a 390px viewport, so trim it on
+   phones. !important because NavRail sets its width inline (as every view in
+   this app does) and inline styles otherwise win over the cascade. */
+@media (max-width: 560px) {
+  .nav-rail {
+    width: 52px !important;
+  }
+}
+
+/* Tappable list card. The affordance is the border + arrow, both always
+   visible — nothing here may depend on hover, since the primary input is a
+   thumb. :active gives the press feedback a hover state would have. */
+.tap-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: var(--sb-surface-1);
+  border: 1px solid var(--sb-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  padding: var(--sp-4);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.tap-card:active {
+  background: var(--sb-surface-3);
+  border-color: var(--sb-border-gold);
+}
+

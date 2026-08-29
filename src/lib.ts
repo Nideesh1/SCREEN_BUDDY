@@ -380,6 +380,19 @@ export function relativeTime(value: string | number | null | undefined): string 
   return new Date(ms).toLocaleDateString()
 }
 
+// ---- Host detection --------------------------------------------------------
+
+// True when the renderer is running inside the Tauri webview rather than a plain
+// browser tab. The admin panel is served on the web too (a finish-claim gets
+// approved from a phone, away from the desk), so every Tauri-only path — invoke,
+// notifications, the remote listener, capture — must be SKIPPED there rather
+// than left to throw. Tauri v2 injects `__TAURI_INTERNALS__` onto window before
+// any app code runs, which is why this is a reliable synchronous check that
+// needs no plugin (same reasoning as IS_WINDOWS at the top of this file).
+export function isTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
 // Wrap a Tauri invoke so a not-yet-implemented command (the Rust agents merge in
 // parallel) never crashes the UI. Returns { ok, data } | { ok:false, error }.
 export type InvokeResult<T> =
@@ -390,6 +403,13 @@ export async function safeInvoke<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<InvokeResult<T>> {
+  // Outside the Tauri webview there is no command bridge at all, so bail before
+  // importing it: the dynamic import resolves fine in a browser build and the
+  // failure would otherwise surface as an opaque "window.__TAURI_INTERNALS__ is
+  // undefined" instead of something a caller can put in front of a user.
+  if (!isTauri()) {
+    return { ok: false, error: `${command} is unavailable outside the desktop app` }
+  }
   try {
     const { invoke } = await import('@tauri-apps/api/core')
     const data = (await invoke(command, args)) as T

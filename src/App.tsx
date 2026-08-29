@@ -1,9 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification'
 import { useGoogleAuth } from './hooks/useGoogleAuth'
 import { ActiveRunProvider } from './activeRun'
-import { CU_BACKEND, safeInvoke, reconcileOrphanedRuns } from './lib'
+import { CU_BACKEND, safeInvoke, reconcileOrphanedRuns, isTauri } from './lib'
 import SplashLogin from './SplashLogin'
 import Layout from './Layout'
 import Dashboard from './views/Dashboard'
@@ -18,7 +17,10 @@ import Scheduled from './views/Scheduled'
 import Templates from './views/Templates'
 import ScheduleDetail from './views/ScheduleDetail'
 import ScheduleFireModal from './views/ScheduleFireModal'
+import Admin from './views/Admin'
 import { useScheduler } from './useScheduler'
+import { ModeProvider, homeRouteFor, useMode } from './mode'
+import ModePicker from './ModePicker'
 
 // App is the auth gate (single source of truth for auth state). It calls
 // useGoogleAuth() ONCE. Not authenticated -> splash. Authenticated -> the
@@ -51,10 +53,17 @@ function App() {
 
   // Request OS notification permission once after auth so the Rust-sent
   // run-complete / run-failed notifications can actually display. Best-effort.
+  // Desktop only: the plugin talks to the Tauri IPC bridge, and this same bundle
+  // is served in a plain browser for the admin panel — hence the isTauri() gate
+  // and the dynamic import (a static one would pull the plugin into the web
+  // chunk for a call that can never run there).
   useEffect(() => {
-    if (!isAuthenticated) return
+    if (!isAuthenticated || !isTauri()) return
     ;(async () => {
       try {
+        const { isPermissionGranted, requestPermission } = await import(
+          '@tauri-apps/plugin-notification'
+        )
         if (!(await isPermissionGranted())) {
           await requestPermission()
         }
@@ -68,9 +77,12 @@ function App() {
   // push run commands to this desktop. The session token doubles as the WS auth
   // and the started run's bearer; `start_remote_listener` is idempotent (it
   // cancels any prior socket), so re-running on token change is safe. Best
-  // effort — a missing token or not-yet-built command never breaks the UI.
+  // effort — a missing token or not-yet-built command never breaks the UI. The
+  // listener is a Rust-side socket, so there is nothing to start in a browser:
+  // safeInvoke already refuses outside Tauri, and skipping here keeps the
+  // no-op out of the console entirely.
   useEffect(() => {
-    if (!isAuthenticated) return
+    if (!isAuthenticated || !isTauri()) return
     const token = localStorage.getItem('screen_buddy_session_token')
     if (!token) return
     safeInvoke('start_remote_listener', { token, backend: CU_BACKEND })
@@ -84,15 +96,46 @@ function App() {
   }
 
   return (
+    <ModeProvider>
+      <ModedShell userEmail={userEmail} onSignOut={logout} />
+    </ModeProvider>
+  )
+}
+
+// The authenticated inside, once a shell mode is settled. Splitting this out of
+// App is what lets it consume useMode() — App owns the ModeProvider, so it can't
+// read from it itself.
+//
+// EVERY route is registered in EVERY mode, on purpose. Mode chooses what the nav
+// offers and where home points; it is not a permission (the backend authorizes
+// each request off the session token regardless), so a shared or bookmarked link
+// must keep working after a mode switch instead of bouncing to a 404.
+function ModedShell({
+  userEmail,
+  onSignOut,
+}: {
+  userEmail: string | null
+  onSignOut: () => void
+}) {
+  const { mode } = useMode()
+
+  // No stored choice and nothing safe to infer — ask, once.
+  if (!mode) return <ModePicker />
+
+  const home = homeRouteFor(mode)
+
+  return (
     <ActiveRunProvider>
       {/* Global cron firing engine + fire modal — mounted above the router so
-          the modal appears no matter which view is active. */}
-      <SchedulerHost />
+          the modal appears no matter which view is active. Not in admin mode:
+          it fires runs on THIS machine, and admin is the one shell that may be
+          a phone browser with no executor behind it. */}
+      {mode !== 'admin' && <SchedulerHost />}
       <HashRouter>
         <Routes>
-          <Route element={<Layout userEmail={userEmail} onSignOut={logout} />}>
-            {/* / -> /dashboard. `replace` so it doesn't pollute history. */}
-            <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route element={<Layout userEmail={userEmail} onSignOut={onSignOut} mode={mode} />}>
+            {/* / -> the mode's home. `replace` so it doesn't pollute history. */}
+            <Route index element={<Navigate to={home} replace />} />
             <Route path="dashboard" element={<Dashboard />} />
             {/* The launcher. */}
             <Route path="runs" element={<NewRun />} />
@@ -104,12 +147,17 @@ function App() {
             <Route path="history" element={<History />} />
             {/* Templates manager — a Runs sub-view alongside New / Scheduled / History. */}
             <Route path="templates" element={<Templates />} />
+            {/* Admin panel — the human-in-the-loop surface. Mobile-first, and
+                reachable from a phone browser as well as the desktop app: the
+                decisions it will carry happen away from the desk. A placeholder
+                for now; the approval protocol behind it is still being designed. */}
+            <Route path="admin" element={<Admin />} />
             <Route path="artifacts" element={<Artifacts />} />
             <Route path="pinned" element={<PinnedLibrary />} />
             <Route path="credentials" element={<Credentials />} />
             <Route path="settings" element={<Settings />} />
-            {/* Unknown route -> dashboard. */}
-            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            {/* Unknown route -> the mode's home. */}
+            <Route path="*" element={<Navigate to={home} replace />} />
           </Route>
         </Routes>
       </HashRouter>

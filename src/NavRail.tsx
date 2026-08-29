@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
+import { isTauri } from './lib'
+import type { AppMode } from './mode'
 import sbLogo from './assets/sb-logo.svg'
 
 // Live remote-channel indicator. Subscribes to the Rust-emitted `remote://status`
@@ -10,6 +12,10 @@ import sbLogo from './assets/sb-logo.svg'
 function RemoteIndicator() {
   const [connected, setConnected] = useState(false)
   useEffect(() => {
+    // There is no Rust side to listen to in a browser tab (the same bundle is
+    // served for the admin panel), and `listen` would reject there with an
+    // unhandled promise rejection — so stay dim and subscribe to nothing.
+    if (!isTauri()) return
     const unlisten = listen<{ connected: boolean }>('remote://status', (e) => {
       setConnected(!!e.payload?.connected)
     })
@@ -54,6 +60,7 @@ function RemoteIndicator() {
 // caller that still thinks in view ids has one source of truth.
 export type ViewId =
   | 'dashboard'
+  | 'admin'
   | 'artifacts'
   | 'pinned'
   | 'runs'
@@ -70,6 +77,7 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
+  { id: 'admin', Icon: ApprovalIcon, label: 'Approvals' },
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
   { id: 'runs', Icon: PlusIcon, label: 'Runs' },
@@ -79,9 +87,38 @@ const ITEMS: NavItem[] = [
   { id: 'settings', Icon: GearIcon, label: 'Settings' },
 ]
 
+// Which items each shell shows. Mode is a VIEW choice — hiding an item here
+// removes it from the rail, not from the router or from what the backend will
+// answer, so nothing about this map is a permission boundary.
+//
+// worker and consumer are the SAME views today: both are the current desktop
+// app, and worker is simply the reduced rail a fleet node needs (what's running,
+// is it connected, does it have permissions). Worker is expected to diverge into
+// its own purpose-built views later — until it does, two parallel nav trees
+// rendering identical screens would be pure duplication.
+const MODE_ITEMS: Record<AppMode, ViewId[]> = {
+  admin: ['admin', 'settings'],
+  worker: ['dashboard', 'history', 'settings'],
+  consumer: [
+    'dashboard',
+    // Consumer keeps the Approvals entry: the person running
+    // their own agents is also the person those agents wait on. Worker doesn't
+    // — nobody is sitting in front of a fleet node to decide anything.
+    'admin',
+    'artifacts',
+    'pinned',
+    'runs',
+    'scheduled',
+    'history',
+    'credentials',
+    'settings',
+  ],
+}
+
 interface NavRailProps {
   userEmail: string | null
   onSignOut: () => void
+  mode: AppMode
 }
 
 // Which nav item the current path highlights. Matched by path prefix so a
@@ -100,12 +137,15 @@ function activeIdFor(pathname: string): ViewId | null {
 // nav icons in the middle, and a Sign out control pushed to the very bottom via
 // a flex spacer. Route-aware: the active item derives from the current path and
 // a click navigates to that route. Sign out still calls the passed callback.
-function NavRail({ userEmail, onSignOut }: NavRailProps) {
+function NavRail({ userEmail, onSignOut, mode }: NavRailProps) {
   const navigate = useNavigate()
   const location = useLocation()
   const active = activeIdFor(location.pathname)
+  const visible = MODE_ITEMS[mode]
+  const items = ITEMS.filter((item) => visible.includes(item.id))
   return (
     <nav
+      className="nav-rail"
       style={{
         width: 68,
         flexShrink: 0,
@@ -138,8 +178,8 @@ function NavRail({ userEmail, onSignOut }: NavRailProps) {
         }}
       />
 
-      {/* Nav icons. */}
-      {ITEMS.map((item) => {
+      {/* Nav icons — the current mode's set. */}
+      {items.map((item) => {
         const isActive = item.id === active
         return (
           <button
@@ -276,6 +316,17 @@ function ArtifactIcon() {
       <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
       <path d="M3 12.5 12 17l9-4.5" />
       <path d="M3 17 12 21.5 21 17" />
+    </IconBase>
+  )
+}
+
+function ApprovalIcon() {
+  // A checkmark inside a document — a claim of "done" awaiting a signature.
+  return (
+    <IconBase>
+      <path d="M6 3h8l4 4v14H6z" />
+      <path d="M14 3v4h4" />
+      <polyline points="9 14 11 16 15 12" />
     </IconBase>
   )
 }

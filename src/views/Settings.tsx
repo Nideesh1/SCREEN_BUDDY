@@ -4,6 +4,8 @@ import { open } from '@tauri-apps/plugin-shell'
 import type { LayoutContext } from '../Layout'
 import { safeInvoke, IS_WINDOWS } from '../lib'
 import { Card, Button, Badge, Spinner } from '../ui'
+import { useMode } from '../mode'
+import { ModeCards } from '../ModePicker'
 
 const SETTINGS_DEEP_LINK = {
   screenRecording: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
@@ -101,6 +103,8 @@ function Settings() {
           </Button>
         </div>
       </Card>
+
+      <ModeCard />
 
       <Card title="Storage">
         <Row label="Screenshots" value="Stored on this computer" />
@@ -507,6 +511,24 @@ function PermRow({
         Open Settings
       </button>
     </div>
+  )
+}
+
+// The mode switcher. One person is routinely all three roles on the same
+// machine, so the choice made after sign-in has to be reversible from inside the
+// app — otherwise picking "admin" once means reinstalling to get the launcher
+// back. Switching only changes which shell renders: it grants nothing, and the
+// backend authorizes every request the same way in all three.
+function ModeCard() {
+  const { mode, setMode } = useMode()
+  return (
+    <Card title="Mode">
+      <p style={{ marginBottom: 'var(--sp-4)', fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+        Which ScreenBuddy you see. This changes the layout only — your access is
+        the same in every mode.
+      </p>
+      <ModeCards current={mode} onPick={setMode} />
+    </Card>
   )
 }
 

@@ -1,9 +1,12 @@
 import { Outlet } from 'react-router-dom'
 import NavRail from './NavRail'
+import type { AppMode } from './mode'
 
 interface LayoutProps {
   userEmail: string | null
   onSignOut: () => void
+  /** Chosen shell — decides which nav items the rail offers, nothing more. */
+  mode: AppMode
 }
 
 // Context handed to child routes via <Outlet/>. Leaf routes that need the
@@ -17,7 +20,7 @@ export interface LayoutContext {
 // carries the brand mark + Sign out) and a routed main content area beside it.
 // No top bar — each view supplies its own heading. This is the router parent
 // layout: <NavRail/> stays put while <Outlet/> swaps the active route's view.
-function Layout({ userEmail, onSignOut }: LayoutProps) {
+function Layout({ userEmail, onSignOut, mode }: LayoutProps) {
   return (
     <div
       style={{
@@ -31,7 +34,7 @@ function Layout({ userEmail, onSignOut }: LayoutProps) {
         overflow: 'hidden',
       }}
     >
-      <NavRail userEmail={userEmail} onSignOut={onSignOut} />
+      <NavRail userEmail={userEmail} onSignOut={onSignOut} mode={mode} />
       <main
         style={{
           flex: 1,
