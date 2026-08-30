@@ -3,10 +3,18 @@
 //! A ScreenBuddy install runs on a fleet of laptops and VMs, and the fleet view
 //! needs to answer "is this the same machine I saw yesterday?". Hostnames get
 //! renamed, VMs get re-imaged onto new IPs, OS versions move — none of them are
-//! an identity. So on first launch we mint a UUID v4, write it next to the other
-//! per-install state, and read that same value back forever after. Everything
-//! else reported here (hostname, os, versions) is descriptive metadata that the
-//! backend is free to overwrite on each upsert; only `device_id` is the key.
+//! an identity. So on first launch we derive a UUID from the machine's own
+//! hardware identifier, write it next to the other per-install state, and read
+//! that same value back forever after. Everything else reported here (hostname,
+//! os, versions) is descriptive metadata that the backend is free to overwrite
+//! on each upsert; only `device_id` is the key.
+//!
+//! The id is derived rather than minted because a random UUID only survives what
+//! the app data dir survives: reinstall the app, or wipe app data, and the
+//! machine comes back as a stranger — a dead row in the fleet view and a walk
+//! back to the admin machine for a fresh enrollment key. Hardware outlives both.
+//! What the file still buys us is the read path: one probe, then a plain read
+//! forever, and a machine whose hardware id is unreadable still gets an id.
 //!
 //! Registration is `POST {backend}/devices`, bearer-authed with the session
 //! token, and is BEST-EFFORT in exactly the sense `agent.rs`'s run persistence
@@ -21,6 +29,7 @@ use std::time::Duration;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Where the minted id lives, inside the app data dir. Same directory and same
@@ -28,6 +37,17 @@ use tauri::{AppHandle, Emitter, Manager};
 /// there is no second config location in this app, and inventing one would mean
 /// two places to look when a device shows up twice in the fleet view.
 const DEVICE_ID_FILE: &str = "device_id";
+
+/// Fixed prefix mixed into the hardware id before hashing. Two jobs, both about
+/// keeping the machine's real hardware identifier off the wire: it domain-
+/// separates our ids from any other product that hashes the same
+/// `IOPlatformUUID` (so a leaked id from elsewhere is not a lookup key here),
+/// and it means the value we store and send is a one-way function of the
+/// hardware rather than the hardware itself.
+///
+/// It is NOT a secret — it ships in the binary — and it must NEVER change:
+/// bumping it re-identifies every machine that has not yet written its id file.
+const DEVICE_ID_SALT: &str = "screenbuddy.device-id.v1|";
 
 /// How long a registration attempt may hang before we give up. Registration is
 /// decorative; it must never keep a socket task alive waiting on a dead server.
@@ -81,6 +101,12 @@ fn mint_uuid_v4() -> String {
     rand::thread_rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    format_uuid(&b)
+}
+
+/// Sixteen bytes in the canonical 8-4-4-4-12 hex layout. Shared by the random
+/// and the derived id so both are the same shape to every reader of the file.
+fn format_uuid(b: &[u8; 16]) -> String {
     let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
@@ -103,24 +129,167 @@ fn looks_like_uuid(s: &str) -> bool {
         })
 }
 
-/// Read this machine's device id, minting and persisting one on first launch.
+/// Hash a machine's hardware identifier into a UUID-shaped id.
 ///
-/// A file that is missing, unreadable, empty, or garbage is treated the same as
-/// "first launch": mint a fresh id and overwrite. Refusing to start because a
-/// half-written file lost a fight with a power cut would be the worst possible
-/// trade — the cost of a fresh id is one duplicate row in the fleet view, the
-/// cost of an error path here is an app that will not open.
+/// The raw value never leaves the box. `IOPlatformUUID` and `MachineGuid` are
+/// the identifiers other software on the same machine also fingerprints users
+/// by, and shipping one to a server — where it lands in a database, a log line
+/// and a backup — hands out a cross-product join key for nothing in return. A
+/// SHA-256 over `salt || value` keeps every property we actually need (same
+/// machine → same id, different machines → different ids) and throws away the
+/// one we don't (the ability to work backwards to the hardware). `sha2` is
+/// already a direct dependency — `artifacts.rs` content-addresses with it.
+///
+/// Truncating a 256-bit digest to 128 bits is not a weakness here: this is a
+/// uniqueness key over a fleet of tens of machines, not a security boundary,
+/// and 128 bits is exactly what a random UUID would have given us anyway.
+///
+/// The version nibble is 8 — "custom" in RFC 9562 — because that is honestly
+/// what this is. Claiming 4 would assert the bytes are random when they are a
+/// pure function of the hardware, and nothing in this app or the backend keys
+/// off the version (see `looks_like_uuid`).
+fn derive_device_id(hardware: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DEVICE_ID_SALT.as_bytes());
+    // Case and surrounding whitespace are formatting of the transport (ioreg
+    // prints upper, /etc/machine-id lower), not part of the identifier.
+    hasher.update(hardware.trim().to_ascii_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    b[6] = (b[6] & 0x0f) | 0x80; // version 8 (custom)
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    format_uuid(&b)
+}
+
+/// This machine's hardware identifier, or `None` if the OS will not give one up.
+///
+/// Deliberately NOT the MAC address, which is the obvious first idea and the
+/// wrong one: macOS rotates a private Wi-Fi address per network, cloning a VM
+/// re-randomises it, a laptop's answer changes the moment it is docked, and
+/// "the" MAC is ambiguous on any machine with more than one NIC. Every one of
+/// those is a silent re-identification of an enrolled machine. The platform
+/// UUIDs below have the one property a MAC lacks — they do not move.
+///
+/// - macOS: `IOPlatformUUID`, carried by the platform expert device.
+/// - Windows: `MachineGuid`, written once by the OS installer.
+/// - Linux: `/etc/machine-id` (systemd), with the older dbus path as a fallback.
+///   Read directly rather than through a subprocess — they are plain files.
+///
+/// All three are stable across reinstalls of *our app*, which is the whole
+/// point. None survives an OS reimage, and none is expected to: a reimaged
+/// machine genuinely is a new machine.
+fn hardware_uuid() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        probe("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
+            .as_deref()
+            .and_then(parse_ioreg_uuid)
+    } else if cfg!(target_os = "windows") {
+        // `/reg:64` pins the 64-bit view. Without it a 32-bit process is
+        // WOW64-redirected to `SOFTWARE\Wow6432Node\Microsoft\Cryptography`,
+        // where MachineGuid does not exist — so one machine would answer "no
+        // hardware id" or a different id purely from the bitness of the build.
+        // We ship x86_64, which already gets the native view, but the flag makes
+        // that true independent of how the app is built. 32-bit-only Windows
+        // rejects the flag outright, hence the retry without it.
+        const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Cryptography";
+        probe("reg", &["query", KEY, "/v", "MachineGuid", "/reg:64"])
+            .or_else(|| probe("reg", &["query", KEY, "/v", "MachineGuid"]))
+            .as_deref()
+            .and_then(parse_machine_guid)
+    } else {
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+            .iter()
+            .find_map(|p| fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Lift the value out of ioreg's property dump, whose line reads:
+/// `    "IOPlatformUUID" = "2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60"`.
+///
+/// Matched on the quoted key so it cannot collide with another property that
+/// merely mentions the name, and shape-checked before it is returned: a match
+/// yielding something that is not a UUID would mean ioreg changed its format,
+/// and a wrong-but-plausible id is worse than no id at all.
+fn parse_ioreg_uuid(dump: &str) -> Option<String> {
+    dump.lines()
+        .filter_map(|l| l.split_once("\"IOPlatformUUID\""))
+        .filter_map(|(_, rest)| rest.split_once('='))
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .find(|v| looks_like_uuid(v))
+}
+
+/// Lift the value out of `reg query`'s tabular output:
+/// `    MachineGuid    REG_SZ    5f7a1c3e-…`.
+///
+/// The columns are separated by whitespace of an unspecified width, so this
+/// splits on whitespace rather than counting spaces and takes the last field —
+/// the value, which is the only column that cannot contain anything else.
+fn parse_machine_guid(out: &str) -> Option<String> {
+    out.lines()
+        .filter(|l| l.split_whitespace().next() == Some("MachineGuid"))
+        .filter_map(|l| l.split_whitespace().last())
+        .map(|v| v.to_string())
+        .find(|v| looks_like_uuid(v))
+}
+
+/// Read this machine's device id, establishing and persisting one on first
+/// launch.
+///
+/// **A valid file always wins.** Machines are enrolled against the id they are
+/// already reporting; re-deriving on a machine that has one would silently
+/// orphan its fleet row and kill its enrollment — and would do it on upgrade, to
+/// every machine at once. So the hardware probe only ever answers "what id
+/// should a machine that has none take?", never "was the existing answer
+/// right?". Writing the derived value straight back to the same file is what
+/// keeps that true: the read path above stays the only read path, and the probe
+/// runs once per install rather than once per call.
+///
+/// A file that is missing, unreadable, empty, or garbage is treated as "first
+/// launch". Refusing to start because a half-written file lost a fight with a
+/// power cut would be the worst possible trade — the cost of a fresh id is one
+/// duplicate row in the fleet view, the cost of an error path here is an app
+/// that will not open. The same reasoning covers an unreadable hardware id
+/// (a locked-down OS, a stripped container, an OS we did not anticipate): fall
+/// back to a random UUID exactly as before, and log which path was taken so a
+/// duplicated fleet row can still be explained after the fact.
 pub fn device_id(app: &AppHandle) -> Result<String, String> {
-    let path = app_data(app)?.join(DEVICE_ID_FILE);
-    if let Ok(raw) = fs::read_to_string(&path) {
+    resolve_device_id(&app_data(app)?.join(DEVICE_ID_FILE), hardware_uuid)
+}
+
+/// The body of `device_id`, over a path and a hardware source rather than an
+/// `AppHandle` — the rules above are the ones worth pinning in a test, and a
+/// test cannot conjure a Tauri app.
+///
+/// `hardware` is a closure, not a value, precisely so the ordering is structural:
+/// there is no way to write a caller that probes the hardware of a machine whose
+/// file already answers the question.
+fn resolve_device_id(
+    path: &std::path::Path,
+    hardware: impl FnOnce() -> Option<String>,
+) -> Result<String, String> {
+    if let Ok(raw) = fs::read_to_string(path) {
         let id = raw.trim();
         if looks_like_uuid(id) {
             return Ok(id.to_string());
         }
-        eprintln!("[device] unusable device id file at {path:?}; minting a new one");
+        eprintln!("[device] unusable device id file at {path:?}; establishing a new one");
     }
-    let id = mint_uuid_v4();
-    fs::write(&path, &id).map_err(|e| format!("write device id: {e}"))?;
+    let (id, whence) = match hardware() {
+        Some(hw) => (
+            derive_device_id(&hw),
+            "derived from this machine's hardware id",
+        ),
+        None => (
+            mint_uuid_v4(),
+            "minted at random (no hardware id available — a reinstall will \
+             re-identify this machine)",
+        ),
+    };
+    fs::write(path, &id).map_err(|e| format!("write device id: {e}"))?;
+    eprintln!("[device] device id {id} {whence}");
     Ok(id)
 }
 
@@ -511,6 +680,151 @@ mod tests {
         assert!(m.contains("mistyped"), "{m}");
         assert!(m.contains("expired"), "{m}");
         assert!(m.contains("already used"), "{m}");
+    }
+
+    /// A scratch directory per test, named like the ones in `artifacts.rs`.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sb_dev_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// THE requirement. Two machines are enrolled against ids that were minted
+    /// at random, and the backend keys their fleet rows and their device tokens
+    /// off exactly those strings. If the hardware id can ever override a file
+    /// that is already there, shipping this orphans both of them at once — so
+    /// the probe must not even be consulted, which is what the panicking closure
+    /// asserts.
+    #[test]
+    fn an_existing_id_file_beats_the_hardware_and_is_not_even_asked() {
+        let dir = scratch("keep");
+        let path = dir.join(DEVICE_ID_FILE);
+        let enrolled = "b1e2c3d4-0000-4000-8000-abcdefabcdef";
+        fs::write(&path, enrolled).unwrap();
+
+        let got = resolve_device_id(&path, || panic!("probed hardware despite a valid id file"));
+        assert_eq!(got.unwrap(), enrolled);
+        // And the file is untouched, so the next launch reads the same thing.
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), enrolled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Trailing whitespace is what a file written by hand or by an editor looks
+    /// like; it must not be mistaken for corruption and re-identify the machine.
+    #[test]
+    fn a_padded_id_file_still_wins() {
+        let dir = scratch("pad");
+        let path = dir.join(DEVICE_ID_FILE);
+        fs::write(&path, "  b1e2c3d4-0000-4000-8000-abcdefabcdef\n").unwrap();
+        let got = resolve_device_id(&path, || panic!("probed hardware despite a valid id file"));
+        assert_eq!(got.unwrap(), "b1e2c3d4-0000-4000-8000-abcdefabcdef");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The property that makes derivation worth doing at all: wipe the app data
+    /// dir, and the same machine comes back as the same device.
+    #[test]
+    fn the_derived_id_is_stable_across_a_wiped_app_data_dir() {
+        let dir = scratch("derive");
+        let path = dir.join(DEVICE_ID_FILE);
+        let hw = || Some("2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60".to_string());
+
+        let first = resolve_device_id(&path, hw).unwrap();
+        assert!(looks_like_uuid(&first), "{first}");
+        assert_eq!(&first[14..15], "8", "version nibble should be custom: {first}");
+        // Written back, so the second call is a plain read and never re-probes.
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        assert_eq!(
+            resolve_device_id(&path, || panic!("re-probed after the first call")).unwrap(),
+            first
+        );
+
+        // The reinstall: the file is gone, the hardware is not.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(resolve_device_id(&path, hw).unwrap(), first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The hash is a pure function of the hardware id, insensitive to how the OS
+    /// happened to print it, and different machines land on different ids. The
+    /// literal is pinned so a future edit to the salt or the byte layout — which
+    /// would re-identify every machine that has not written its file yet — fails
+    /// here instead of in the fleet view.
+    #[test]
+    fn derivation_is_stable_and_machine_specific() {
+        let a = derive_device_id("2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60");
+        assert_eq!(a, derive_device_id("2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60"));
+        assert_eq!(a, derive_device_id(" 2c4b9a17-6e0d-5f82-9c31-7a5e1d4b8f60 \n"));
+        assert_ne!(a, derive_device_id("00000000-0000-0000-0000-000000000000"));
+        // The hardware id itself must not be recoverable from what we ship.
+        assert!(!a.contains("2c4b9a17"), "{a}");
+        assert_eq!(a, "ea674c2b-3a33-8b43-b934-cf02c8e861ec", "salt or layout changed");
+    }
+
+    /// A stripped container, a locked-down OS, an OS we did not anticipate: the
+    /// app still starts and still gets an id. Losing hardware-stability is a
+    /// duplicate fleet row; failing here is a machine that will not open.
+    #[test]
+    fn no_hardware_id_falls_back_to_a_random_uuid() {
+        let dir = scratch("fallback");
+        let path = dir.join(DEVICE_ID_FILE);
+
+        let id = resolve_device_id(&path, || None).unwrap();
+        assert!(looks_like_uuid(&id), "{id}");
+        assert_eq!(&id[14..15], "4", "random fallback should be a v4: {id}");
+        // Persisted like any other, so it is stable for as long as the file is.
+        assert_eq!(
+            resolve_device_id(&path, || None).unwrap(),
+            id,
+            "the fallback id must survive the next launch"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hardware probe that answers with something other than a UUID is a
+    /// probe whose output format changed; taking it at face value would give the
+    /// machine a stable-but-wrong id, which is harder to notice than no id.
+    #[test]
+    fn a_garbled_hardware_answer_is_rejected_by_the_parsers() {
+        assert_eq!(parse_ioreg_uuid("nothing to see here"), None);
+        assert_eq!(
+            parse_ioreg_uuid("    \"IOPlatformUUID\" = \"not-a-uuid\""),
+            None
+        );
+        assert_eq!(parse_machine_guid("ERROR: The system was unable to find"), None);
+        assert_eq!(parse_machine_guid("    MachineGuid    REG_SZ    ????"), None);
+    }
+
+    /// Real `ioreg -rd1 -c IOPlatformExpertDevice` output, trimmed. The key is
+    /// matched quoted, so a neighbouring property that merely mentions the name
+    /// cannot win the race.
+    #[test]
+    fn parses_the_platform_uuid_out_of_an_ioreg_dump() {
+        let dump = "+-o J316sAP  <class IOPlatformExpertDevice, id 0x100000278>\n\
+                    {\n\
+                    \x20 \"IOPlatformSerialNumber\" = \"XXXXXXXXXX\"\n\
+                    \x20 \"IOPlatformUUID\" = \"2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60\"\n\
+                    \x20 \"IOPolledInterface\" = \"AppleARMWatchdogTimerHibernateHandler is not serializable\"\n\
+                    }\n";
+        assert_eq!(
+            parse_ioreg_uuid(dump).as_deref(),
+            Some("2C4B9A17-6E0D-5F82-9C31-7A5E1D4B8F60")
+        );
+    }
+
+    /// `reg query`'s three columns are separated by whitespace of no fixed
+    /// width, and the blank line + echoed key path above the value are part of
+    /// the output rather than noise we can assume away.
+    #[test]
+    fn parses_machine_guid_out_of_reg_query_output() {
+        let out = "\r\n\
+                   HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n\
+                   \x20   MachineGuid    REG_SZ    5f7a1c3e-9b2d-4a11-8c60-0e3f5d7a91bc\r\n";
+        assert_eq!(
+            parse_machine_guid(out).as_deref(),
+            Some("5f7a1c3e-9b2d-4a11-8c60-0e3f5d7a91bc")
+        );
     }
 
     #[test]
