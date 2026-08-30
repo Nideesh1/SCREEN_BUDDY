@@ -7,9 +7,18 @@
 //!   backend → desktop  {"type":"run","run_id":"uuid","task":"…","model":"…",
 //!                       "model_endpoint":"https://…",
 //!                       "pinned_set_names":"[\"Set name\"]"}
+//!                      {"type":"snapshot"}
 //!                      {"type":"ping"}
 //!   desktop → backend  {"type":"ack","run_id":"uuid"}
+//!                      {"type":"ack","kind":"snapshot"}
 //!                      {"type":"pong"}
+//!
+//! A `snapshot` frame asks "what is this machine looking at right now" — the
+//! console's way of pulling a fresh frame from a machine that is idle, and so it
+//! carries no `run_id` and the uploaded object belongs to no run. Its ack means
+//! CAPTURE ACCEPTED, not uploaded: the frame reaches the backend out of band via
+//! `POST /screenshots/commit`, and the ack goes out long before that lands. The
+//! console learns the upload happened from the commit, never from this socket.
 //!
 //! A `run` frame is ack'd immediately, then funneled through
 //! `agent::start_run_internal` (the exact lock/RunLease/persistence path that
@@ -136,6 +145,20 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
     };
     match v.get("type").and_then(|t| t.as_str()) {
         Some("ping") => Some(json!({ "type": "pong" }).to_string()),
+        Some("snapshot") => {
+            // Detached: the capture and its three-legged upload must not hold up
+            // the read loop, which is also how run frames arrive. `auth` is this
+            // socket's credential — the device token on an enrolled worker — so
+            // the presign/commit legs authenticate exactly as run persistence
+            // does.
+            //
+            // Deliberately independent of any run in flight: no `run_id`, no
+            // `AgentState`, and no `ComputerState` (see
+            // `screenshots::spawn_snapshot`), so a live run's timeline and its
+            // click-coordinate scaling are both untouched.
+            crate::screenshots::spawn_snapshot(app, backend, auth);
+            Some(json!({ "type": "ack", "kind": "snapshot" }).to_string())
+        }
         Some("run") => {
             let run_id = v.get("run_id").and_then(|r| r.as_str()).unwrap_or("").to_string();
             let task = v.get("task").and_then(|t| t.as_str()).unwrap_or("").to_string();

@@ -11,6 +11,7 @@ mod device;
 mod permissions;
 mod pinned;
 mod remote;
+mod screenshots;
 mod video;
 mod window;
 

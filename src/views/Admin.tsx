@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
 import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
@@ -856,6 +856,11 @@ function DeviceDetail({
 
       <NowCard device={device} onOpenRun={onOpenRun} />
 
+      {/* Directly under NOW: that card says a run exists, this one says what it
+          is doing. Read the other way round they are the same machine's story in
+          the right order. */}
+      <ScreenCard device={device} />
+
       <AccessCard
         device={device}
         revoking={revoking}
@@ -1120,6 +1125,761 @@ function NowCard({
     </Card>
   )
 }
+
+// ───────────────────────────────────────────────────────── screen
+
+// SCREEN — what the machine is actually looking at.
+//
+// NOW, above, can only say that a run exists and which step it is on. A worker
+// grinding through a task and a worker stuck in a loop clicking the same button
+// produce the identical card: a run id and a step count that keeps ticking. The
+// frames are the only thing that separates them, and nobody is sitting at these
+// machines to look — which is why the latest one is rendered at a size you can
+// read rather than as a thumbnail.
+//
+// Workers upload each turn's frame to object storage and the backend hands back
+// PRESIGNED, short-lived URLs. Nothing here holds one past a failed load: see
+// `reportBadUrl`, which treats a broken image as an expired signature and asks
+// the backend again, because a silently blank panel reads as a broken feature
+// rather than as a URL that timed out.
+
+// One uploaded frame. The screenshot endpoints are landing in parallel with this
+// pane, so every field is read through a short list of aliases rather than one
+// exact key. The failure this avoids is the bad one: if the backend settled on
+// `created_at` where this expected `captured_at`, a strict read renders an empty
+// strip — which is indistinguishable from a machine that has never uploaded
+// anything, and sends the operator looking at the wrong problem.
+interface Frame {
+  /** Only has to be STABLE and comparable: it is what "is there a newer frame
+   *  than the one on screen?" is answered with. */
+  id: string
+  url: string
+  captured_at: string
+  /** When the presigned URL stops working, when the backend bothers to say. */
+  expires_at: string | null
+}
+
+type Snap =
+  | { state: 'idle' }
+  | { state: 'pending' }
+  | { state: 'timeout' }
+  | { state: 'error'; message: string }
+
+// How often a RUNNING machine is checked for a newer frame. Fast enough to track
+// a run turn by turn (a computer-use step is seconds, not milliseconds) without
+// re-signing URLs faster than the worker produces frames.
+const SCREEN_POLL_MS = 5_000
+
+// How many frames the strip asks for. A long-running machine has hundreds, each
+// a ~1024px JPEG; the strip exists to show the last stretch of a run, and pulling
+// the lot would cost megabytes to render a row of 132px thumbnails.
+const STRIP_LIMIT = 24
+
+// The snapshot wait. POST /snapshot returns once the request is QUEUED — the
+// machine still has to pick the command up, wake, capture and upload — so the
+// frame lands seconds later, or never if nothing is listening. 45s is generous
+// for a machine that is answering and short enough that one that is not gets
+// SAID rather than left spinning.
+const SNAPSHOT_POLL_MS = 2_000
+const SNAPSHOT_TIMEOUT_MS = 45_000
+
+// How long a batch of presigned URLs is assumed to stay good when the backend
+// does not send an expiry. Only ever makes this pane re-fetch sooner than it
+// needed to, which is the harmless direction to be wrong in.
+const URL_ASSUMED_LIFE_MS = 4 * 60_000
+
+// Rendered width of a filmstrip thumbnail. The bytes are full-size either way —
+// there is no thumbnail endpoint — so `loading="lazy"` is what actually keeps
+// the row cheap; this only decides how many fit on screen.
+const THUMB_W = 132
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// The wall-clock time a frame was taken. The filmstrip shows this ALONGSIDE the
+// relative time, not instead of it: "3m ago" says how stale the run is, while the
+// clock time is what two adjacent frames get compared on when the question is
+// whether the machine has been repeating itself.
+function clockTime(iso: string): string {
+  const ms = Date.parse(iso)
+  if (!Number.isFinite(ms)) return '—'
+  return new Date(ms).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function firstString(row: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = row[key]
+    if (typeof value === 'string' && value) return value
+  }
+  return null
+}
+
+// The backend's ScreenshotOut (routers/screenshots.py): url, device_id, run_id,
+// seq, content_type, created_at, expires_at. It deliberately does NOT return an
+// object_key — a raw storage path is useless to a browser holding no credentials
+// and would publish the fleet's key layout — so there is no server-side id to
+// key React on.
+//
+// `created_at` stands in for one. It comes from the write path, is unique per
+// capture in practice, and is stable across the re-signs that change `url` every
+// few minutes — which is what a key has to be, since a lightbox left open across
+// a poll must not swap the image out from under whoever is reading it.
+function normalizeFrame(raw: unknown): Frame | null {
+  if (!raw || typeof raw !== 'object') return null
+  const row = raw as Record<string, unknown>
+  const url = firstString(row, ['url'])
+  // A row with no URL is nothing this pane can render, so it is dropped rather
+  // than shown as a broken tile.
+  if (!url) return null
+  const capturedAt = firstString(row, ['created_at']) ?? ''
+  return {
+    id: capturedAt || url,
+    url,
+    captured_at: capturedAt,
+    expires_at: firstString(row, ['expires_at']),
+  }
+}
+
+// True once the backend's own stated expiry for a URL has passed. Used only to
+// re-sign BEFORE loading a full-size image; an expiry we were never told about
+// falls back to URL_ASSUMED_LIFE_MS.
+function expired(frame: Frame | undefined): boolean {
+  if (!frame?.expires_at) return false
+  const ms = Date.parse(frame.expires_at)
+  return Number.isFinite(ms) && ms <= Date.now()
+}
+
+function ScreenCard({ device }: { device: Device }) {
+  const deviceId = device.device_id
+  const revoked = device.enrollment_state === 'revoked'
+  const running = device.online && !!device.current_run_id
+
+  const [frames, setFrames] = useState<Frame[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // When the last batch of URLs was signed, for the pre-load freshness check.
+  const [fetchedAt, setFetchedAt] = useState(0)
+  // A URL that failed to load and failed AGAIN after being re-signed. That is not
+  // an expiry, so it is shown rather than retried.
+  const [broken, setBroken] = useState(false)
+  const [snap, setSnap] = useState<Snap>({ state: 'idle' })
+  // The lightbox is keyed by frame id, never by index: a poll landing while it is
+  // open prepends newer frames and would shift every index under it, showing the
+  // operator a different screenshot than the one they clicked.
+  const [openId, setOpenId] = useState<string | null>(null)
+
+  // Which URLs have already been re-signed once. Without this, an object that is
+  // genuinely gone (rather than merely expired) puts the pane in a fetch loop.
+  const resignedRef = useRef<Set<string>>(new Set())
+  // The frame the polls compare against, read from a ref so the interval and the
+  // snapshot wait don't have to be rebuilt every time the list changes.
+  const latestIdRef = useRef<string | null>(null)
+  // Set on unmount so an in-flight snapshot wait stops touching state after the
+  // operator has selected another machine.
+  const goneRef = useRef(false)
+  useEffect(
+    () => () => {
+      goneRef.current = true
+    },
+    [],
+  )
+
+  const loadStrip = useCallback(async (): Promise<void> => {
+    try {
+      const resp = await fetch(
+        `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${STRIP_LIMIT}`,
+        { headers: authHeaders() },
+      )
+      // 404 is "this machine has never uploaded a frame" — an older worker build,
+      // or one that has never run — not a failure. It gets the empty state, which
+      // says so, rather than an error card.
+      if (resp.status === 404) {
+        setFrames([])
+        setError(null)
+        setFetchedAt(Date.now())
+        return
+      }
+      if (!resp.ok) {
+        setError(`Could not load frames (${resp.status})`)
+        return
+      }
+      const data = await resp.json()
+      const rows: unknown[] = Array.isArray(data) ? data : (data.screenshots ?? data.frames ?? [])
+      const next = rows.map(normalizeFrame).filter((frame): frame is Frame => frame !== null)
+      setFrames(next)
+      setError(null)
+      setBroken(false)
+      setFetchedAt(Date.now())
+      // Fresh signatures: whatever failed before is worth one more attempt.
+      resignedRef.current = new Set()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error')
+    }
+  }, [deviceId])
+
+  // The cheap "is there anything newer?" probe. The frame it returns is
+  // deliberately DISCARDED and the list re-fetched instead: the big frame and the
+  // strip must agree with each other, and one list call re-signs every URL on
+  // screen at once rather than leaving the strip holding older signatures.
+  const probeLatestId = useCallback(async (): Promise<string | null> => {
+    const resp = await fetch(
+      `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots/latest`,
+      { headers: authHeaders() },
+    )
+    // 404 means nothing has been uploaded yet, which the strip already says.
+    if (!resp.ok) return null
+    return normalizeFrame(await resp.json())?.id ?? null
+  }, [deviceId])
+
+  useEffect(() => {
+    loadStrip()
+  }, [loadStrip])
+
+  useEffect(() => {
+    latestIdRef.current = frames?.[0]?.id ?? null
+  }, [frames])
+
+  // Only a machine that is mid-run is polled. An idle worker's screen does not
+  // change on its own — nothing is driving it — so a timer against one would
+  // re-sign URLs forever to re-show the same JPEG, and an offline machine cannot
+  // answer at all. Take snapshot is how you look at an idle machine.
+  useEffect(() => {
+    if (!running) return
+    const timer = setInterval(async () => {
+      try {
+        const latestId = await probeLatestId()
+        if (latestId && latestId !== latestIdRef.current) await loadStrip()
+      } catch {
+        // A missed poll is corrected by the next one; a run in flight is not
+        // worth an error card over one dropped request.
+      }
+    }, SCREEN_POLL_MS)
+    return () => clearInterval(timer)
+  }, [running, probeLatestId, loadStrip])
+
+  const takeSnapshot = useCallback(async () => {
+    const baseline = latestIdRef.current
+    setSnap({ state: 'pending' })
+    try {
+      const resp = await fetch(`${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/snapshot`, {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      if (!resp.ok) {
+        setSnap({ state: 'error', message: `The request was refused (${resp.status}).` })
+        return
+      }
+    } catch (err) {
+      setSnap({ state: 'error', message: err instanceof Error ? err.message : 'Network error' })
+      return
+    }
+
+    // The POST only means QUEUED. Everything after it is the machine's to do, so
+    // the wait is bounded and its end is a STATEMENT — it did not answer — rather
+    // than a spinner that outlives the operator's patience.
+    const deadline = Date.now() + SNAPSHOT_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      await sleep(SNAPSHOT_POLL_MS)
+      if (goneRef.current) return
+      try {
+        const latestId = await probeLatestId()
+        if (latestId && latestId !== baseline) {
+          await loadStrip()
+          setSnap({ state: 'idle' })
+          return
+        }
+      } catch {
+        // Keep waiting: the deadline is the only thing that ends this loop.
+      }
+    }
+    if (!goneRef.current) setSnap({ state: 'timeout' })
+  }, [deviceId, probeLatestId, loadStrip])
+
+  // An image that fails to load is, nearly always, a signature that expired while
+  // this pane sat open. Ask the backend once per URL — a second failure is
+  // something else (the object is gone) and re-fetching would loop.
+  const reportBadUrl = useCallback(
+    (url: string) => {
+      if (resignedRef.current.has(url)) {
+        setBroken(true)
+        return
+      }
+      resignedRef.current.add(url)
+      loadStrip()
+    },
+    [loadStrip],
+  )
+
+  const shots = frames ?? []
+  const latest = shots[0]
+  const openIndex = openId ? shots.findIndex((f) => f.id === openId) : -1
+
+  // The open frame rolled off the end of the list while the lightbox was open.
+  // Close rather than silently jump to a neighbour.
+  useEffect(() => {
+    if (openId && openIndex < 0) setOpenId(null)
+  }, [openId, openIndex])
+
+  const openShot = useCallback(
+    async (id: string) => {
+      setOpenId(id)
+      // The thumbnail on screen keeps rendering from the copy the browser decoded
+      // when the strip loaded, so a dead URL stays invisible until the enlarged
+      // view fetches it again and opens onto nothing. Re-sign first whenever
+      // these URLs are old enough to be a risk.
+      const frame = shots.find((f) => f.id === id)
+      if (expired(frame) || Date.now() - fetchedAt > URL_ASSUMED_LIFE_MS) await loadStrip()
+    },
+    [shots, fetchedAt, loadStrip],
+  )
+
+  // A snapshot is a request made OF a machine, so it is only offered to one that
+  // could conceivably answer. A powered-off or locked-out machine would take the
+  // click, queue a command nobody will read, and leave the operator watching a
+  // 45-second timer for an answer that was never possible.
+  const blocked = revoked
+    ? 'Access revoked — this machine cannot be asked for anything until it is re-enrolled.'
+    : !device.online
+      ? 'Offline — this machine is not checked in, so there is nothing to ask. The last frame it uploaded is below.'
+      : null
+
+  return (
+    <Card
+      title={<SectionTitle>Screen</SectionTitle>}
+      actions={
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={takeSnapshot}
+          disabled={!!blocked || snap.state === 'pending'}
+          title={blocked ?? 'Ask this machine for a fresh frame'}
+        >
+          {snap.state === 'pending' ? 'Asking…' : '⧉ Take snapshot'}
+        </Button>
+      }
+    >
+      {blocked && (
+        <div
+          style={{
+            marginBottom: 'var(--sp-3)',
+            fontSize: 'var(--fs-md)',
+            color: 'var(--sb-text-muted)',
+          }}
+        >
+          {blocked}
+        </div>
+      )}
+
+      {snap.state === 'pending' && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-2)',
+            marginBottom: 'var(--sp-3)',
+            fontSize: 'var(--fs-md)',
+            color: 'var(--sb-text-muted)',
+          }}
+        >
+          <Spinner size={14} /> Asked {displayName(device)} for a frame. It has to wake, capture and
+          upload, so this takes a few seconds.
+        </div>
+      )}
+
+      {snap.state === 'timeout' && (
+        <div
+          style={{
+            marginBottom: 'var(--sp-3)',
+            fontSize: 'var(--fs-md)',
+            lineHeight: 1.5,
+            color: 'var(--sb-text)',
+          }}
+        >
+          No answer from {displayName(device)} in {Math.round(SNAPSHOT_TIMEOUT_MS / 1000)}s — it may
+          be asleep, busy, or no longer listening. The request is still queued, so a frame will
+          appear here if it ever lands.
+        </div>
+      )}
+
+      {snap.state === 'error' && (
+        <div className="error-message" style={{ marginBottom: 'var(--sp-3)' }}>
+          {snap.message}
+        </div>
+      )}
+
+      {frames === null && !error && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 'var(--sp-3)',
+            padding: 'var(--sp-5)',
+            color: 'var(--sb-text-muted)',
+          }}
+        >
+          <Spinner /> Loading frames…
+        </div>
+      )}
+
+      {error && frames === null && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
+          <span className="error-message">{error}</span>
+          <Button size="sm" variant="ghost" onClick={loadStrip}>
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {frames !== null && shots.length === 0 && (
+        <EmptyState
+          icon="🖥"
+          title="This machine has never sent a frame"
+          hint={
+            device.online
+              ? 'Workers upload a screenshot each turn, so frames appear here once it runs something. A machine on an older build never uploads any — Take snapshot is the quickest way to tell which of the two this is.'
+              : 'Workers upload a screenshot each turn. This one has either never run, or is on a build from before frames were uploaded.'
+          }
+        />
+      )}
+
+      {latest && (
+        <>
+          {/* The point of the feature: the frame at a size you can read, not a
+              thumbnail. Same well and gold-bordered treatment as the live panel's
+              latest screenshot (AgentRunPanel), so the two read as one thing seen
+              from two places. */}
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'center',
+              background: 'var(--sb-surface-2)',
+              border: '1px solid var(--sb-border)',
+              borderRadius: 'var(--r-md)',
+              padding: 'var(--sp-3)',
+            }}
+          >
+            {broken ? (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 'var(--sp-3)',
+                  padding: 'var(--sp-5)',
+                  fontSize: 'var(--fs-md)',
+                  color: 'var(--sb-text-muted)',
+                }}
+              >
+                This frame would not load, even after asking for a fresh link.
+                <Button size="sm" variant="ghost" onClick={loadStrip}>
+                  Reload
+                </Button>
+              </div>
+            ) : (
+              <img
+                src={latest.url}
+                alt={`screen of ${displayName(device)}`}
+                onClick={() => openShot(latest.id)}
+                onError={() => reportBadUrl(latest.url)}
+                style={{
+                  display: 'block',
+                  width: '100%',
+                  maxWidth: 960,
+                  height: 'auto',
+                  borderRadius: 'var(--r-md)',
+                  border: '1px solid var(--sb-border-gold)',
+                  boxShadow: 'var(--shadow-2)',
+                  cursor: 'zoom-in',
+                }}
+              />
+            )}
+          </div>
+
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--sp-2)',
+              marginTop: 'var(--sp-2)',
+              fontSize: 'var(--fs-sm)',
+              color: 'var(--sb-text-muted)',
+            }}
+          >
+            <span style={{ fontFamily: 'var(--font-mono)' }}>{clockTime(latest.captured_at)}</span>
+            <span>· {relativeTime(latest.captured_at)}</span>
+            {/* Say which of the two this panel is doing, so a frame that stops
+                changing reads as a stuck machine rather than a stopped pane. */}
+            <span style={{ marginLeft: 'auto' }}>
+              {running
+                ? `following the run · refreshes every ${Math.round(SCREEN_POLL_MS / 1000)}s`
+                : 'not refreshing — this machine is idle'}
+            </span>
+          </div>
+
+          <Filmstrip shots={shots} onOpen={openShot} onBadUrl={reportBadUrl} />
+        </>
+      )}
+
+      {openIndex >= 0 && (
+        <FrameLightbox
+          shots={shots}
+          index={openIndex}
+          onClose={() => setOpenId(null)}
+          onNavigate={(next) => setOpenId(shots[next].id)}
+          onBadUrl={reportBadUrl}
+        />
+      )}
+    </Card>
+  )
+}
+
+// The growing timeline. Its whole job is to make a REPEAT visible — the same
+// window, the same button, four frames running — so order and time are the two
+// things it may not leave ambiguous: newest is pinned left and labelled, and
+// every frame carries its wall-clock time rather than only "2m ago".
+function Filmstrip({
+  shots,
+  onOpen,
+  onBadUrl,
+}: {
+  shots: Frame[]
+  onOpen: (id: string) => void
+  onBadUrl: (url: string) => void
+}) {
+  // One frame IS the panel above it; a strip of one would only repeat it.
+  if (shots.length < 2) return null
+  return (
+    <div style={{ marginTop: 'var(--sp-4)' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 'var(--sp-2)',
+          marginBottom: 'var(--sp-2)',
+        }}
+      >
+        <SectionTitle>Recent frames</SectionTitle>
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+          newest first · last {shots.length}
+        </span>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          gap: 'var(--sp-3)',
+          overflowX: 'auto',
+          paddingBottom: 'var(--sp-2)',
+        }}
+      >
+        {shots.map((frame, i) => (
+          <button
+            key={frame.id}
+            onClick={() => onOpen(frame.id)}
+            title={`Open the frame from ${clockTime(frame.captured_at)}`}
+            style={{
+              flexShrink: 0,
+              width: THUMB_W,
+              padding: 0,
+              textAlign: 'left',
+              background: 'transparent',
+              border: 'none',
+              cursor: 'zoom-in',
+              font: 'inherit',
+              color: 'var(--sb-text-muted)',
+            }}
+          >
+            <img
+              src={frame.url}
+              alt={`frame from ${clockTime(frame.captured_at)}`}
+              // Full-size bytes with no thumbnail endpoint to lean on, so lazy
+              // loading is what actually keeps a strip of ~1024px JPEGs off the
+              // wire until the operator scrolls to them.
+              loading="lazy"
+              decoding="async"
+              onError={() => onBadUrl(frame.url)}
+              style={{
+                display: 'block',
+                width: '100%',
+                height: 'auto',
+                borderRadius: 'var(--r-sm)',
+                // The newest frame is the one the big panel is showing; the gold
+                // edge is what ties the two together.
+                border: `1px solid ${i === 0 ? 'var(--sb-border-gold)' : 'var(--sb-border)'}`,
+                background: 'var(--sb-surface-2)',
+              }}
+            />
+            <div
+              style={{
+                marginTop: 4,
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--fs-xs)',
+                color: i === 0 ? 'var(--sb-text)' : 'var(--sb-text-muted)',
+              }}
+            >
+              {clockTime(frame.captured_at)}
+            </div>
+            <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
+              {i === 0 ? 'latest' : relativeTime(frame.captured_at)}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Full-screen view of one frame, with the same keyboard handling and chrome as
+// the run replay's lightbox (RunDetail). Kept separate rather than shared because
+// that one is typed on RunEvent and resolves LOCAL paths through the Tauri asset
+// protocol; these are presigned remote URLs, and the thing that matters here — a
+// URL can die between the thumbnail and this view — does not exist over there.
+function FrameLightbox({
+  shots,
+  index,
+  onClose,
+  onNavigate,
+  onBadUrl,
+}: {
+  shots: Frame[]
+  index: number
+  onClose: () => void
+  onNavigate: (index: number) => void
+  onBadUrl: (url: string) => void
+}) {
+  const count = shots.length
+  const go = useCallback(
+    (delta: number) => onNavigate((index + delta + count) % count),
+    [index, count, onNavigate],
+  )
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+      else if (e.key === 'ArrowRight') go(1)
+      else if (e.key === 'ArrowLeft') go(-1)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose, go])
+
+  const frame = shots[index]
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 1000,
+        background: 'rgba(0, 0, 0, 0.86)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 'var(--sp-6)',
+      }}
+    >
+      <Button
+        variant="secondary"
+        size="sm"
+        onClick={(e) => {
+          e.stopPropagation()
+          onClose()
+        }}
+        style={{ position: 'absolute', top: 'var(--sp-4)', right: 'var(--sp-4)' }}
+      >
+        ✕ Close
+      </Button>
+
+      <img
+        src={frame.url}
+        alt={`frame from ${clockTime(frame.captured_at)}`}
+        onClick={(e) => e.stopPropagation()}
+        // A presigned URL can die between the strip loading and this opening. The
+        // re-sign happens in the parent; closing is what keeps the operator from
+        // staring at a black rectangle waiting for it.
+        onError={() => {
+          onBadUrl(frame.url)
+          onClose()
+        }}
+        style={{
+          maxWidth: '90vw',
+          maxHeight: '86vh',
+          objectFit: 'contain',
+          borderRadius: 'var(--r-md)',
+          border: '1px solid var(--sb-border-gold)',
+          boxShadow: 'var(--shadow-2)',
+        }}
+      />
+
+      {/* The caption is the whole reason to enlarge a frame out of a loop: the
+          images look identical, and the time is what tells them apart. */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 'var(--sp-4)',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--sp-3)',
+          fontSize: 'var(--fs-sm)',
+          fontFamily: 'var(--font-mono)',
+          color: 'var(--sb-text-muted)',
+        }}
+      >
+        {count > 1 && (
+          // The list runs newest-first, so "older" is the NEXT index and "newer"
+          // the previous one. The arrows point the way the strip reads, not the
+          // way the array is indexed.
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              go(1)
+            }}
+            aria-label="Older frame"
+            style={lightboxNavStyle}
+          >
+            ‹
+          </button>
+        )}
+        <span>
+          {clockTime(frame.captured_at)} · {index + 1} of {count} · newest is 1
+        </span>
+        {count > 1 && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              go(-1)
+            }}
+            aria-label="Newer frame"
+            style={lightboxNavStyle}
+          >
+            ›
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const lightboxNavStyle: React.CSSProperties = {
+  width: 32,
+  height: 32,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  fontSize: 18,
+  color: 'var(--sb-text)',
+  background: 'var(--sb-surface-2)',
+  border: '1px solid var(--sb-border)',
+  borderRadius: 'var(--r-pill)',
+  cursor: 'pointer',
+}
+
+// ───────────────────────────────────────────────────────── remote desktop
 
 // REMOTE DESKTOP — where the machine's RustDesk id is kept, so it is at hand
 // when a run goes wrong and someone has to take the screen back.

@@ -1309,7 +1309,7 @@ fn set_rolling_cache(messages: &mut Vec<Value>) {
 /// overrides it with the stored device token on an enrolled worker. Call sites
 /// stay ignorant of which — there is one credential, chosen once, and adding a
 /// second answer here is how the two classes would start to blur.
-fn with_bearer(
+pub(crate) fn with_bearer(
     app: &AppHandle,
     req: reqwest::RequestBuilder,
     auth: &str,
@@ -1397,8 +1397,12 @@ async fn runs_event(
 
 /// Save a screenshot to LOCAL disk under the app data dir and return its
 /// absolute path on success (for the follow-up screenshot event), or `None`
-/// (logged) on any failure. Screenshots are the most sensitive data, so they
-/// NEVER leave the user's Mac — there is no server upload here.
+/// (logged) on any failure.
+///
+/// This is the OFFLINE record and the only copy guaranteed to exist: the same
+/// frame is also mirrored to object storage (`screenshots::enqueue_run_shot`),
+/// but that is best-effort and droppable, so the disk write stays unconditional
+/// and stays first.
 ///
 /// Path scheme: `<app_data_dir>/runs/<run_id>/<shot_seq>.jpg`. The base64 jpeg
 /// is decoded to raw bytes before writing. This is synchronous (no `.await`);
@@ -2010,10 +2014,26 @@ async fn run_agent(
                 )
                 .await;
                 for shot in shots {
-                    // Save the jpeg to LOCAL disk (never uploaded) and record the
-                    // absolute file path in the screenshot event so the UI can load
-                    // it back off the user's Mac.
+                    // Save the jpeg to LOCAL disk and record the absolute file
+                    // path in the screenshot event so the UI can load it back
+                    // off this machine.
                     let fseq = bump(&mut shot_seq);
+                    // ...and mirror the SAME bytes off-machine so the admin
+                    // console can watch this run without a remote desktop. This
+                    // is `shot` — the image block the model was actually sent,
+                    // already downscaled to the vision budget — not a fresh
+                    // capture, so the console shows the evidence rather than a
+                    // re-enactment, at a fraction of the bytes.
+                    //
+                    // Fire-and-forget by construction: `enqueue_run_shot` spawns
+                    // and returns, so the turn never waits on storage, and it
+                    // drops the frame outright when its in-flight ceiling is
+                    // reached rather than growing a backlog behind the loop.
+                    // Not gated on the local write: the two destinations fail
+                    // independently.
+                    crate::screenshots::enqueue_run_shot(
+                        &app, &client, &base, &auth, rid, fseq, shot,
+                    );
                     if let Some(local_path) =
                         runs_save_screenshot_local(&app, rid, fseq, shot)
                     {
