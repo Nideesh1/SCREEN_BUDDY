@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Navigate, useNavigate, useParams } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime } from '../lib'
 import { formatTokens } from './History'
 import { Markdown, asText, summaryText } from './RunDetail'
+import { DeviceDot, deviceLabel, deviceLine, useDevice, type DeviceHead } from './DeviceRuns'
 import { ActionChip, Button, Card, Chip, EmptyState, SectionTitle, Spinner, StatChip, StatusPill } from '../ui'
 
 // FleetRun — one REMOTE worker's run, read entirely from the backend.
@@ -42,6 +43,11 @@ interface RunEventRow {
 // shows a subset and does not duplicate its telemetry card.
 interface RunRecord {
   run_id: string
+  /** The machine that executed it, when one did. Null/absent on a run started
+   *  locally — there is no device row behind those at all. Older backends do not
+   *  send the field, which is why "does this run belong here?" only ever asks
+   *  the question when a value is present. */
+  device_id?: string | null
   task?: string
   model?: string
   status?: string
@@ -139,7 +145,10 @@ function normalizeEvent(raw: unknown): RunEventRow | null {
     artifact_object: pick('artifact_object'),
     artifact_kind: pick('artifact_kind'),
     created_at: pick('created_at'),
-    url: pick('url'),
+    // `artifact_url` is what the events route returns; `url` is only the shape
+    // the device screenshot routes use. Reading the wrong one left every frame
+    // in the timeline without an image while the event around it rendered fine.
+    url: pick('artifact_url') ?? pick('url'),
     expires_at: pick('expires_at'),
   }
 }
@@ -178,14 +187,19 @@ function compareEvents(a: RunEventRow, b: RunEventRow): number {
 
 function FleetRun() {
   const navigate = useNavigate()
-  const { runId = '' } = useParams<{ runId: string }>()
+  // `deviceId` is absent only on the legacy /fleet/runs/:runId link when the run
+  // turned out to belong to no machine — see FleetRunRedirect.
+  const { runId = '', deviceId } = useParams<{ runId: string; deviceId?: string }>()
+  const device = useDevice(deviceId)
 
-  // Back to the fleet, not to the operator's own history: every way into this
-  // view is a machine.
+  // Back to the machine's runs, which is the page this one is nested under —
+  // never history.back(). A run is linkable and bookmarkable, so the operator
+  // who arrived from a pasted URL has nothing behind them, and the URL is the
+  // only thing that knows where up is.
   const onBack = useCallback(() => {
-    if (window.history.length > 1) navigate(-1)
+    if (deviceId) navigate(`/devices/${encodeURIComponent(deviceId)}/runs`)
     else navigate('/admin')
-  }, [navigate])
+  }, [navigate, deviceId])
 
   const [run, setRun] = useState<RunRecord | null>(null)
   const [events, setEvents] = useState<RunEventRow[]>([])
@@ -228,9 +242,14 @@ function FleetRun() {
   const pullEvents = useCallback(async (): Promise<void> => {
     if (wholeHistoryRef.current) return
     for (let page = 0; page < MAX_PAGES_PER_TICK; page++) {
+      // No cursor yet is an ABSENT since_seq, not a negative one. The backend
+      // validates since_seq >= 0, so sending the -1 sentinel made the very
+      // first request of every run a 422 — the timeline never loaded once, and
+      // an empty timeline reads as "this run recorded nothing" rather than as a
+      // failed request.
+      const cursor = sinceRef.current >= 0 ? `since_seq=${sinceRef.current}&` : ''
       const resp = await fetch(
-        `${CU_BACKEND}/runs/${encodeURIComponent(runId)}/events` +
-          `?since_seq=${sinceRef.current}&limit=${EVENT_PAGE}`,
+        `${CU_BACKEND}/runs/${encodeURIComponent(runId)}/events?${cursor}limit=${EVENT_PAGE}`,
         { headers: authHeaders() },
       )
       if (resp.status === 404) {
@@ -381,9 +400,59 @@ function FleetRun() {
     [signedAt, resign],
   )
 
+  // Whose run this actually is, versus whose page it was opened under. The two
+  // disagree in two real cases: a run started locally has no device at all
+  // (`device_id` null — nothing in the fleet executed it), and a hand-edited or
+  // stale link can put a real run under the wrong machine. Neither is rendered
+  // silently: the run is still readable — refusing to show a run someone asked
+  // for by id helps nobody — but the page says out loud that this machine is not
+  // where it happened, and offers the machine where it did.
+  //
+  // Only asked when the backend actually sent a device_id: a build that omits
+  // the field must not make every run look misfiled.
+  const foreign = deviceId != null && run != null && run.device_id !== undefined &&
+    run.device_id !== deviceId
+
   return (
     <div style={{ padding: 'var(--sp-5)', maxWidth: 'var(--page-max-wide)', margin: '0 auto' }}>
-      <Header run={run} runId={runId} onBack={onBack} />
+      <Header
+        run={run}
+        runId={runId}
+        onBack={onBack}
+        backLabel={device ? `← ${deviceLabel(device)}` : deviceId ? '← Runs' : '← Devices'}
+        subtitle={!foreign && device ? { device } : null}
+      />
+
+      {foreign && (
+        <div
+          className="error-message"
+          style={{
+            marginBottom: 'var(--sp-4)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-3)',
+          }}
+        >
+          <span style={{ flex: 1, minWidth: 0 }}>
+            {run?.device_id
+              ? 'This run did not happen on the machine whose page you opened it from — it belongs to another machine in the fleet.'
+              : 'This run was started locally, not by a fleet machine, so it belongs to no machine on this page.'}
+          </span>
+          {run?.device_id && (
+            <Button
+              size="sm"
+              onClick={() =>
+                navigate(
+                  `/devices/${encodeURIComponent(run.device_id as string)}/runs/${encodeURIComponent(runId)}`,
+                )
+              }
+              style={{ flexShrink: 0 }}
+            >
+              Open on its machine →
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* A failed run's reason goes above everything, in the error style, before
           any card the eye has to scan past. The whole point of opening a failed
@@ -443,10 +512,21 @@ function Header({
   run,
   runId,
   onBack,
+  backLabel,
+  subtitle,
 }: {
   run: RunRecord | null
   runId: string
   onBack: () => void
+  /** Names the destination rather than the gesture: back from a run goes to one
+   *  named machine's runs, and saying which one is the difference between a
+   *  navigation and a guess. */
+  backLabel: string
+  /** The machine this run ran on, when the page is sure of it. Null while the
+   *  device is still loading, when it cannot be read, and — deliberately —
+   *  whenever the run does not belong to it, since the banner below is then
+   *  saying the opposite of what this line would. */
+  subtitle: { device: DeviceHead } | null
 }) {
   return (
     <div
@@ -457,8 +537,14 @@ function Header({
         marginBottom: 'var(--sp-5)',
       }}
     >
-      <Button variant="ghost" size="sm" onClick={onBack} style={{ flexShrink: 0 }}>
-        ← Back
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onBack}
+        title="Back to this machine's runs"
+        style={{ flexShrink: 0, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis' }}
+      >
+        {backLabel}
       </Button>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div
@@ -474,6 +560,27 @@ function Header({
         >
           {run?.task || '(untitled task)'}
         </div>
+        {/* Whose run this is, said before the id: a run opened from a link is
+            otherwise a task with no machine attached to it. */}
+        {subtitle && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--sp-2)',
+              fontSize: 'var(--fs-sm)',
+              color: 'var(--sb-text-muted)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <DeviceDot device={subtitle.device} />
+            <span>
+              {deviceLabel(subtitle.device)} · {deviceLine(subtitle.device)}
+            </span>
+          </div>
+        )}
         <div
           style={{
             fontSize: 'var(--fs-xs)',
@@ -878,6 +985,75 @@ function Marker({
       {icon && <span aria-hidden>{icon}</span>}
       <span>{text}</span>
     </div>
+  )
+}
+
+// ───────────────────────────────────────────────────────── legacy link
+
+// #/fleet/runs/<runId> — where this view used to live, before a run was nested
+// under the machine that ran it. Kept because the URL is out there: it was what
+// the Devices pane linked to for the whole life of that pane, and anything
+// bookmarked or pasted from it must not land on the fleet home with no
+// explanation.
+//
+// The old URL names a run and no machine, so the machine is looked up: the run
+// record carries `device_id`, and that is the missing half of the new address.
+// A run with no device (started locally) has no nested address to send it to, so
+// it is simply rendered here, unattached — the alternative is bouncing a valid
+// link somewhere it did not ask for.
+export function FleetRunRedirect() {
+  const { runId = '' } = useParams<{ runId: string }>()
+  const [deviceId, setDeviceId] = useState<string | null | undefined>(undefined)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const resp = await fetch(`${CU_BACKEND}/runs/${encodeURIComponent(runId)}`, {
+          headers: authHeaders(),
+        })
+        if (!resp.ok) {
+          // Unreadable run: fall through to FleetRun, whose error card says so
+          // properly. Redirecting to a machine we could not name would be worse.
+          if (!cancelled) setDeviceId(null)
+          return
+        }
+        const body = await resp.json()
+        const record = (body.run ?? body) as RunRecord
+        if (!cancelled) setDeviceId(record.device_id ?? null)
+      } catch {
+        if (!cancelled) setDeviceId(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [runId])
+
+  if (deviceId === undefined) {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--sp-3)',
+          padding: 'var(--sp-5)',
+          color: 'var(--sb-text-muted)',
+        }}
+      >
+        <Spinner /> Loading run…
+      </div>
+    )
+  }
+
+  if (deviceId === null) return <FleetRun />
+
+  // `replace` so Back skips the resolver rather than bouncing through it again.
+  return (
+    <Navigate
+      to={`/devices/${encodeURIComponent(deviceId)}/runs/${encodeURIComponent(runId)}`}
+      replace
+    />
   )
 }
 

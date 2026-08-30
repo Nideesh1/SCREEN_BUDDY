@@ -11,7 +11,8 @@ import Dashboard from './views/Dashboard'
 import NewRun from './views/NewRun'
 import History from './views/History'
 import RunDetail from './views/RunDetail'
-import FleetRun from './views/FleetRun'
+import FleetRun, { FleetRunRedirect } from './views/FleetRun'
+import DeviceRuns from './views/DeviceRuns'
 import PinnedLibrary from './views/PinnedLibrary'
 import Artifacts from './views/Artifacts'
 import Credentials from './views/Credentials'
@@ -231,11 +232,22 @@ function ModedShell({
             <Route path="runs" element={<NewRun />} />
             {/* Drilldown: live or replay, decided inside RunDetail. */}
             <Route path="runs/:runId" element={<RunDetail />} />
-            {/* A FLEET run: one remote worker's run, read entirely over HTTP.
-                Separate from runs/:runId because that view embeds the local
-                agent:// stream and resolves screenshots off this machine's
-                disk, neither of which exists for a run executed elsewhere. */}
-            <Route path="fleet/runs/:runId" element={<FleetRun />} />
+            {/* One machine's runs, and one of its runs — both real pages under
+                the machine they belong to, not cards inside the Devices pane.
+                The nesting is what lets each of them say whose work it is
+                showing and where "back" goes when it is opened cold from a
+                bookmark, which history.back() cannot.
+
+                A FLEET run is read entirely over HTTP, and is separate from
+                runs/:runId because that view embeds the local agent:// stream
+                and resolves screenshots off this machine's disk, neither of
+                which exists for a run executed elsewhere. */}
+            <Route path="devices/:deviceId/runs" element={<DeviceRuns />} />
+            <Route path="devices/:deviceId/runs/:runId" element={<FleetRun />} />
+            {/* Where the fleet run view used to live. Resolves the run's machine
+                and forwards to the nested address, so links minted before the
+                move keep landing on the run. */}
+            <Route path="fleet/runs/:runId" element={<FleetRunRedirect />} />
             {/* Scheduled (future) runs + drilldown. */}
             <Route path="scheduled" element={<Scheduled />} />
             <Route path="scheduled/:id" element={<ScheduleDetail />} />

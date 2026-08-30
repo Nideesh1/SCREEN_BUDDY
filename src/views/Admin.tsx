@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
-import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
+import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
+// The runs list lives on its own page now; the pane borrows its row and its
+// reader so a run reads the same in the preview as it does in the full list.
+import { RunRow, useDeviceRuns } from './DeviceRuns'
 
 // One machine in the fleet, field-for-field the backend contract for
 // GET /devices. Everything except name / rustdesk_id / notes is REPORTED by the
@@ -69,10 +72,6 @@ type Load =
 // uses to decide `online`, so a machine that drops off is never stale by more
 // than one poll.
 const POLL_MS = 30_000
-
-// How many runs the RUNS card lists. It is a way back into this machine's recent
-// work, not an archive — History is the archive.
-const RUNS_SHOWN = 12
 
 // Devices — the admin shell's fleet supervisor. Two panes with no navigation
 // between them: the list on the left is what someone glances at from across the
@@ -233,7 +232,18 @@ function Devices() {
                 // machine has no local agent:// stream and no screenshots on
                 // this disk, so the local detail view renders it as a live panel
                 // that never streams and a gallery of paths that do not resolve.
-                onOpenRun={(runId) => navigate('/fleet/runs/' + runId)}
+                //
+                // Nested under the machine, not at a flat /fleet/runs/<id>: the
+                // run belongs to a machine, and the URL is what tells the run
+                // view where "back" goes when someone lands on it cold.
+                onOpenRun={(runId) =>
+                  navigate(
+                    `/devices/${encodeURIComponent(selected.device_id)}/runs/${encodeURIComponent(runId)}`,
+                  )
+                }
+                onOpenRuns={() =>
+                  navigate(`/devices/${encodeURIComponent(selected.device_id)}/runs`)
+                }
                 onChanged={() => fetchDevices(true)}
                 onAddMachine={() => setAddingMachine(true)}
               />
@@ -691,12 +701,16 @@ function DeviceDetail({
   device,
   isThisMachine,
   onOpenRun,
+  onOpenRuns,
   onChanged,
   onAddMachine,
 }: {
   device: Device
   isThisMachine: boolean
   onOpenRun: (runId: string) => void
+  /** Leave the pane for this machine's runs page. The pane previews two; the
+   *  page is the whole record. */
+  onOpenRuns: () => void
   onChanged: () => void
   /** Open the mint-a-key modal. Reachable from here as well as the header
    *  because a machine that was just revoked is the single most likely thing to
@@ -869,14 +883,13 @@ function DeviceDetail({
           the right order. */}
       <ScreenCard device={device} />
 
-      {/* Then the work itself. NOW and SCREEN are this second; RUNS is
-          everything this machine has done, the live one included and first, and
-          each row is the way into that run's own narration and frames. Below it
-          the pane stops describing the machine and starts configuring it —
-          access, the way in, and the fields an admin types — which is the order
-          someone reads in only after the answer above was not the one they
+      {/* Then the work itself. NOW and SCREEN are this second; RUNS is the last
+          thing this machine did, and the door to everything it has ever done.
+          Below it the pane stops describing the machine and starts configuring
+          it — access, the way in, and the fields an admin types — which is the
+          order someone reads in only after the answer above was not the one they
           wanted. */}
-      <RunsCard device={device} onOpenRun={onOpenRun} />
+      <RunsCard device={device} onOpenRun={onOpenRun} onOpenRuns={onOpenRuns} />
 
       <AccessCard
         device={device}
@@ -1145,105 +1158,42 @@ function NowCard({
 
 // ───────────────────────────────────────────────────────── runs
 
-// One row of GET /runs/by-device/{device_id} — the backend's _run_summary, which
-// is a run WITHOUT its result (a whole trajectory, wanted on exactly one run at
-// a time). Not History's RunSummary: this route also carries the lifecycle
-// timestamps, and those are what a duration is made of.
-interface DeviceRun {
-  run_id: string
-  task?: string
-  model?: string
-  status?: string
-  num_steps?: number
-  created_at?: string
-  started_at?: string | null
-  completed_at?: string | null
-}
+// How many runs the pane previews. The full list is a page of its own now
+// (#/devices/<id>/runs); what earns space HERE is recency, not the archive.
+// This pane is read top-down as one machine's present state, and "the last thing
+// it did" is part of that state — an idle machine that finished a minute ago and
+// one that has been sitting there since Tuesday look identical otherwise. Two
+// rows say that. Twelve pushed everything below them — access, remote desktop,
+// the fields an admin types — out of reach behind a list.
+const RUNS_PREVIEW = 2
 
-// How long a run took, or has been going. Worth showing next to the step count
-// because the two disagree in the cases worth noticing: a machine stuck
-// re-clicking the same button burns minutes without adding steps, and a run that
-// died on its first turn never adds any.
-function runDuration(run: DeviceRun): string | null {
-  const start = Date.parse(String(run.started_at ?? run.created_at ?? ''))
-  if (!Number.isFinite(start)) return null
-  const end = run.completed_at ? Date.parse(run.completed_at) : Date.now()
-  if (!Number.isFinite(end) || end < start) return null
-  const secs = Math.round((end - start) / 1000)
-  if (secs < 60) return `${secs}s`
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return `${mins}m`
-  return `${Math.floor(mins / 60)}h ${mins % 60}m`
-}
-
-// RUNS — everything this machine has done, the one in flight first.
+// RUNS — the machine's two most recent, and the way to the rest.
 //
-// The run is the unit. A device is a machine; a run is a thing that happened on
-// it, and a run's frames belong to that run's own timeline (FleetRun), in order,
-// rather than to a flat strip on this pane where nothing said which run had
-// produced them.
-//
-// This list used to be reconstructed from the device's FRAMES, joining their
-// run_ids against GET /runs, because no route answered "this machine's runs".
-// One does now, and the difference is not cosmetic: the join could not show a
-// run that uploaded no frame — a run that died before its first turn, which is
-// exactly the run an operator comes here looking for.
+// The header button is there whether or not any row is: on a machine with no
+// runs it is the only thing that says where they would appear, and on a busy one
+// it is the way out of a preview that is deliberately too short.
 function RunsCard({
   device,
   onOpenRun,
+  onOpenRuns,
 }: {
   device: Device
   onOpenRun: (runId: string) => void
+  onOpenRuns: () => void
 }) {
-  const deviceId = device.device_id
-  const currentRunId = device.current_run_id
-  const [runs, setRuns] = useState<DeviceRun[] | null>(null)
-
-  // The device record and the run record can disagree for a moment either side
-  // of a transition, so a row counts as live if EITHER says so.
-  const isLive = useCallback(
-    (run: DeviceRun): boolean =>
-      run.run_id === currentRunId || (run.status || '').toLowerCase() === 'running',
-    [currentRunId],
-  )
-
-  // Re-read when the machine's current run changes, and never on a timer of its
-  // own: a run starting or finishing is the only thing that alters this list,
-  // and the fleet poll above already delivers that change.
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      try {
-        const resp = await fetch(
-          `${CU_BACKEND}/runs/by-device/${encodeURIComponent(deviceId)}?limit=${RUNS_SHOWN}`,
-          { headers: authHeaders() },
-        )
-        if (!resp.ok) {
-          if (!cancelled) setRuns([])
-          return
-        }
-        const body = await resp.json()
-        if (cancelled) return
-        const rows: DeviceRun[] = Array.isArray(body) ? body : (body.runs ?? [])
-        // Newest-first from the backend, then the live run lifted to the top
-        // whatever its created_at says: it is the only row still changing.
-        setRuns([...rows].sort((a, b) => Number(isLive(b)) - Number(isLive(a))))
-      } catch {
-        // Failing to list runs is worth an empty state, not an error card:
-        // everything above it — the machine, its screen, its current run — is
-        // unaffected and is the reason the operator is on this pane.
-        if (!cancelled) setRuns([])
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [deviceId, isLive])
-
+  const { runs, isLive } = useDeviceRuns(device.device_id, RUNS_PREVIEW, device.current_run_id)
   const listed = runs !== null && runs.length > 0
 
   return (
-    <Card title={<SectionTitle>Runs</SectionTitle>} padded={!listed}>
+    <Card
+      title={<SectionTitle>Runs</SectionTitle>}
+      actions={
+        <Button variant="secondary" size="sm" onClick={onOpenRuns}>
+          All runs →
+        </Button>
+      }
+      padded={!listed}
+    >
       {runs === null && (
         <div
           style={{
@@ -1259,65 +1209,17 @@ function RunsCard({
 
       {runs !== null && runs.length === 0 && (
         <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-          This machine has not run anything yet. Runs appear here newest first, each with its own
-          narration and its own frames.
+          This machine has not run anything yet.
         </span>
       )}
 
       {listed &&
-        runs.map((run, i) => {
-          const live = isLive(run)
-          const duration = runDuration(run)
-          return (
-            <div key={run.run_id}>
-              {i > 0 && <Divider style={{ margin: 0 }} />}
-              <button
-                onClick={() => onOpenRun(run.run_id)}
-                title="Open this run — its narration, its actions and its frames"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 'var(--sp-3)',
-                  width: '100%',
-                  textAlign: 'left',
-                  padding: '10px 16px',
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
-                  color: 'var(--sb-text)',
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
-                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-              >
-                {/* Pulses on `running`, which is the whole of "reads as live". */}
-                <StatusPill status={live ? 'running' : run.status} />
-                <span
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    fontSize: 'var(--fs-md)',
-                  }}
-                >
-                  {run.task || '(untitled task)'}
-                </span>
-                <span
-                  style={{
-                    fontSize: 'var(--fs-sm)',
-                    color: 'var(--sb-text-muted)',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {run.num_steps ?? 0} steps
-                  {duration && (live ? ` · running for ${duration}` : ` · took ${duration}`)} ·{' '}
-                  {relativeTime(run.started_at ?? run.created_at)}
-                </span>
-              </button>
-            </div>
-          )
-        })}
+        runs.map((run, i) => (
+          <div key={run.run_id}>
+            {i > 0 && <Divider style={{ margin: 0 }} />}
+            <RunRow run={run} live={isLive(run)} onOpen={() => onOpenRun(run.run_id)} />
+          </div>
+        ))}
     </Card>
   )
 }
