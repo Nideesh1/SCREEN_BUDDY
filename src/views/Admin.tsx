@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
 import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
-import type { RunSummary } from './History'
 
 // One machine in the fleet, field-for-field the backend contract for
 // GET /devices. Everything except name / rustdesk_id / notes is REPORTED by the
@@ -71,15 +70,9 @@ type Load =
 // than one poll.
 const POLL_MS = 30_000
 
-// How many frame rows the "earlier runs" join scans. Frames come back
-// newest-first and a busy run produces dozens, so this is a window on the recent
-// past rather than the machine's whole life; 200 is the backend's own cap on
-// that list.
-const RUNS_SCAN_LIMIT = 200
-
-// How many past runs that card lists. It is a way back into recent work, not an
-// archive — History is the archive.
-const RUNS_SHOWN = 8
+// How many runs the RUNS card lists. It is a way back into this machine's recent
+// work, not an archive — History is the archive.
+const RUNS_SHOWN = 12
 
 // Devices — the admin shell's fleet supervisor. Two panes with no navigation
 // between them: the list on the left is what someone glances at from across the
@@ -876,8 +869,13 @@ function DeviceDetail({
           the right order. */}
       <ScreenCard device={device} />
 
-      {/* Then the way back. NOW and SCREEN are this second; this is everything
-          before it. */}
+      {/* Then the work itself. NOW and SCREEN are this second; RUNS is
+          everything this machine has done, the live one included and first, and
+          each row is the way into that run's own narration and frames. Below it
+          the pane stops describing the machine and starts configuring it —
+          access, the way in, and the fields an admin types — which is the order
+          someone reads in only after the answer above was not the one they
+          wanted. */}
       <RunsCard device={device} onOpenRun={onOpenRun} />
 
       <AccessCard
@@ -1145,24 +1143,51 @@ function NowCard({
   )
 }
 
-// ───────────────────────────────────────────────────────── earlier runs
+// ───────────────────────────────────────────────────────── runs
 
-// EARLIER RUNS — what this machine has done before now.
+// One row of GET /runs/by-device/{device_id} — the backend's _run_summary, which
+// is a run WITHOUT its result (a whole trajectory, wanted on exactly one run at
+// a time). Not History's RunSummary: this route also carries the lifecycle
+// timestamps, and those are what a duration is made of.
+interface DeviceRun {
+  run_id: string
+  task?: string
+  model?: string
+  status?: string
+  num_steps?: number
+  created_at?: string
+  started_at?: string | null
+  completed_at?: string | null
+}
+
+// How long a run took, or has been going. Worth showing next to the step count
+// because the two disagree in the cases worth noticing: a machine stuck
+// re-clicking the same button burns minutes without adding steps, and a run that
+// died on its first turn never adds any.
+function runDuration(run: DeviceRun): string | null {
+  const start = Date.parse(String(run.started_at ?? run.created_at ?? ''))
+  if (!Number.isFinite(start)) return null
+  const end = run.completed_at ? Date.parse(run.completed_at) : Date.now()
+  if (!Number.isFinite(end) || end < start) return null
+  const secs = Math.round((end - start) / 1000)
+  if (secs < 60) return `${secs}s`
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return `${mins}m`
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`
+}
+
+// RUNS — everything this machine has done, the one in flight first.
 //
-// NOW covers the run in flight and nothing else, so a machine that has been
-// grinding through work all night reads exactly like one that has never executed
-// anything. This is the way back into a finished run's narration.
+// The run is the unit. A device is a machine; a run is a thing that happened on
+// it, and a run's frames belong to that run's own timeline (FleetRun), in order,
+// rather than to a flat strip on this pane where nothing said which run had
+// produced them.
 //
-// There is no GET /devices/{id}/runs: a Run row records the device that claimed
-// it, but nothing serves the reverse lookup. Two routes that DO exist answer it
-// between them — a frame row names its run (ScreenshotOut carries run_id) and
-// GET /runs names every run this operator owns — so the device's frames supply
-// the ids and the runs list supplies their tasks. Both are calls the console
-// already makes elsewhere.
-//
-// The consequence is worth stating rather than hiding: a run that uploaded no
-// frame cannot appear here. That is a run that died before its first turn, and
-// it is found under History instead.
+// This list used to be reconstructed from the device's FRAMES, joining their
+// run_ids against GET /runs, because no route answered "this machine's runs".
+// One does now, and the difference is not cosmetic: the join could not show a
+// run that uploaded no frame — a run that died before its first turn, which is
+// exactly the run an operator comes here looking for.
 function RunsCard({
   device,
   onOpenRun,
@@ -1172,55 +1197,39 @@ function RunsCard({
 }) {
   const deviceId = device.device_id
   const currentRunId = device.current_run_id
-  const [runs, setRuns] = useState<RunSummary[] | null>(null)
+  const [runs, setRuns] = useState<DeviceRun[] | null>(null)
 
-  // Fetched once per selected machine and never polled: a past run does not
-  // change, and the one that does is NOW's, which is excluded below.
+  // The device record and the run record can disagree for a moment either side
+  // of a transition, so a row counts as live if EITHER says so.
+  const isLive = useCallback(
+    (run: DeviceRun): boolean =>
+      run.run_id === currentRunId || (run.status || '').toLowerCase() === 'running',
+    [currentRunId],
+  )
+
+  // Re-read when the machine's current run changes, and never on a timer of its
+  // own: a run starting or finishing is the only thing that alters this list,
+  // and the fleet poll above already delivers that change.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
-        const [shotsResp, runsResp] = await Promise.all([
-          fetch(
-            `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${RUNS_SCAN_LIMIT}`,
-            { headers: authHeaders() },
-          ),
-          fetch(`${CU_BACKEND}/runs`, { headers: authHeaders() }),
-        ])
-        if (!shotsResp.ok || !runsResp.ok) {
+        const resp = await fetch(
+          `${CU_BACKEND}/runs/by-device/${encodeURIComponent(deviceId)}?limit=${RUNS_SHOWN}`,
+          { headers: authHeaders() },
+        )
+        if (!resp.ok) {
           if (!cancelled) setRuns([])
           return
         }
-        const shotsBody = await shotsResp.json()
-        const runsBody = await runsResp.json()
+        const body = await resp.json()
         if (cancelled) return
-
-        // Frames arrive newest-first, so the FIRST sighting of an id is that
-        // run's most recent frame — which is the order to list the runs in.
-        const rows: unknown[] = Array.isArray(shotsBody)
-          ? shotsBody
-          : (shotsBody.screenshots ?? shotsBody.frames ?? [])
-        const ids: string[] = []
-        for (const row of rows) {
-          const id = (row as { run_id?: unknown }).run_id
-          if (typeof id === 'string' && id && id !== currentRunId && !ids.includes(id)) {
-            ids.push(id)
-          }
-        }
-
-        const all: RunSummary[] = Array.isArray(runsBody) ? runsBody : (runsBody.runs ?? [])
-        const byId = new Map(all.map((r) => [r.run_id, r]))
-        setRuns(
-          ids
-            .slice(0, RUNS_SHOWN)
-            // An id with no matching run has been pruned from the runs list; there
-            // is nothing left to name it with, so it is dropped rather than
-            // rendered as a bare uuid.
-            .map((id) => byId.get(id))
-            .filter((r): r is RunSummary => r !== undefined),
-        )
+        const rows: DeviceRun[] = Array.isArray(body) ? body : (body.runs ?? [])
+        // Newest-first from the backend, then the live run lifted to the top
+        // whatever its created_at says: it is the only row still changing.
+        setRuns([...rows].sort((a, b) => Number(isLive(b)) - Number(isLive(a))))
       } catch {
-        // Failing to list past runs is worth an empty state, not an error card:
+        // Failing to list runs is worth an empty state, not an error card:
         // everything above it — the machine, its screen, its current run — is
         // unaffected and is the reason the operator is on this pane.
         if (!cancelled) setRuns([])
@@ -1229,12 +1238,12 @@ function RunsCard({
     return () => {
       cancelled = true
     }
-  }, [deviceId, currentRunId])
+  }, [deviceId, isLive])
 
   const listed = runs !== null && runs.length > 0
 
   return (
-    <Card title={<SectionTitle>Earlier runs</SectionTitle>} padded={!listed}>
+    <Card title={<SectionTitle>Runs</SectionTitle>} padded={!listed}>
       {runs === null && (
         <div
           style={{
@@ -1244,76 +1253,92 @@ function RunsCard({
             color: 'var(--sb-text-muted)',
           }}
         >
-          <Spinner size={14} /> Looking for earlier runs…
+          <Spinner size={14} /> Loading runs…
         </div>
       )}
 
       {runs !== null && runs.length === 0 && (
         <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-          Nothing earlier — this machine has not finished a run that uploaded any frames.
+          This machine has not run anything yet. Runs appear here newest first, each with its own
+          narration and its own frames.
         </span>
       )}
 
       {listed &&
-        runs.map((run, i) => (
-          <div key={run.run_id}>
-            {i > 0 && <Divider style={{ margin: 0 }} />}
-            <button
-              onClick={() => onOpenRun(run.run_id)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 'var(--sp-3)',
-                width: '100%',
-                textAlign: 'left',
-                padding: '10px 16px',
-                background: 'transparent',
-                border: 'none',
-                cursor: 'pointer',
-                color: 'var(--sb-text)',
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
-              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-            >
-              <StatusPill status={run.status} />
-              <span
+        runs.map((run, i) => {
+          const live = isLive(run)
+          const duration = runDuration(run)
+          return (
+            <div key={run.run_id}>
+              {i > 0 && <Divider style={{ margin: 0 }} />}
+              <button
+                onClick={() => onOpenRun(run.run_id)}
+                title="Open this run — its narration, its actions and its frames"
                 style={{
-                  flex: 1,
-                  minWidth: 0,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  fontSize: 'var(--fs-md)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 'var(--sp-3)',
+                  width: '100%',
+                  textAlign: 'left',
+                  padding: '10px 16px',
+                  background: 'transparent',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: 'var(--sb-text)',
                 }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
+                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
               >
-                {run.task || '(untitled task)'}
-              </span>
-              <span
-                style={{
-                  fontSize: 'var(--fs-sm)',
-                  color: 'var(--sb-text-muted)',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {run.num_steps ?? run.steps ?? 0} steps · {relativeTime(run.created_at)}
-              </span>
-            </button>
-          </div>
-        ))}
+                {/* Pulses on `running`, which is the whole of "reads as live". */}
+                <StatusPill status={live ? 'running' : run.status} />
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontSize: 'var(--fs-md)',
+                  }}
+                >
+                  {run.task || '(untitled task)'}
+                </span>
+                <span
+                  style={{
+                    fontSize: 'var(--fs-sm)',
+                    color: 'var(--sb-text-muted)',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {run.num_steps ?? 0} steps
+                  {duration && (live ? ` · running for ${duration}` : ` · took ${duration}`)} ·{' '}
+                  {relativeTime(run.started_at ?? run.created_at)}
+                </span>
+              </button>
+            </div>
+          )
+        })}
     </Card>
   )
 }
 
 // ───────────────────────────────────────────────────────── screen
 
-// SCREEN — what the machine is actually looking at.
+// SCREEN — what the machine is looking at right now, and nothing else.
 //
 // NOW, above, can only say that a run exists and which step it is on. A worker
 // grinding through a task and a worker stuck in a loop clicking the same button
 // produce the identical card: a run id and a step count that keeps ticking. The
-// frames are the only thing that separates them, and nobody is sitting at these
-// machines to look — which is why the latest one is rendered at a size you can
-// read rather than as a thumbnail.
+// frame is the only thing that separates them, and nobody is sitting at these
+// machines to look — which is why it is rendered at a size you can read rather
+// than as a thumbnail.
+//
+// It used to carry a strip of the last two dozen frames as well. That strip
+// belonged to no run: it interleaved every frame this machine had ever uploaded,
+// so the moment it had done more than one piece of work — the normal case — the
+// order stopped meaning anything. Frames are the run's record and are rendered
+// in the run's own timeline (FleetRun), where each one sits between the
+// narration that decided on it and the action that followed.
 //
 // Workers upload each turn's frame to object storage and the backend hands back
 // PRESIGNED, short-lived URLs. Nothing here holds one past a failed load: see
@@ -1321,12 +1346,8 @@ function RunsCard({
 // the backend again, because a silently blank panel reads as a broken feature
 // rather than as a URL that timed out.
 
-// One uploaded frame. The screenshot endpoints are landing in parallel with this
-// pane, so every field is read through a short list of aliases rather than one
-// exact key. The failure this avoids is the bad one: if the backend settled on
-// `created_at` where this expected `captured_at`, a strict read renders an empty
-// strip — which is indistinguishable from a machine that has never uploaded
-// anything, and sends the operator looking at the wrong problem.
+// One uploaded frame, from ScreenshotOut (routers/screenshots.py): url,
+// device_id, run_id, seq, content_type, created_at, expires_at.
 interface Frame {
   /** Only has to be STABLE and comparable: it is what "is there a newer frame
    *  than the one on screen?" is answered with. */
@@ -1348,11 +1369,6 @@ type Snap =
 // re-signing URLs faster than the worker produces frames.
 const SCREEN_POLL_MS = 5_000
 
-// How many frames the strip asks for. A long-running machine has hundreds, each
-// a ~1024px JPEG; the strip exists to show the last stretch of a run, and pulling
-// the lot would cost megabytes to render a row of 132px thumbnails.
-const STRIP_LIMIT = 24
-
 // The snapshot wait. POST /snapshot returns once the request is QUEUED — the
 // machine still has to pick the command up, wake, capture and upload — so the
 // frame lands seconds later, or never if nothing is listening. 45s is generous
@@ -1361,22 +1377,17 @@ const STRIP_LIMIT = 24
 const SNAPSHOT_POLL_MS = 2_000
 const SNAPSHOT_TIMEOUT_MS = 45_000
 
-// How long a batch of presigned URLs is assumed to stay good when the backend
-// does not send an expiry. Only ever makes this pane re-fetch sooner than it
-// needed to, which is the harmless direction to be wrong in.
+// How long a presigned URL is assumed to stay good when the backend does not
+// send an expiry. Only ever makes this pane re-fetch sooner than it needed to,
+// which is the harmless direction to be wrong in.
 const URL_ASSUMED_LIFE_MS = 4 * 60_000
-
-// Rendered width of a filmstrip thumbnail. The bytes are full-size either way —
-// there is no thumbnail endpoint — so `loading="lazy"` is what actually keeps
-// the row cheap; this only decides how many fit on screen.
-const THUMB_W = 132
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// The wall-clock time a frame was taken. The filmstrip shows this ALONGSIDE the
-// relative time, not instead of it: "3m ago" says how stale the run is, while the
-// clock time is what two adjacent frames get compared on when the question is
-// whether the machine has been repeating itself.
+// The wall-clock time a frame was taken, shown ALONGSIDE the relative time:
+// "3m ago" says how stale the run is, while the clock time is what this frame
+// gets compared against the next one on when the question is whether the machine
+// has been repeating itself.
 function clockTime(iso: string): string {
   const ms = Date.parse(iso)
   if (!Number.isFinite(ms)) return '—'
@@ -1395,11 +1406,9 @@ function firstString(row: Record<string, unknown>, keys: string[]): string | nul
   return null
 }
 
-// The backend's ScreenshotOut (routers/screenshots.py): url, device_id, run_id,
-// seq, content_type, created_at, expires_at. It deliberately does NOT return an
-// object_key — a raw storage path is useless to a browser holding no credentials
-// and would publish the fleet's key layout — so there is no server-side id to
-// key React on.
+// ScreenshotOut deliberately does NOT return an object_key — a raw storage path
+// is useless to a browser holding no credentials and would publish the fleet's
+// key layout — so there is no server-side id to key React on.
 //
 // `created_at` stands in for one. It comes from the write path, is unique per
 // capture in practice, and is stable across the re-signs that change `url` every
@@ -1422,9 +1431,9 @@ function normalizeFrame(raw: unknown): Frame | null {
 }
 
 // True once the backend's own stated expiry for a URL has passed. Used only to
-// re-sign BEFORE loading a full-size image; an expiry we were never told about
+// re-sign BEFORE showing a frame full-size; an expiry we were never told about
 // falls back to URL_ASSUMED_LIFE_MS.
-function expired(frame: Frame | undefined): boolean {
+function expired(frame: Frame | null): boolean {
   if (!frame?.expires_at) return false
   const ms = Date.parse(frame.expires_at)
   return Number.isFinite(ms) && ms <= Date.now()
@@ -1435,25 +1444,27 @@ function ScreenCard({ device }: { device: Device }) {
   const revoked = device.enrollment_state === 'revoked'
   const running = device.online && !!device.current_run_id
 
-  const [frames, setFrames] = useState<Frame[] | null>(null)
+  const [frame, setFrame] = useState<Frame | null>(null)
+  // Whether the backend has answered at all yet. Separate from `frame` because
+  // "still loading" and "this machine has never sent a frame" are different
+  // things to say, and the second one is a statement, not a blank panel.
+  const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // When the last batch of URLs was signed, for the pre-load freshness check.
+  // When the URL currently on screen was signed, for the pre-enlarge freshness
+  // check.
   const [fetchedAt, setFetchedAt] = useState(0)
   // A URL that failed to load and failed AGAIN after being re-signed. That is not
   // an expiry, so it is shown rather than retried.
   const [broken, setBroken] = useState(false)
   const [snap, setSnap] = useState<Snap>({ state: 'idle' })
-  // The lightbox is keyed by frame id, never by index: a poll landing while it is
-  // open prepends newer frames and would shift every index under it, showing the
-  // operator a different screenshot than the one they clicked.
-  const [openId, setOpenId] = useState<string | null>(null)
+  const [zoomed, setZoomed] = useState(false)
 
   // Which URLs have already been re-signed once. Without this, an object that is
   // genuinely gone (rather than merely expired) puts the pane in a fetch loop.
   const resignedRef = useRef<Set<string>>(new Set())
-  // The frame the polls compare against, read from a ref so the interval and the
-  // snapshot wait don't have to be rebuilt every time the list changes.
-  const latestIdRef = useRef<string | null>(null)
+  // The id on screen, read from a ref so the poll and the snapshot wait don't
+  // have to be rebuilt every time it changes.
+  const shownIdRef = useRef<string | null>(null)
   // Set on unmount so an in-flight snapshot wait stops touching state after the
   // operator has selected another machine.
   const goneRef = useRef(false)
@@ -1464,60 +1475,66 @@ function ScreenCard({ device }: { device: Device }) {
     [],
   )
 
-  const loadStrip = useCallback(async (): Promise<void> => {
-    try {
-      const resp = await fetch(
-        `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${STRIP_LIMIT}`,
-        { headers: authHeaders() },
-      )
-      // 404 is "this machine has never uploaded a frame" — an older worker build,
-      // or one that has never run — not a failure. It gets the empty state, which
-      // says so, rather than an error card.
-      if (resp.status === 404) {
-        setFrames([])
+  // Fetch the newest frame, and report which one that is so a caller can tell
+  // whether it changed without waiting for a re-render.
+  //
+  // `resign` is the difference between "poll" and "I need this URL to work right
+  // now". A poll that adopted every response would hand the <img> a fresh
+  // signature for the identical JPEG every few seconds and make the browser
+  // re-download it; a re-sign has to replace the URL even though the frame is
+  // the same one.
+  const loadLatest = useCallback(
+    async (resign = false): Promise<string | null> => {
+      try {
+        const resp = await fetch(
+          `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots/latest`,
+          { headers: authHeaders() },
+        )
+        // 404 is "this machine has never uploaded a frame" — an older worker
+        // build, or one that has never run — not a failure. It gets the empty
+        // state, which says so, rather than an error card.
+        if (resp.status === 404) {
+          setFrame(null)
+          setLoaded(true)
+          setError(null)
+          return null
+        }
+        if (!resp.ok) {
+          setError(`Could not load the frame (${resp.status})`)
+          setLoaded(true)
+          return shownIdRef.current
+        }
+        const next = normalizeFrame(await resp.json())
+        setLoaded(true)
         setError(null)
-        setFetchedAt(Date.now())
-        return
+        if (!next) {
+          setFrame(null)
+          return null
+        }
+        if (resign || next.id !== shownIdRef.current) {
+          setFrame(next)
+          setBroken(false)
+          setFetchedAt(Date.now())
+          // Fresh signature: whatever failed before is worth one more attempt.
+          resignedRef.current = new Set()
+        }
+        return next.id
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Network error')
+        setLoaded(true)
+        return shownIdRef.current
       }
-      if (!resp.ok) {
-        setError(`Could not load frames (${resp.status})`)
-        return
-      }
-      const data = await resp.json()
-      const rows: unknown[] = Array.isArray(data) ? data : (data.screenshots ?? data.frames ?? [])
-      const next = rows.map(normalizeFrame).filter((frame): frame is Frame => frame !== null)
-      setFrames(next)
-      setError(null)
-      setBroken(false)
-      setFetchedAt(Date.now())
-      // Fresh signatures: whatever failed before is worth one more attempt.
-      resignedRef.current = new Set()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error')
-    }
-  }, [deviceId])
-
-  // The cheap "is there anything newer?" probe. The frame it returns is
-  // deliberately DISCARDED and the list re-fetched instead: the big frame and the
-  // strip must agree with each other, and one list call re-signs every URL on
-  // screen at once rather than leaving the strip holding older signatures.
-  const probeLatestId = useCallback(async (): Promise<string | null> => {
-    const resp = await fetch(
-      `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots/latest`,
-      { headers: authHeaders() },
-    )
-    // 404 means nothing has been uploaded yet, which the strip already says.
-    if (!resp.ok) return null
-    return normalizeFrame(await resp.json())?.id ?? null
-  }, [deviceId])
+    },
+    [deviceId],
+  )
 
   useEffect(() => {
-    loadStrip()
-  }, [loadStrip])
+    loadLatest()
+  }, [loadLatest])
 
   useEffect(() => {
-    latestIdRef.current = frames?.[0]?.id ?? null
-  }, [frames])
+    shownIdRef.current = frame?.id ?? null
+  }, [frame])
 
   // Only a machine that is mid-run is polled. An idle worker's screen does not
   // change on its own — nothing is driving it — so a timer against one would
@@ -1525,20 +1542,16 @@ function ScreenCard({ device }: { device: Device }) {
   // answer at all. Take snapshot is how you look at an idle machine.
   useEffect(() => {
     if (!running) return
-    const timer = setInterval(async () => {
-      try {
-        const latestId = await probeLatestId()
-        if (latestId && latestId !== latestIdRef.current) await loadStrip()
-      } catch {
-        // A missed poll is corrected by the next one; a run in flight is not
-        // worth an error card over one dropped request.
-      }
+    const timer = setInterval(() => {
+      // A missed poll is corrected by the next one; loadLatest already swallows
+      // its own failures into `error`.
+      loadLatest()
     }, SCREEN_POLL_MS)
     return () => clearInterval(timer)
-  }, [running, probeLatestId, loadStrip])
+  }, [running, loadLatest])
 
   const takeSnapshot = useCallback(async () => {
-    const baseline = latestIdRef.current
+    const baseline = shownIdRef.current
     setSnap({ state: 'pending' })
     try {
       const resp = await fetch(`${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/snapshot`, {
@@ -1561,19 +1574,14 @@ function ScreenCard({ device }: { device: Device }) {
     while (Date.now() < deadline) {
       await sleep(SNAPSHOT_POLL_MS)
       if (goneRef.current) return
-      try {
-        const latestId = await probeLatestId()
-        if (latestId && latestId !== baseline) {
-          await loadStrip()
-          setSnap({ state: 'idle' })
-          return
-        }
-      } catch {
-        // Keep waiting: the deadline is the only thing that ends this loop.
+      const id = await loadLatest()
+      if (id && id !== baseline) {
+        setSnap({ state: 'idle' })
+        return
       }
     }
     if (!goneRef.current) setSnap({ state: 'timeout' })
-  }, [deviceId, probeLatestId, loadStrip])
+  }, [deviceId, loadLatest])
 
   // An image that fails to load is, nearly always, a signature that expired while
   // this pane sat open. Ask the backend once per URL — a second failure is
@@ -1585,33 +1593,19 @@ function ScreenCard({ device }: { device: Device }) {
         return
       }
       resignedRef.current.add(url)
-      loadStrip()
+      loadLatest(true)
     },
-    [loadStrip],
+    [loadLatest],
   )
 
-  const shots = frames ?? []
-  const latest = shots[0]
-  const openIndex = openId ? shots.findIndex((f) => f.id === openId) : -1
-
-  // The open frame rolled off the end of the list while the lightbox was open.
-  // Close rather than silently jump to a neighbour.
-  useEffect(() => {
-    if (openId && openIndex < 0) setOpenId(null)
-  }, [openId, openIndex])
-
-  const openShot = useCallback(
-    async (id: string) => {
-      setOpenId(id)
-      // The thumbnail on screen keeps rendering from the copy the browser decoded
-      // when the strip loaded, so a dead URL stays invisible until the enlarged
-      // view fetches it again and opens onto nothing. Re-sign first whenever
-      // these URLs are old enough to be a risk.
-      const frame = shots.find((f) => f.id === id)
-      if (expired(frame) || Date.now() - fetchedAt > URL_ASSUMED_LIFE_MS) await loadStrip()
-    },
-    [shots, fetchedAt, loadStrip],
-  )
+  const enlarge = useCallback(async () => {
+    setZoomed(true)
+    // The frame on screen keeps rendering from the copy the browser decoded when
+    // the panel loaded, so a dead URL stays invisible until the enlarged view
+    // fetches it again and opens onto nothing. Re-sign first whenever this URL is
+    // old enough to be a risk.
+    if (expired(frame) || Date.now() - fetchedAt > URL_ASSUMED_LIFE_MS) await loadLatest(true)
+  }, [frame, fetchedAt, loadLatest])
 
   // A snapshot is a request made OF a machine, so it is only offered to one that
   // could conceivably answer. A powered-off or locked-out machine would take the
@@ -1687,7 +1681,7 @@ function ScreenCard({ device }: { device: Device }) {
         </div>
       )}
 
-      {frames === null && !error && (
+      {!loaded && !error && (
         <div
           style={{
             display: 'flex',
@@ -1698,32 +1692,32 @@ function ScreenCard({ device }: { device: Device }) {
             color: 'var(--sb-text-muted)',
           }}
         >
-          <Spinner /> Loading frames…
+          <Spinner /> Loading the latest frame…
         </div>
       )}
 
-      {error && frames === null && (
+      {error && !frame && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)' }}>
           <span className="error-message">{error}</span>
-          <Button size="sm" variant="ghost" onClick={loadStrip}>
+          <Button size="sm" variant="ghost" onClick={() => loadLatest(true)}>
             Retry
           </Button>
         </div>
       )}
 
-      {frames !== null && shots.length === 0 && (
+      {loaded && !frame && !error && (
         <EmptyState
           icon="🖥"
           title="This machine has never sent a frame"
           hint={
             device.online
-              ? 'Workers upload a screenshot each turn, so frames appear here once it runs something. A machine on an older build never uploads any — Take snapshot is the quickest way to tell which of the two this is.'
+              ? 'Workers upload a screenshot each turn, so a frame appears here once it runs something. A machine on an older build never uploads any — Take snapshot is the quickest way to tell which of the two this is.'
               : 'Workers upload a screenshot each turn. This one has either never run, or is on a build from before frames were uploaded.'
           }
         />
       )}
 
-      {latest && (
+      {frame && (
         <>
           {/* The point of the feature: the frame at a size you can read, not a
               thumbnail. Same well and gold-bordered treatment as the live panel's
@@ -1751,16 +1745,16 @@ function ScreenCard({ device }: { device: Device }) {
                 }}
               >
                 This frame would not load, even after asking for a fresh link.
-                <Button size="sm" variant="ghost" onClick={loadStrip}>
+                <Button size="sm" variant="ghost" onClick={() => loadLatest(true)}>
                   Reload
                 </Button>
               </div>
             ) : (
               <img
-                src={latest.url}
+                src={frame.url}
                 alt={`screen of ${displayName(device)}`}
-                onClick={() => openShot(latest.id)}
-                onError={() => reportBadUrl(latest.url)}
+                onClick={enlarge}
+                onError={() => reportBadUrl(frame.url)}
                 style={{
                   display: 'block',
                   width: '100%',
@@ -1785,8 +1779,8 @@ function ScreenCard({ device }: { device: Device }) {
               color: 'var(--sb-text-muted)',
             }}
           >
-            <span style={{ fontFamily: 'var(--font-mono)' }}>{clockTime(latest.captured_at)}</span>
-            <span>· {relativeTime(latest.captured_at)}</span>
+            <span style={{ fontFamily: 'var(--font-mono)' }}>{clockTime(frame.captured_at)}</span>
+            <span>· {relativeTime(frame.captured_at)}</span>
             {/* Say which of the two this panel is doing, so a frame that stops
                 changing reads as a stuck machine rather than a stopped pane. */}
             <span style={{ marginLeft: 'auto' }}>
@@ -1795,154 +1789,41 @@ function ScreenCard({ device }: { device: Device }) {
                 : 'not refreshing — this machine is idle'}
             </span>
           </div>
-
-          <Filmstrip shots={shots} onOpen={openShot} onBadUrl={reportBadUrl} />
         </>
       )}
 
-      {openIndex >= 0 && (
-        <FrameLightbox
-          shots={shots}
-          index={openIndex}
-          onClose={() => setOpenId(null)}
-          onNavigate={(next) => setOpenId(shots[next].id)}
-          onBadUrl={reportBadUrl}
-        />
+      {zoomed && frame && (
+        <FrameLightbox frame={frame} onClose={() => setZoomed(false)} onBadUrl={reportBadUrl} />
       )}
     </Card>
   )
 }
 
-// The growing timeline. Its whole job is to make a REPEAT visible — the same
-// window, the same button, four frames running — so order and time are the two
-// things it may not leave ambiguous: newest is pinned left and labelled, and
-// every frame carries its wall-clock time rather than only "2m ago".
-function Filmstrip({
-  shots,
-  onOpen,
-  onBadUrl,
-}: {
-  shots: Frame[]
-  onOpen: (id: string) => void
-  onBadUrl: (url: string) => void
-}) {
-  // One frame IS the panel above it; a strip of one would only repeat it.
-  if (shots.length < 2) return null
-  return (
-    <div style={{ marginTop: 'var(--sp-4)' }}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'baseline',
-          gap: 'var(--sp-2)',
-          marginBottom: 'var(--sp-2)',
-        }}
-      >
-        <SectionTitle>Recent frames</SectionTitle>
-        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
-          newest first · last {shots.length}
-        </span>
-      </div>
-      <div
-        style={{
-          display: 'flex',
-          gap: 'var(--sp-3)',
-          overflowX: 'auto',
-          paddingBottom: 'var(--sp-2)',
-        }}
-      >
-        {shots.map((frame, i) => (
-          <button
-            key={frame.id}
-            onClick={() => onOpen(frame.id)}
-            title={`Open the frame from ${clockTime(frame.captured_at)}`}
-            style={{
-              flexShrink: 0,
-              width: THUMB_W,
-              padding: 0,
-              textAlign: 'left',
-              background: 'transparent',
-              border: 'none',
-              cursor: 'zoom-in',
-              font: 'inherit',
-              color: 'var(--sb-text-muted)',
-            }}
-          >
-            <img
-              src={frame.url}
-              alt={`frame from ${clockTime(frame.captured_at)}`}
-              // Full-size bytes with no thumbnail endpoint to lean on, so lazy
-              // loading is what actually keeps a strip of ~1024px JPEGs off the
-              // wire until the operator scrolls to them.
-              loading="lazy"
-              decoding="async"
-              onError={() => onBadUrl(frame.url)}
-              style={{
-                display: 'block',
-                width: '100%',
-                height: 'auto',
-                borderRadius: 'var(--r-sm)',
-                // The newest frame is the one the big panel is showing; the gold
-                // edge is what ties the two together.
-                border: `1px solid ${i === 0 ? 'var(--sb-border-gold)' : 'var(--sb-border)'}`,
-                background: 'var(--sb-surface-2)',
-              }}
-            />
-            <div
-              style={{
-                marginTop: 4,
-                fontFamily: 'var(--font-mono)',
-                fontSize: 'var(--fs-xs)',
-                color: i === 0 ? 'var(--sb-text)' : 'var(--sb-text-muted)',
-              }}
-            >
-              {clockTime(frame.captured_at)}
-            </div>
-            <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
-              {i === 0 ? 'latest' : relativeTime(frame.captured_at)}
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// Full-screen view of one frame, with the same keyboard handling and chrome as
-// the run replay's lightbox (RunDetail). Kept separate rather than shared because
-// that one is typed on RunEvent and resolves LOCAL paths through the Tauri asset
-// protocol; these are presigned remote URLs, and the thing that matters here — a
-// URL can die between the thumbnail and this view — does not exist over there.
+// Full-screen view of the current frame, with the same chrome as the run
+// replay's lightbox (RunDetail). Kept separate rather than shared because that
+// one is typed on RunEvent and resolves LOCAL paths through the Tauri asset
+// protocol; this is a presigned remote URL, and the thing that matters here — a
+// URL can die between the panel and this view — does not exist over there.
+//
+// There is nothing to page through: this pane holds exactly one frame, the
+// latest. Stepping between a run's frames belongs to the run's timeline, where
+// each frame sits in the order it was taken.
 function FrameLightbox({
-  shots,
-  index,
+  frame,
   onClose,
-  onNavigate,
   onBadUrl,
 }: {
-  shots: Frame[]
-  index: number
+  frame: Frame
   onClose: () => void
-  onNavigate: (index: number) => void
   onBadUrl: (url: string) => void
 }) {
-  const count = shots.length
-  const go = useCallback(
-    (delta: number) => onNavigate((index + delta + count) % count),
-    [index, count, onNavigate],
-  )
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose()
-      else if (e.key === 'ArrowRight') go(1)
-      else if (e.key === 'ArrowLeft') go(-1)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, go])
-
-  const frame = shots[index]
+  }, [onClose])
 
   return (
     <div
@@ -1975,7 +1856,7 @@ function FrameLightbox({
         src={frame.url}
         alt={`frame from ${clockTime(frame.captured_at)}`}
         onClick={(e) => e.stopPropagation()}
-        // A presigned URL can die between the strip loading and this opening. The
+        // A presigned URL can die between the panel loading and this opening. The
         // re-sign happens in the parent; closing is what keeps the operator from
         // staring at a black rectangle waiting for it.
         onError={() => {
@@ -1992,69 +1873,21 @@ function FrameLightbox({
         }}
       />
 
-      {/* The caption is the whole reason to enlarge a frame out of a loop: the
-          images look identical, and the time is what tells them apart. */}
       <div
         style={{
           position: 'absolute',
           bottom: 'var(--sp-4)',
           left: '50%',
           transform: 'translateX(-50%)',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 'var(--sp-3)',
           fontSize: 'var(--fs-sm)',
           fontFamily: 'var(--font-mono)',
           color: 'var(--sb-text-muted)',
         }}
       >
-        {count > 1 && (
-          // The list runs newest-first, so "older" is the NEXT index and "newer"
-          // the previous one. The arrows point the way the strip reads, not the
-          // way the array is indexed.
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              go(1)
-            }}
-            aria-label="Older frame"
-            style={lightboxNavStyle}
-          >
-            ‹
-          </button>
-        )}
-        <span>
-          {clockTime(frame.captured_at)} · {index + 1} of {count} · newest is 1
-        </span>
-        {count > 1 && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              go(-1)
-            }}
-            aria-label="Newer frame"
-            style={lightboxNavStyle}
-          >
-            ›
-          </button>
-        )}
+        {clockTime(frame.captured_at)} · {relativeTime(frame.captured_at)}
       </div>
     </div>
   )
-}
-
-const lightboxNavStyle: React.CSSProperties = {
-  width: 32,
-  height: 32,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  fontSize: 18,
-  color: 'var(--sb-text)',
-  background: 'var(--sb-surface-2)',
-  border: '1px solid var(--sb-border)',
-  borderRadius: 'var(--r-pill)',
-  cursor: 'pointer',
 }
 
 // ───────────────────────────────────────────────────────── remote desktop

@@ -162,6 +162,13 @@ function normalizeEvent(raw: unknown): RunEventRow | null {
 // seq alone would rake every uploaded frame to the top of the run. `created_at`
 // is stamped by the single worker that persists the bus, so it is one clock and
 // it is the run's real order; seq only breaks ties within the same instant.
+// A frame on the timeline. The worker labels its own uploads `screenshot`, while
+// a frame that reached storage by another path arrives as a generic event with
+// an image artifact, so both count.
+function isShot(ev: RunEventRow): boolean {
+  return ev.type === 'screenshot' || ev.artifact_kind === 'image'
+}
+
 function compareEvents(a: RunEventRow, b: RunEventRow): number {
   const at = a.created_at ? Date.parse(a.created_at) : NaN
   const bt = b.created_at ? Date.parse(b.created_at) : NaN
@@ -553,6 +560,10 @@ function Timeline({
   // to see; goes false the instant the operator scrolls away from the bottom.
   const [following, setFollowing] = useState(true)
   const count = events.length
+  // Frames are counted separately because this is the only place they are
+  // listed: the device pane shows a machine's latest frame and nothing more, so
+  // "this run captured 14 frames" is a fact only the run's own record carries.
+  const shots = events.reduce((n, ev) => n + (isShot(ev) ? 1 : 0), 0)
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current
@@ -579,7 +590,12 @@ function Timeline({
 
   return (
     <Card
-      title={<SectionTitle>Timeline{count ? ` · ${count}` : ''}</SectionTitle>}
+      title={
+        <SectionTitle>
+          Timeline{count ? ` · ${count} events` : ''}
+          {shots ? ` · ${shots} frames` : ''}
+        </SectionTitle>
+      }
       actions={
         live && !following ? (
           <Button size="sm" variant="secondary" onClick={jumpToLatest}>
@@ -660,7 +676,7 @@ function EventRow({
 }) {
   const d = (ev.data ?? {}) as Record<string, unknown>
 
-  if (ev.type === 'screenshot' || ev.artifact_kind === 'image') {
+  if (isShot(ev)) {
     return <Shot ev={ev} onBadUrl={onBadUrl} onEnlarge={onEnlarge} />
   }
 
