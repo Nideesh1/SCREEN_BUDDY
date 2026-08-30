@@ -24,12 +24,18 @@ export const CU_BACKEND =
 // string, so an entry that lies about which model ran is a debugging trap. Add
 // an option here for any endpoint you actually run against.
 export const MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'qwen38', label: 'Qwen3.8 27B (self-hosted)' },
   { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
   { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
-  { value: 'qwen38', label: 'Qwen3.8 27B (self-hosted)' },
 ]
 
 // Fallback when nothing else (a template, a schedule) specifies one.
+//
+// The self-hosted endpoint leads deliberately. The Anthropic options are a paid
+// API, and a default that costs money on every unattended run is the wrong way
+// round — an enrolled worker refuses to drive api.anthropic.com at all, so a
+// template defaulting there was simply unrunnable on the fleet. Choosing to pay
+// should be an act, not an oversight.
 export const DEFAULT_MODEL = MODEL_OPTIONS[0].value
 
 // Deadline for the best-effort artifact metadata mirror. `fetch` has no default

@@ -235,7 +235,9 @@ function NewRun() {
       setTemplateId(t?.id ?? BLANK_TEMPLATE.id)
       if (!t) return
       setTask(t.taskScaffold)
-      setModel(t.model)
+      // A template may state no model at all — it describes what to do, not
+      // where inference runs. Fall back rather than clearing the picker.
+      setModel(t.model || DEFAULT_MODEL)
       setInputValues({})
       if (t.suggestedSetName) {
         const match = sets.find((s) => s.name === t.suggestedSetName)
