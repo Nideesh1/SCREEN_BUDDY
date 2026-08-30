@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
-import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
+import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
+import type { RunSummary } from './History'
 
 // One machine in the fleet, field-for-field the backend contract for
 // GET /devices. Everything except name / rustdesk_id / notes is REPORTED by the
@@ -69,6 +70,16 @@ type Load =
 // uses to decide `online`, so a machine that drops off is never stale by more
 // than one poll.
 const POLL_MS = 30_000
+
+// How many frame rows the "earlier runs" join scans. Frames come back
+// newest-first and a busy run produces dozens, so this is a window on the recent
+// past rather than the machine's whole life; 200 is the backend's own cap on
+// that list.
+const RUNS_SCAN_LIMIT = 200
+
+// How many past runs that card lists. It is a way back into recent work, not an
+// archive — History is the archive.
+const RUNS_SHOWN = 8
 
 // Devices — the admin shell's fleet supervisor. Two panes with no navigation
 // between them: the list on the left is what someone glances at from across the
@@ -225,7 +236,11 @@ function Devices() {
                 key={selected.device_id}
                 device={selected}
                 isThisMachine={selected.device_id === thisDeviceId}
-                onOpenRun={(runId) => navigate('/runs/' + runId)}
+                // The FLEET run view, not runs/:runId. A run executed on another
+                // machine has no local agent:// stream and no screenshots on
+                // this disk, so the local detail view renders it as a live panel
+                // that never streams and a gallery of paths that do not resolve.
+                onOpenRun={(runId) => navigate('/fleet/runs/' + runId)}
                 onChanged={() => fetchDevices(true)}
                 onAddMachine={() => setAddingMachine(true)}
               />
@@ -861,6 +876,10 @@ function DeviceDetail({
           the right order. */}
       <ScreenCard device={device} />
 
+      {/* Then the way back. NOW and SCREEN are this second; this is everything
+          before it. */}
+      <RunsCard device={device} onOpenRun={onOpenRun} />
+
       <AccessCard
         device={device}
         revoking={revoking}
@@ -1122,6 +1141,165 @@ function NowCard({
           Open run →
         </Button>
       </div>
+    </Card>
+  )
+}
+
+// ───────────────────────────────────────────────────────── earlier runs
+
+// EARLIER RUNS — what this machine has done before now.
+//
+// NOW covers the run in flight and nothing else, so a machine that has been
+// grinding through work all night reads exactly like one that has never executed
+// anything. This is the way back into a finished run's narration.
+//
+// There is no GET /devices/{id}/runs: a Run row records the device that claimed
+// it, but nothing serves the reverse lookup. Two routes that DO exist answer it
+// between them — a frame row names its run (ScreenshotOut carries run_id) and
+// GET /runs names every run this operator owns — so the device's frames supply
+// the ids and the runs list supplies their tasks. Both are calls the console
+// already makes elsewhere.
+//
+// The consequence is worth stating rather than hiding: a run that uploaded no
+// frame cannot appear here. That is a run that died before its first turn, and
+// it is found under History instead.
+function RunsCard({
+  device,
+  onOpenRun,
+}: {
+  device: Device
+  onOpenRun: (runId: string) => void
+}) {
+  const deviceId = device.device_id
+  const currentRunId = device.current_run_id
+  const [runs, setRuns] = useState<RunSummary[] | null>(null)
+
+  // Fetched once per selected machine and never polled: a past run does not
+  // change, and the one that does is NOW's, which is excluded below.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [shotsResp, runsResp] = await Promise.all([
+          fetch(
+            `${CU_BACKEND}/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${RUNS_SCAN_LIMIT}`,
+            { headers: authHeaders() },
+          ),
+          fetch(`${CU_BACKEND}/runs`, { headers: authHeaders() }),
+        ])
+        if (!shotsResp.ok || !runsResp.ok) {
+          if (!cancelled) setRuns([])
+          return
+        }
+        const shotsBody = await shotsResp.json()
+        const runsBody = await runsResp.json()
+        if (cancelled) return
+
+        // Frames arrive newest-first, so the FIRST sighting of an id is that
+        // run's most recent frame — which is the order to list the runs in.
+        const rows: unknown[] = Array.isArray(shotsBody)
+          ? shotsBody
+          : (shotsBody.screenshots ?? shotsBody.frames ?? [])
+        const ids: string[] = []
+        for (const row of rows) {
+          const id = (row as { run_id?: unknown }).run_id
+          if (typeof id === 'string' && id && id !== currentRunId && !ids.includes(id)) {
+            ids.push(id)
+          }
+        }
+
+        const all: RunSummary[] = Array.isArray(runsBody) ? runsBody : (runsBody.runs ?? [])
+        const byId = new Map(all.map((r) => [r.run_id, r]))
+        setRuns(
+          ids
+            .slice(0, RUNS_SHOWN)
+            // An id with no matching run has been pruned from the runs list; there
+            // is nothing left to name it with, so it is dropped rather than
+            // rendered as a bare uuid.
+            .map((id) => byId.get(id))
+            .filter((r): r is RunSummary => r !== undefined),
+        )
+      } catch {
+        // Failing to list past runs is worth an empty state, not an error card:
+        // everything above it — the machine, its screen, its current run — is
+        // unaffected and is the reason the operator is on this pane.
+        if (!cancelled) setRuns([])
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [deviceId, currentRunId])
+
+  const listed = runs !== null && runs.length > 0
+
+  return (
+    <Card title={<SectionTitle>Earlier runs</SectionTitle>} padded={!listed}>
+      {runs === null && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-3)',
+            color: 'var(--sb-text-muted)',
+          }}
+        >
+          <Spinner size={14} /> Looking for earlier runs…
+        </div>
+      )}
+
+      {runs !== null && runs.length === 0 && (
+        <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+          Nothing earlier — this machine has not finished a run that uploaded any frames.
+        </span>
+      )}
+
+      {listed &&
+        runs.map((run, i) => (
+          <div key={run.run_id}>
+            {i > 0 && <Divider style={{ margin: 0 }} />}
+            <button
+              onClick={() => onOpenRun(run.run_id)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--sp-3)',
+                width: '100%',
+                textAlign: 'left',
+                padding: '10px 16px',
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                color: 'var(--sb-text)',
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            >
+              <StatusPill status={run.status} />
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  fontSize: 'var(--fs-md)',
+                }}
+              >
+                {run.task || '(untitled task)'}
+              </span>
+              <span
+                style={{
+                  fontSize: 'var(--fs-sm)',
+                  color: 'var(--sb-text-muted)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {run.num_steps ?? run.steps ?? 0} steps · {relativeTime(run.created_at)}
+              </span>
+            </button>
+          </div>
+        ))}
     </Card>
   )
 }

@@ -2018,6 +2018,18 @@ async fn run_agent(
                     // path in the screenshot event so the UI can load it back
                     // off this machine.
                     let fseq = bump(&mut shot_seq);
+                    // The event's seq is allocated HERE, before the upload is
+                    // enqueued, so both destinations describe the frame with the
+                    // SAME number. They used to disagree: the local event took
+                    // the loop's `seq` while the upload carried `shot_seq`, a
+                    // separate counter. That produced two rows per frame, and
+                    // the uploaded one landed at a seq the console's since_seq
+                    // cursor had already passed — so the frames the operator
+                    // came to see were the one thing an incremental poll could
+                    // never deliver. `shot_seq` still names the local FILE,
+                    // where a dense 0,1,2… is what makes a run's directory
+                    // readable by hand.
+                    let s = bump(&mut seq);
                     // ...and mirror the SAME bytes off-machine so the admin
                     // console can watch this run without a remote desktop. This
                     // is `shot` — the image block the model was actually sent,
@@ -2032,12 +2044,11 @@ async fn run_agent(
                     // Not gated on the local write: the two destinations fail
                     // independently.
                     crate::screenshots::enqueue_run_shot(
-                        &app, &client, &base, &auth, rid, fseq, shot,
+                        &app, &client, &base, &auth, rid, s, shot,
                     );
                     if let Some(local_path) =
                         runs_save_screenshot_local(&app, rid, fseq, shot)
                     {
-                        let s = bump(&mut seq);
                         runs_event(
                             &app, &client, &base, &auth, rid, s, "screenshot",
                             json!({}), Some(&local_path), Some("screenshot_local"),
