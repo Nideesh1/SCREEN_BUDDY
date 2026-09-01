@@ -157,14 +157,18 @@ fn note_fleet_endpoint(base: &str, model: Option<&str>) {
     }
 }
 
-fn last_fleet_endpoint() -> Option<(String, Option<String>)> {
+/// `pub(crate)`: the task-pickup loop (channel.rs) passes these raw values into
+/// `start_run_internal` exactly as a dispatched frame would have carried them,
+/// so a task run walks the same frame > env > default ladder as everything else.
+pub(crate) fn last_fleet_endpoint() -> Option<(String, Option<String>)> {
     LAST_FLEET_ENDPOINT.lock().ok().and_then(|g| g.clone())
 }
 
-/// Resolve exactly as a run would, for the read-only UI commands. Shares one
-/// code path with the real thing so "what would happen" and "what happens"
-/// cannot drift.
-fn endpoint_for_display() -> ResolvedEndpoint {
+/// Resolve exactly as a run would, for the read-only UI commands — and for the
+/// readback a task-pickup posts (channel.rs), which must promise the operator
+/// the endpoint the approved run will actually drive. Shares one code path with
+/// the real thing so "what would happen" and "what happens" cannot drift.
+pub(crate) fn endpoint_for_display() -> ResolvedEndpoint {
     let fleet = last_fleet_endpoint();
     resolve_endpoint(
         fleet.as_ref().map(|(b, _)| b.as_str()),
@@ -1461,6 +1465,12 @@ async fn runs_finalize(
     result: Value,
     error_message: Option<&str>,
 ) {
+    // Every terminal path funnels through here, so this is the one place the
+    // task-pickup loop (channel.rs) can learn how a run ended — a device token
+    // cannot GET /runs/{id} back, so the worker's own record is the only copy
+    // it can consult. Recorded BEFORE the network call: the outcome must be in
+    // state before the RunLease drop cancels the token the pickup waits on.
+    crate::channel::note_run_outcome(app, run_id, status, error_message);
     let url = format!("{base}/runs/{run_id}");
     let body = json!({
         "status": status,
@@ -1644,6 +1654,14 @@ async fn run_agent(
     // Consecutive empty assistant turns; reset by any turn that carries content.
     let mut empty_turns: usize = 0;
 
+    // The diary drain. On an enrolled worker EVERY run drains — local,
+    // dispatched or task-picked alike — because a nudge should reach whatever
+    // run is actually in flight; on an un-enrolled machine `TurnDrain` disables
+    // itself (there is no device credential to read the channel with). Cheap by
+    // construction: one GET per turn boundary, and a drain failure never fails
+    // the turn.
+    let mut drain = crate::channel::TurnDrain::new(&app);
+
     // Resolved once per run so a mid-run env change can't make some turns carry
     // an auto-screenshot and others not.
     let auto_screenshot = auto_screenshot_enabled(&ep.base);
@@ -1703,6 +1721,25 @@ async fn run_agent(
                 json!({"turn": turn, "state": "running"}), None, None,
             )
             .await;
+        }
+
+        // Turn-boundary drain: pick up anything the operator appended to the
+        // diary since the last boundary. Each nudge becomes its OWN user
+        // message — never a mutation of messages[0], which owns the static
+        // cache breakpoint and must stay byte-identical for the pinned prefix
+        // to keep hitting. Other admin types are receipted inside the drain
+        // without touching the conversation. The server cursor is advanced by
+        // `turn_completed` below, only after this turn's response has fully
+        // landed — a crash mid-turn must redeliver the batch, and the
+        // deterministic receipt msg_ids make that redelivery harmless.
+        for nudge in drain.at_boundary(&app, &client, &base).await {
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": crate::channel::nudge_user_text(&nudge),
+                }],
+            }));
         }
 
         let body = json!({
@@ -1848,6 +1885,14 @@ async fn run_agent(
         empty_turns = 0;
 
         messages.push(json!({"role": "assistant", "content": content.clone()}));
+
+        // The turn that consumed this boundary's drained batch has completed —
+        // the model's full response is in hand — so acknowledge consumption to
+        // the server NOW, before the end_turn check: waiting for the next
+        // boundary would leave the final turn's batch unacknowledged on every
+        // clean run end. The empty-turn retry above deliberately does not reach
+        // here: a dropped turn did not consume anything.
+        drain.turn_completed(&app, &client, &base).await;
 
         let tool_uses: Vec<&Value> = content
             .iter()

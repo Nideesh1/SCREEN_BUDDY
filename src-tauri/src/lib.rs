@@ -5,6 +5,7 @@ use tauri::{Manager, State};
 mod agent;
 mod artifacts;
 mod capture;
+mod channel;
 mod computer;
 mod credentials;
 mod device;
@@ -273,6 +274,15 @@ pub fn run() {
       app.manage(agent::AgentState::default());
       // Remote-listener cancellation state (no listener running at startup).
       app.manage(remote::RemoteState::default());
+      // Diary state: the mail doorbell, the run-outcome slot, and the shutdown
+      // token every channel wait selects against.
+      app.manage(channel::ChannelState::default());
+      // The worker's idle task-pickup loop. Spawned unconditionally but inert
+      // on anything that is not an enrolled worker: it re-checks enrollment
+      // every iteration and an operator's Mac never touches /tasks (see
+      // `task_pickup_loop`). Lives for the life of the app; its waits are all
+      // cancellable via the ChannelState shutdown token.
+      tauri::async_runtime::spawn(channel::task_pickup_loop(app.handle().clone()));
 
       Ok(())
     })

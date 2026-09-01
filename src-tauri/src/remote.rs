@@ -8,6 +8,7 @@
 //!                       "model_endpoint":"https://…",
 //!                       "pinned_set_names":"[\"Set name\"]"}
 //!                      {"type":"snapshot"}
+//!                      {"type":"mail","seq":N}      (channel doorbell; no reply)
 //!                      {"type":"ping"}
 //!   desktop → backend  {"type":"ack","run_id":"uuid"}
 //!                      {"type":"ack","kind":"snapshot"}
@@ -158,6 +159,18 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
             // click-coordinate scaling are both untouched.
             crate::screenshots::spawn_snapshot(app, backend, auth);
             Some(json!({ "type": "ack", "kind": "snapshot" }).to_string())
+        }
+        Some("mail") => {
+            // Channel doorbell: the operator appended to this machine's diary.
+            // Content-free by design — no reply, no ack, and the carried `seq`
+            // is ignored, because the cursor reconcile (the idle poll and the
+            // turn-boundary drain in channel.rs) is the truth and this frame is
+            // only latency. All it does is latch the doorbell so an idle
+            // pickup wakes now instead of at its next interval; mid-run it is
+            // deliberately inert — the boundary drain catches the mail within
+            // a turn regardless.
+            crate::channel::ring_doorbell(app);
+            None
         }
         Some("run") => {
             let run_id = v.get("run_id").and_then(|r| r.as_str()).unwrap_or("").to_string();
