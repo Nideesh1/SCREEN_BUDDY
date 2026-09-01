@@ -1,7 +1,0 @@
-- generic [ref=e3]:
-  - generic [ref=e4]: SB
-  - generic [ref=e5]:
-    - heading "ScreenBuddy" [level=1] [ref=e6]
-    - paragraph [ref=e7]: Your AI agent for your desktop. Sign in to get started.
-  - button "Sign in with Google" [ref=e8] [cursor=pointer]
-  - generic [ref=e9]: Cannot read properties of undefined (reading 'invoke')
