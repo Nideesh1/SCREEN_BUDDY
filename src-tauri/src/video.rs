@@ -443,6 +443,22 @@ fn select_keepers(frames: &[Decoded], cap: usize) -> Vec<usize> {
         capped.dedup();
         kept = capped;
     }
+
+    // (3c) always keep the clip's FINAL frame. The last frame is the one a
+    // viewer most often needs — "what did it end as" — and both the change
+    // triggers (no change after the last event) and the subsample cap can drop
+    // it silently. It is exempt from the blur/luma filters on purpose: a
+    // degraded final frame still answers "how did this end" better than no
+    // final frame. `kept` is sorted ascending, so if the last index is present
+    // it can only be the tail; when adding it over a full cap, the previous
+    // tail gives way rather than growing past what the caller asked for.
+    let last = frames.len() - 1;
+    if kept.last() != Some(&last) {
+        if cap > 0 && kept.len() >= cap {
+            kept.pop();
+        }
+        kept.push(last);
+    }
     kept
 }
 
@@ -665,6 +681,36 @@ mod tests {
         assert!(!frames.is_empty(), "got candidate frames + timestamps");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The final frame is the "how did it end" frame and must survive selection
+    /// no matter what drops it: here the clip goes static after an early burst
+    /// of change (no trigger ever fires near the end), AND the tail frame is
+    /// near-black (the luma filter would refuse it), AND the cap is tiny (the
+    /// subsample would skip it). It must still be the last keeper — replacing
+    /// the previous tail rather than growing past the cap.
+    #[test]
+    fn select_keepers_always_keeps_final_frame() {
+        let n = 40usize;
+        let frames: Vec<Decoded> = (0..n)
+            .map(|i| Decoded {
+                path: PathBuf::from(format!("f{i}")),
+                ts_ms: (i as u64) * 250,
+                // change happens only in the first 10 frames; static after
+                hash: if i < 10 { (1u64 << (i * 6).min(63)) - 1 } else { (1u64 << 60) - 1 },
+                sharp: 100.0,
+                luma: if i == n - 1 { 5.0 } else { 128.0 }, // tail is near-black
+            })
+            .collect();
+
+        let cap = 4;
+        let keepers = select_keepers(&frames, cap);
+        assert!(keepers.len() <= cap, "cap respected, got {}", keepers.len());
+        assert_eq!(
+            keepers.last(),
+            Some(&(n - 1)),
+            "final frame must be the last keeper, got {keepers:?}"
+        );
     }
 
     /// The core fix, deterministic (no ffmpeg): a SLOW drift where each decoded
