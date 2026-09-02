@@ -825,7 +825,7 @@ async fn fetch_next_task(
     client: &reqwest::Client,
     base: &str,
     device_id: &str,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<(Value, (Option<String>, Option<String>))>, String> {
     let url = format!("{base}/tasks/next?device_id={}", urlencoding::encode(device_id));
     let resp = with_bearer(app, client.get(&url), "")
         .send()
@@ -838,9 +838,17 @@ async fn fetch_next_task(
         return Err(format!("HTTP {status}: {txt}"));
     }
     let body: Value = resp.json().await.map_err(|e| format!("bad body: {e}"))?;
+    // The fleet's model endpoint rides the pickup response, resolved by the
+    // backend at this moment exactly as /agent/dispatch resolves it onto a run
+    // frame. Without it, a freshly started worker that has never received a
+    // dispatch frame has no fleet value at all: its first task read back
+    // "claude-opus-4-8 at api.anthropic.com" and the guard stood ready to
+    // refuse the run — the first live readback caught precisely that.
+    let pick = |k: &str| body.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+    let fleet = (pick("model_endpoint"), pick("model"));
     match body.get("task") {
         Some(Value::Null) | None => Ok(None),
-        Some(task) => Ok(Some(task.clone())),
+        Some(task) => Ok(Some((task.clone(), fleet))),
     }
 }
 
@@ -941,8 +949,8 @@ pub async fn task_pickup_loop(app: AppHandle) {
         if crate::credentials::is_enrolled(&app) && !run_in_flight(&app) {
             if let Ok(device_id) = crate::device::device_id(&app) {
                 match fetch_next_task(&app, &client, &base, &device_id).await {
-                    Ok(Some(task)) => {
-                        handle_task(&app, &client, &base, &device_id, &task, &shutdown).await;
+                    Ok(Some((task, fleet))) => {
+                        handle_task(&app, &client, &base, &device_id, &task, fleet, &shutdown).await;
                         // Re-poll immediately: finishing one task is the moment
                         // the queue most likely holds the next.
                         continue;
@@ -968,6 +976,7 @@ async fn handle_task(
     base: &str,
     device_id: &str,
     task: &Value,
+    fleet_from_pickup: (Option<String>, Option<String>),
     cancel: &CancellationToken,
 ) {
     let task_id = task.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -990,9 +999,16 @@ async fn handle_task(
     // The readback question. Deterministic msg_id: a worker that crashes
     // mid-wait and (in a later phase) re-enters readback re-posts the same
     // question and inherits its original seq — and any verdict already given.
+    // What this run WILL drive, promised honestly: the pickup's fleet values
+    // win; the display resolver (last dispatch frame > env > default) is only
+    // the fallback. The same pair is handed to start_run_internal below, so the
+    // readback can never promise one endpoint and the run drive another.
     let ep = crate::agent::endpoint_for_display();
+    let (fleet_base, fleet_model) = fleet_from_pickup;
+    let promised_base = fleet_base.clone().unwrap_or_else(|| ep.base.clone());
+    let promised_model = fleet_model.clone().unwrap_or_else(|| ep.model.clone());
     let ws = task.get("workspace").map(workspace_summary).unwrap_or(None);
-    let text = readback_text(&title, &spec, ws.as_deref(), &ep.model, &ep.base);
+    let text = readback_text(&title, &spec, ws.as_deref(), &promised_model, &promised_base);
     let question_id = format!("readback-{task_id}");
     let Some(verdict) = ask_operator(
         app,
@@ -1037,7 +1053,7 @@ async fn handle_task(
         eprintln!("[tasks] {task_id}: readback->running failed: {e}");
         return;
     }
-    let run_id = match create_run_row(app, client, base, &title, &ep.model, cancel).await {
+    let run_id = match create_run_row(app, client, base, &title, &promised_model, cancel).await {
         Ok(id) => id,
         Err(e) => {
             eprintln!("[tasks] {task_id}: POST /runs failed: {e}");
@@ -1054,10 +1070,14 @@ async fn handle_task(
     };
 
     // The fleet endpoint resolution is UNCHANGED from a dispatched run: pass
-    // the raw last-seen fleet values (what a `run` frame would have carried)
-    // and let `resolve_endpoint`'s frame > env > default ladder decide — so a
-    // task run drives exactly what the readback promised.
+    // fleet values in the frame position and let `resolve_endpoint`'s
+    // frame > env > default ladder decide. The values come from the PICKUP
+    // response (resolved server-side at claim time), falling back to the last
+    // dispatch frame's memory — so a task run drives exactly what the readback
+    // promised.
     let fleet = crate::agent::last_fleet_endpoint();
+    let frame_base = fleet_base.or_else(|| fleet.as_ref().map(|(b, _)| b.clone()));
+    let frame_model = fleet_model.or_else(|| fleet.as_ref().and_then(|(_, m)| m.clone()));
     let agent_state = app.state::<crate::agent::AgentState>();
     let started = crate::agent::start_run_internal(
         app,
@@ -1066,8 +1086,8 @@ async fn handle_task(
         String::new(), // no session token; the device credential rides via with_bearer
         Vec::new(),
         run_id.clone(),
-        fleet.as_ref().and_then(|(_, m)| m.clone()),
-        fleet.as_ref().map(|(b, _)| b.clone()),
+        frame_model,
+        frame_base,
         base.to_string(),
     );
     let run_token = match started {
