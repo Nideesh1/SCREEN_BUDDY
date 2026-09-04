@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
 import { isTauri, safeInvoke } from './lib'
+import { useInboxCount } from './views/Inbox'
 import type { AppMode } from './mode'
 import sbLogo from './assets/sb-logo.svg'
 
@@ -70,6 +71,7 @@ function RemoteIndicator() {
 // caller that still thinks in view ids has one source of truth.
 export type ViewId =
   | 'dashboard'
+  | 'inbox'
   | 'machine'
   | 'admin'
   | 'artifacts'
@@ -88,6 +90,7 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
+  { id: 'inbox', Icon: InboxIcon, label: 'Inbox' },
   { id: 'machine', Icon: MachineIcon, label: 'This machine' },
   { id: 'admin', Icon: DeviceIcon, label: 'Devices' },
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
@@ -110,10 +113,15 @@ const ITEMS: NavItem[] = [
 // `authHeaders()`, which an enrolled machine has nothing to put in, so they
 // could only ever render empty there.
 const MODE_ITEMS: Record<AppMode, ViewId[]> = {
-  admin: ['admin', 'settings'],
+  // Inbox leads for admin: it is THE page a supervisor opens — everything on
+  // it is a machine standing still until a human acts.
+  admin: ['inbox', 'admin', 'settings'],
   worker: ['machine', 'settings'],
   consumer: [
     'dashboard',
+    // The same supervision applies to a personal fleet: a blocked question or
+    // an unjudged task waits identically whoever owns the machines.
+    'inbox',
     // ...and This machine: the person running agents on their own desktop is
     // the person who wants to know whether it has the permissions to.
     'machine',
@@ -159,6 +167,10 @@ function NavRail({ userEmail, onSignOut, mode }: NavRailProps) {
   const active = activeIdFor(location.pathname)
   const visible = MODE_ITEMS[mode]
   const items = ITEMS.filter((item) => visible.includes(item.id))
+  // Blocked questions + tasks awaiting verdict, polled quietly. Only when the
+  // rail actually shows the item — a worker shell must not poll operator
+  // endpoints it could never render (and has no credentials for anyway).
+  const inboxCount = useInboxCount(visible.includes('inbox'))
   return (
     <nav
       className="nav-rail"
@@ -207,6 +219,33 @@ function NavRail({ userEmail, onSignOut, mode }: NavRailProps) {
             style={navButtonStyle(isActive)}
           >
             <item.Icon />
+            {/* The waiting count, worn by the Inbox icon itself so a blocked
+                machine is visible from every page, not just the inbox. */}
+            {item.id === 'inbox' && inboxCount !== null && inboxCount > 0 && (
+              <span
+                aria-label={`${inboxCount} waiting`}
+                style={{
+                  position: 'absolute',
+                  top: 3,
+                  right: 3,
+                  minWidth: 16,
+                  height: 16,
+                  boxSizing: 'border-box',
+                  padding: '0 4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 10,
+                  fontWeight: 700,
+                  lineHeight: 1,
+                  color: '#0A0A0A',
+                  background: 'var(--sb-gold)',
+                  borderRadius: 'var(--r-pill)',
+                }}
+              >
+                {inboxCount > 99 ? '99+' : inboxCount}
+              </span>
+            )}
             {/* Styled gold/black tooltip, revealed on hover to the right of the
                 icon (left rail). Pure CSS — see .nav-tooltip in index.css. */}
             <span className="nav-tooltip" role="tooltip">
@@ -292,6 +331,16 @@ function HomeIcon() {
       <path d="M3 11l9-7 9 7" />
       <path d="M5 10v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9" />
       <path d="M9 20v-6h6v6" />
+    </IconBase>
+  )
+}
+
+function InboxIcon() {
+  // A tray with a slot — things arrive here to be dealt with.
+  return (
+    <IconBase>
+      <path d="M22 12h-6l-2 3h-4l-2-3H2" />
+      <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
     </IconBase>
   )
 }

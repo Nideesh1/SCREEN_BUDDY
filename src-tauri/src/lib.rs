@@ -12,6 +12,7 @@ mod device;
 mod permissions;
 mod pinned;
 mod remote;
+mod runs_local;
 mod screenshots;
 mod video;
 mod window;
@@ -255,6 +256,8 @@ pub fn run() {
         artifacts::artifact_thumb,
         artifacts::artifact_rename,
         artifacts::artifact_delete,
+        runs_local::local_runs,
+        runs_local::local_run_frames,
         video::extract_frames_from_video,
         window::bring_to_front
     ])

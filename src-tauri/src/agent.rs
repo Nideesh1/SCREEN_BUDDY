@@ -1471,6 +1471,12 @@ async fn runs_finalize(
     // it can consult. Recorded BEFORE the network call: the outcome must be in
     // state before the RunLease drop cancels the token the pickup waits on.
     crate::channel::note_run_outcome(app, run_id, status, error_message);
+    // The DURABLE twin of the note above: the outcome slot dies with the app,
+    // and the frames under runs/<id>/ say nothing about how the run ended, so
+    // this is the one moment the machine can remember that for later (the
+    // Machine screen's local run card). Best-effort like the local frame
+    // writes — a full disk loses a breadcrumb, never the run.
+    crate::runs_local::write_outcome(app, run_id, status, error_message, num_steps);
     let url = format!("{base}/runs/{run_id}");
     let body = json!({
         "status": status,

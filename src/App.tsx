@@ -22,6 +22,8 @@ import Templates from './views/Templates'
 import ScheduleDetail from './views/ScheduleDetail'
 import ScheduleFireModal from './views/ScheduleFireModal'
 import Admin from './views/Admin'
+import Inbox from './views/Inbox'
+import TaskDetail from './views/TaskDetail'
 import Machine from './views/Machine'
 import { useScheduler } from './useScheduler'
 import { ModeProvider, homeRouteFor, useCredentialClass, useDeviceRejected, useMode } from './mode'
@@ -244,6 +246,13 @@ function ModedShell({
                 which exists for a run executed elsewhere. */}
             <Route path="devices/:deviceId/runs" element={<DeviceRuns />} />
             <Route path="devices/:deviceId/runs/:runId" element={<FleetRun />} />
+            {/* One task, nested under its machine the way runs are: the diary
+                thread, the verdict controls, and the run links live there. */}
+            <Route path="devices/:deviceId/tasks/:taskId" element={<TaskDetail />} />
+            {/* The "what needs me" page: blocked questions fleet-wide and tasks
+                awaiting a verdict. Plain HTTP reads, so it renders in a browser
+                as well as the desktop shell. */}
+            <Route path="inbox" element={<Inbox />} />
             {/* Where the fleet run view used to live. Resolves the run's machine
                 and forwards to the nested address, so links minted before the
                 move keep landing on the run. */}

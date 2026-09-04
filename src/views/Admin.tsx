@@ -5,6 +5,9 @@ import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, S
 // The runs list lives on its own page now; the pane borrows its row and its
 // reader so a run reads the same in the preview as it does in the full list.
 import { RunRow, useDeviceRuns } from './DeviceRuns'
+// The task layer's shared shapes live with the Inbox (its front door), the same
+// way the run row lives with DeviceRuns.
+import { TaskRecord, TaskStatusPill, taskIsTerminal, utcRelative } from './Inbox'
 
 // One machine in the fleet, field-for-field the backend contract for
 // GET /devices. Everything except name / rustdesk_id / notes is REPORTED by the
@@ -243,6 +246,11 @@ function Devices() {
                 }
                 onOpenRuns={() =>
                   navigate(`/devices/${encodeURIComponent(selected.device_id)}/runs`)
+                }
+                onOpenTask={(taskId) =>
+                  navigate(
+                    `/devices/${encodeURIComponent(selected.device_id)}/tasks/${encodeURIComponent(taskId)}`,
+                  )
                 }
                 onChanged={() => fetchDevices(true)}
                 onAddMachine={() => setAddingMachine(true)}
@@ -702,6 +710,7 @@ function DeviceDetail({
   isThisMachine,
   onOpenRun,
   onOpenRuns,
+  onOpenTask,
   onChanged,
   onAddMachine,
 }: {
@@ -711,6 +720,8 @@ function DeviceDetail({
   /** Leave the pane for this machine's runs page. The pane previews two; the
    *  page is the whole record. */
   onOpenRuns: () => void
+  /** Open one task's page — its diary thread and verdict controls. */
+  onOpenTask: (taskId: string) => void
   onChanged: () => void
   /** Open the mint-a-key modal. Reachable from here as well as the header
    *  because a machine that was just revoked is the single most likely thing to
@@ -877,6 +888,12 @@ function DeviceDetail({
       </Card>
 
       <NowCard device={device} onOpenRun={onOpenRun} />
+
+      {/* Under NOW because a task is the intent behind the run NOW shows: the
+          run is what the machine is doing, the task is what it was told. Also
+          where new work is handed out — the + New task modal posts for THIS
+          machine. */}
+      <TasksCard device={device} onOpenTask={onOpenTask} />
 
       {/* Directly under NOW: that card says a run exists, this one says what it
           is doing. Read the other way round they are the same machine's story in
@@ -1153,6 +1170,339 @@ function NowCard({
         </Button>
       </div>
     </Card>
+  )
+}
+
+// ───────────────────────────────────────────────────────── tasks
+
+// How many of a machine's most recent tasks the pane lists. Same reasoning as
+// RUNS_PREVIEW below: the pane is the machine's present, not its archive, and
+// an active task list is short by nature (one runs at a time).
+const TASKS_PREVIEW = 5
+
+// TASKS — the work this machine has been told to do, and the door to handing
+// it more. Each row links to the task's own page (#/devices/<id>/tasks/<id>),
+// where the diary thread and the verdict controls live; nothing is judged from
+// here. Terminal tasks are filtered out — the pane shows standing intent, and
+// the Inbox is where finished-but-unjudged work already announces itself.
+function TasksCard({
+  device,
+  onOpenTask,
+}: {
+  device: Device
+  onOpenTask: (taskId: string) => void
+}) {
+  const [tasks, setTasks] = useState<TaskRecord[] | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const resp = await fetch(
+          `${CU_BACKEND}/tasks?device_id=${encodeURIComponent(device.device_id)}&limit=50`,
+          { headers: authHeaders() },
+        )
+        if (!resp.ok) {
+          if (!cancelled) setTasks([])
+          return
+        }
+        const body = await resp.json()
+        if (cancelled) return
+        const rows: TaskRecord[] = Array.isArray(body) ? body : (body.tasks ?? [])
+        setTasks(rows.filter((t) => !taskIsTerminal(t.status)).slice(0, TASKS_PREVIEW))
+      } catch {
+        // An unlistable queue is an empty state, not an error card — the
+        // machine above is unaffected.
+        if (!cancelled) setTasks([])
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [device.device_id, nonce])
+
+  const listed = tasks !== null && tasks.length > 0
+
+  return (
+    <Card
+      title={<SectionTitle>Tasks</SectionTitle>}
+      actions={
+        <Button variant="primary" size="sm" onClick={() => setCreating(true)}>
+          + New task
+        </Button>
+      }
+      padded={!listed}
+    >
+      {/* Remounted per open, AddMachineModal's idiom: a dismissed draft must
+          not sit in state waiting to be reopened half-typed. */}
+      {creating && (
+        <NewTaskModal
+          device={device}
+          onClose={() => setCreating(false)}
+          onCreated={() => {
+            setCreating(false)
+            setNonce((n) => n + 1)
+          }}
+        />
+      )}
+
+      {tasks === null && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-3)',
+            color: 'var(--sb-text-muted)',
+          }}
+        >
+          <Spinner size={14} /> Loading tasks…
+        </div>
+      )}
+
+      {tasks !== null && tasks.length === 0 && (
+        <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+          Nothing queued or in flight. New task hands this machine work: it reads the spec back to
+          you before it starts, and only you can mark the result done.
+        </span>
+      )}
+
+      {listed &&
+        tasks.map((task, i) => (
+          <div key={task.task_id}>
+            {i > 0 && <Divider style={{ margin: 0 }} />}
+            <button
+              onClick={() => onOpenTask(task.task_id)}
+              title="Open this task — its diary thread and its controls"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--sp-3)',
+                width: '100%',
+                textAlign: 'left',
+                padding: '10px 16px',
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                color: 'var(--sb-text)',
+                font: 'inherit',
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            >
+              <TaskStatusPill status={task.status} />
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  fontSize: 'var(--fs-md)',
+                }}
+              >
+                {task.title}
+              </span>
+              <span
+                style={{
+                  fontSize: 'var(--fs-sm)',
+                  color: 'var(--sb-text-muted)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                created {utcRelative(task.created_at)}
+              </span>
+            </button>
+          </div>
+        ))}
+    </Card>
+  )
+}
+
+// New task: title + spec, and the optional workspace for repo-touching work.
+// Posts POST /tasks for THIS machine; the task is born `queued` and the worker
+// answers with its readback, which lands in the Inbox for a verdict — so the
+// modal's job ends at "queued", and it says so instead of pretending the work
+// started.
+function NewTaskModal({
+  device,
+  onClose,
+  onCreated,
+}: {
+  device: Device
+  onClose: () => void
+  onCreated: (task: TaskRecord) => void
+}) {
+  const [title, setTitle] = useState('')
+  const [spec, setSpec] = useState('')
+  const [repo, setRepo] = useState('')
+  const [branch, setBranch] = useState('')
+  const [mode, setMode] = useState<'scratch' | 'existing'>('scratch')
+  const [posting, setPosting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = useCallback(async () => {
+    setPosting(true)
+    setError(null)
+    try {
+      const body: Record<string, unknown> = {
+        device_id: device.device_id,
+        title: title.trim(),
+        spec: spec.trim(),
+      }
+      // The workspace block only exists when the task touches a repo — an
+      // empty one would fail the backend's min-length on `repo` anyway.
+      if (repo.trim()) {
+        body.workspace = {
+          repo: repo.trim(),
+          mode,
+          ...(branch.trim() ? { branch: branch.trim() } : {}),
+        }
+      }
+      const resp = await fetch(`${CU_BACKEND}/tasks`, {
+        method: 'POST',
+        headers: { ...authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!resp.ok) {
+        setError(`The task was refused (${resp.status}).`)
+        return
+      }
+      onCreated((await resp.json()) as TaskRecord)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error')
+    } finally {
+      setPosting(false)
+    }
+  }, [device.device_id, title, spec, repo, branch, mode, onCreated])
+
+  const ready = title.trim().length > 0 && spec.trim().length > 0
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="New task"
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 2000,
+        background: 'rgba(0, 0, 0, 0.72)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 'var(--sp-6)',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 560,
+          background: 'var(--sb-surface-1)',
+          border: '1px solid var(--sb-border-gold)',
+          borderRadius: 'var(--r-lg)',
+          boxShadow: 'var(--shadow-2)',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--sb-border)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-2)',
+          }}
+        >
+          <SectionTitle>New task for {displayName(device)}</SectionTitle>
+        </div>
+
+        <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+          <Field label="Title">
+            <input
+              className="agent-input"
+              style={inputStyle}
+              placeholder="what this task is, in one line"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              autoFocus
+            />
+          </Field>
+          <Field label="Spec">
+            <textarea
+              className="agent-input"
+              style={{ ...inputStyle, minHeight: 120, resize: 'vertical', lineHeight: 1.5 }}
+              placeholder="the whole ask — the worker reads this back to you before it starts"
+              value={spec}
+              onChange={(e) => setSpec(e.target.value)}
+            />
+          </Field>
+          <Field label="Repo">
+            <input
+              className="agent-input"
+              style={inputStyle}
+              placeholder="optional — only for work that touches a repo"
+              value={repo}
+              onChange={(e) => setRepo(e.target.value)}
+            />
+          </Field>
+          {repo.trim() && (
+            <>
+              <Field label="Branch">
+                <input
+                  className="agent-input"
+                  style={inputStyle}
+                  placeholder="optional — the repo's default when blank"
+                  value={branch}
+                  onChange={(e) => setBranch(e.target.value)}
+                />
+              </Field>
+              <Field label="Checkout">
+                <select
+                  className="agent-input"
+                  style={inputStyle}
+                  value={mode}
+                  onChange={(e) => setMode(e.target.value as 'scratch' | 'existing')}
+                >
+                  <option value="scratch">scratch — clone fresh</option>
+                  <option value="existing">existing — use the checkout it has</option>
+                </select>
+              </Field>
+            </>
+          )}
+
+          {error && <div className="error-message">{error}</div>}
+
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              gap: 'var(--sp-3)',
+              marginTop: 'var(--sp-2)',
+            }}
+          >
+            <span
+              style={{
+                marginRight: 'auto',
+                fontSize: 'var(--fs-sm)',
+                color: 'var(--sb-text-faint)',
+              }}
+            >
+              Queues the task — the worker's readback lands in the Inbox for your go-ahead.
+            </span>
+            <Button variant="secondary" onClick={onClose} disabled={posting}>
+              Cancel
+            </Button>
+            <Button variant="primary" onClick={submit} disabled={!ready || posting}>
+              {posting ? 'Queuing…' : 'Queue task'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }
 

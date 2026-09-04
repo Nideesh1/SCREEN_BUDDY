@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { CU_BACKEND, isTauri, safeInvoke, type CredentialClass } from '../lib'
-import { Badge, Button, Card, EmptyState, SectionTitle, Spinner } from '../ui'
+import { Badge, Button, Card, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
 import { PermissionsCard } from './Settings'
 
 // THIS MACHINE — worker mode's home, and the one screen a fleet node has.
@@ -153,6 +154,7 @@ function Machine() {
       <IdentityCard refreshKey={nonce} />
       <LinkCard refreshKey={nonce} />
       <NowCard />
+      <LocalRunsCard refreshKey={nonce} />
       {/* Readiness. The same card Settings shows, deliberately not a variant of
           it: a worker missing Screen Recording looks exactly like a worker with
           nothing to do, and nobody is sitting at it to tell the difference. */}
@@ -573,6 +575,266 @@ function NowCard() {
       {stopError && (
         <div className="error-message" style={{ marginTop: 'var(--sp-3)' }}>
           {stopError}
+        </div>
+      )}
+    </Card>
+  )
+}
+
+// ───────────────────────────────────────────────────────── recent runs (local)
+
+// RECENT RUNS (LOCAL) — the machine's own memory of past runs, read from its
+// own disk and nowhere else.
+//
+// A worker cannot show backend run history here: its device token never enters
+// the webview, and the run-history routes refuse device tokens by design. What
+// it CAN show honestly is what already lives under app_data_dir/runs/<id>/ —
+// every frame the agent saved, plus outcome.json where a run finalized on a
+// build that writes it. That record is deliberately presented as what it is:
+// timestamps are file times, older runs have no outcome at all, and the card
+// says so instead of dressing local traces up as fleet metadata.
+
+// What `local_runs` answers with (src-tauri/src/runs_local.rs `LocalRun`).
+interface LocalRun {
+  run_id: string
+  /** RFC3339, from the earliest frame's mtime. Null when no frame was saved. */
+  started_at: string | null
+  /** outcome.json's finished_at, else the latest frame's mtime. */
+  finished_at: string | null
+  /** Terminal status if the machine recorded one; null for older runs. */
+  outcome: string | null
+  error_message: string | null
+  frame_count: number
+  first_frame: string | null
+  last_frame: string | null
+}
+
+// Same conversion RunDetail.tsx uses for run screenshots: local absolute path →
+// asset-protocol URL. Null when convertFileSrc is unavailable or throws, so the
+// caller can drop the thumbnail rather than render a broken img.
+function frameSrc(path: string): string | null {
+  try {
+    return convertFileSrc(path)
+  } catch {
+    return null
+  }
+}
+
+// "When" for a row: date + time in the reader's locale, or a dash. These are
+// file mtimes, so minute precision is already flattering them.
+function formatWhen(ts: string | null): string {
+  if (!ts) return '—'
+  const ms = Date.parse(ts)
+  if (Number.isNaN(ms)) return '—'
+  return new Date(ms).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function LocalRunsCard({ refreshKey }: { refreshKey: number }) {
+  const [runs, setRuns] = useState<LocalRun[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // One row open at a time: the strip below it is the detail view, and two open
+  // rows of thumbnails turn a glanceable card into a scroll.
+  const [openId, setOpenId] = useState<string | null>(null)
+  const [frames, setFrames] = useState<Record<string, string[] | 'loading'>>({})
+
+  useEffect(() => {
+    let active = true
+    safeInvoke<LocalRun[]>('local_runs').then((res) => {
+      if (!active) return
+      if (res.ok) setRuns(res.data)
+      else setError(res.error)
+    })
+    return () => {
+      active = false
+    }
+  }, [refreshKey])
+
+  const toggle = useCallback(
+    async (runId: string) => {
+      if (openId === runId) {
+        setOpenId(null)
+        return
+      }
+      setOpenId(runId)
+      // Frames are fetched once per run and kept: the paths are immutable (a
+      // finished run's directory only ever gains an outcome.json).
+      if (frames[runId]) return
+      setFrames((prev) => ({ ...prev, [runId]: 'loading' }))
+      const res = await safeInvoke<string[]>('local_run_frames', { runId })
+      setFrames((prev) => ({ ...prev, [runId]: res.ok ? res.data : [] }))
+    },
+    [openId, frames],
+  )
+
+  // Outside the desktop app there is no disk to read — and unlike the identity
+  // card, which explains itself, an always-empty history card would only add
+  // noise to the browser-served admin panel. Render nothing.
+  if (!isTauri()) return null
+
+  return (
+    <Card title={<SectionTitle>Recent runs (local)</SectionTitle>}>
+      {/* The honesty line, before any rows: this is the machine testifying
+          about itself, not the fleet's ledger. */}
+      <p
+        style={{
+          margin: '0 0 var(--sp-3)',
+          fontSize: 'var(--fs-sm)',
+          lineHeight: 1.5,
+          color: 'var(--sb-text-faint)',
+        }}
+      >
+        What this machine remembers on its own disk — frames saved as runs happened, and
+        outcomes where it recorded one. The fleet's authoritative run history lives in the
+        operator's console.
+      </p>
+
+      {!runs && !error && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--sp-2)',
+            color: 'var(--sb-text-muted)',
+            fontSize: 'var(--fs-md)',
+          }}
+        >
+          <Spinner size={14} /> Reading local records…
+        </div>
+      )}
+
+      {error && (
+        <p style={{ margin: 0, fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+          Could not read this machine's local run records. {error}
+        </p>
+      )}
+
+      {runs && runs.length === 0 && (
+        <EmptyState icon="○" title="Nothing recorded" hint="No run has left frames on this machine's disk yet." />
+      )}
+
+      {runs && runs.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {runs.map((run, i) => {
+            const open = openId === run.run_id
+            const runFrames = frames[run.run_id]
+            return (
+              <div
+                key={run.run_id}
+                style={{ borderTop: i > 0 ? '1px solid var(--sb-border)' : undefined }}
+              >
+                <button
+                  onClick={() => toggle(run.run_id)}
+                  title={run.run_id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 'var(--sp-3)',
+                    width: '100%',
+                    padding: 'var(--sp-2) 0',
+                    border: 'none',
+                    background: 'none',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                  }}
+                >
+                  <span
+                    aria-hidden
+                    style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)', width: 10 }}
+                  >
+                    {open ? '▾' : '▸'}
+                  </span>
+                  <Badge mono>{run.run_id.slice(0, 8)}</Badge>
+                  <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)' }}>
+                    {formatWhen(run.finished_at)}
+                  </span>
+                  {/* No badge when no outcome was recorded: an absent record is
+                      a fact about this disk, not a status to invent. */}
+                  {run.outcome && <StatusPill status={run.outcome} />}
+                  <span
+                    style={{
+                      marginLeft: 'auto',
+                      fontSize: 'var(--fs-sm)',
+                      color: 'var(--sb-text-faint)',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {run.frame_count} {run.frame_count === 1 ? 'frame' : 'frames'}
+                  </span>
+                </button>
+
+                {open && (
+                  <div style={{ padding: '0 0 var(--sp-3) calc(10px + var(--sp-3))' }}>
+                    {run.error_message && (
+                      <p
+                        style={{
+                          margin: '0 0 var(--sp-2)',
+                          fontSize: 'var(--fs-sm)',
+                          lineHeight: 1.5,
+                          color: 'var(--sb-danger-bright)',
+                          overflowWrap: 'anywhere',
+                        }}
+                      >
+                        {run.error_message}
+                      </p>
+                    )}
+                    {runFrames === 'loading' && (
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--sp-2)',
+                          color: 'var(--sb-text-muted)',
+                          fontSize: 'var(--fs-sm)',
+                        }}
+                      >
+                        <Spinner size={12} /> Reading frames…
+                      </div>
+                    )}
+                    {Array.isArray(runFrames) && runFrames.length === 0 && (
+                      <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+                        No frames on disk for this run.
+                      </span>
+                    )}
+                    {Array.isArray(runFrames) && runFrames.length > 0 && (
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(96px, 1fr))',
+                          gap: 'var(--sp-2)',
+                        }}
+                      >
+                        {runFrames.map((path) => {
+                          const src = frameSrc(path)
+                          if (!src) return null
+                          return (
+                            <img
+                              key={path}
+                              src={src}
+                              alt="saved run frame"
+                              loading="lazy"
+                              style={{
+                                display: 'block',
+                                width: '100%',
+                                height: 'auto',
+                                border: '1px solid var(--sb-border)',
+                                borderRadius: 'var(--r-sm)',
+                                background: 'var(--sb-surface-2)',
+                              }}
+                            />
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </div>
       )}
     </Card>
