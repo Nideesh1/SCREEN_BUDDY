@@ -14,6 +14,9 @@ import {
   patchTaskStatus,
   taskIsTerminal,
   utcRelative,
+  QuestionChecklistRows,
+  questionChecklist,
+  questionTextWithoutChecklist,
 } from './Inbox'
 
 // TaskDetail — one task, as a page: #/devices/:deviceId/tasks/:taskId.
@@ -723,6 +726,7 @@ function DiaryEntry({
 
   if (m.type === 'question') {
     const answered = !!m.answered_by
+    const qRows = questionChecklist(m.payload)
     return (
       <div
         style={{
@@ -744,8 +748,9 @@ function DiaryEntry({
             whiteSpace: 'pre-wrap',
           }}
         >
-          {text || '(no text)'}
+          {questionTextWithoutChecklist(text ?? '', qRows.length > 0) || '(no text)'}
         </div>
+        <QuestionChecklistRows items={qRows} />
         {!answered && m.requires_reply && (
           <VerdictControls
             deviceId={deviceId}

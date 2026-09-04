@@ -1197,7 +1197,21 @@ async fn handle_task(
         device_id,
         &question_id,
         &task_id,
-        json!({ "text": text }),
+        // The original text plus the checklist as STRUCTURED rows. The text
+        // stays complete on its own (a degraded consumer loses nothing); the
+        // array is what renderers and models should read — parsing "[ ]" lines
+        // back out of prose is exactly the confusion the operator flagged.
+        json!({
+            "text": text,
+            "checklist": checklist_items(&checklist)
+                .iter()
+                .map(|it| json!({
+                    "item_id": it.item_id,
+                    "text": it.text,
+                    "approved": it.approved,
+                }))
+                .collect::<Vec<_>>(),
+        }),
         cancel,
     )
     .await

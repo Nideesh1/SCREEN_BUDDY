@@ -805,6 +805,73 @@ function VerdictTaskRow({
 
 // One blocked machine's question, with the answer controls right on it — the
 // whole point of this page is that unblocking never needs a second screen.
+// One checklist row inside a question card: read-only, mirroring the payload's
+// structured `checklist` array. Questions used to flatten these into the text
+// blob as "[ ] …" lines; the payload now carries them typed, and renderers use
+// the rows — parsing prose back into structure was the confusion this removes.
+export interface QuestionChecklistItem {
+  item_id: string
+  text: string
+  approved: boolean
+}
+
+export function QuestionChecklistRows({ items }: { items: QuestionChecklistItem[] }) {
+  if (items.length === 0) return null
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {items.map((it) => (
+        <div
+          key={it.item_id}
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 'var(--sp-2)',
+            fontSize: 'var(--fs-md)',
+            color: it.approved ? 'var(--sb-text-muted)' : 'var(--sb-text)',
+          }}
+        >
+          <span aria-hidden style={{ fontFamily: 'var(--font-mono)' }}>
+            {it.approved ? '\u2611' : '\u2610'}
+          </span>
+          <span style={{ textDecoration: it.approved ? 'line-through' : 'none' }}>{it.text}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// A question payload's structured checklist, tolerantly parsed ([] when absent
+// or malformed — older questions carry only the text blob).
+export function questionChecklist(payload: unknown): QuestionChecklistItem[] {
+  const raw = (payload as { checklist?: unknown } | null)?.checklist
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+    .map((r) => ({
+      item_id: String(r.item_id ?? ''),
+      text: String(r.text ?? ''),
+      approved: r.approved === true,
+    }))
+    .filter((r) => r.item_id && r.text)
+}
+
+// The same items also sit inside the text blob as "[ ] ..." lines (kept there
+// so a consumer without the array loses nothing). Rendering both would show
+// every criterion twice, so the prose copy — the lines plus their "Definition
+// of done" header — is stripped for display whenever the rows will be shown.
+export function questionTextWithoutChecklist(text: string, hasRows: boolean): string {
+  if (!hasRows) return text
+  return text
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim()
+      if (t.startsWith('[ ]') || t.startsWith('[done]')) return false
+      if (t.startsWith('Definition of done')) return false
+      return true
+    })
+    .join('\n')
+}
+
 function QuestionCard({
   question,
   deviceName,
@@ -819,7 +886,9 @@ function QuestionCard({
   onAnswered: () => void
 }) {
   const blocking = blockingStyle(question.blocking_for_seconds)
-  const text = typeof question.payload?.text === 'string' ? question.payload.text : ''
+  const rawText = typeof question.payload?.text === 'string' ? question.payload.text : ''
+  const rows = questionChecklist(question.payload)
+  const text = questionTextWithoutChecklist(rawText, rows.length > 0)
   return (
     <div
       style={{
@@ -875,6 +944,8 @@ function QuestionCard({
       >
         {text || '(the question carried no text)'}
       </div>
+
+      <QuestionChecklistRows items={rows} />
 
       <VerdictControls
         deviceId={question.device_id}
