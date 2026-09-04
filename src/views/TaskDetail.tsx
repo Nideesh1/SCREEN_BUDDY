@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime } from '../lib'
-import { Badge, Button, Card, ConfirmModal, SectionTitle, Spinner } from '../ui'
+import { Badge, Button, Card, ConfirmModal, IconButton, SectionTitle, Spinner } from '../ui'
 import { DeviceDot, deviceLabel, deviceLine, useDevice } from './DeviceRuns'
 import {
+  ChecklistItem,
+  SendBackModal,
   TaskRecord,
   TaskStatusPill,
   VerdictControls,
   newMsgId,
   parseUtcMs,
+  patchTaskStatus,
   taskIsTerminal,
   utcRelative,
 } from './Inbox'
@@ -72,7 +75,8 @@ function TaskDetail() {
   // The incremental cursor: highest seq this page holds. A ref, not state — the
   // poll reads it without wanting to be rebuilt every time a message lands.
   const sinceSeqRef = useRef(0)
-  const [confirming, setConfirming] = useState<'done' | 'kill' | null>(null)
+  const [confirming, setConfirming] = useState<'approve' | 'kill' | null>(null)
+  const [sendingBack, setSendingBack] = useState(false)
   const [patching, setPatching] = useState(false)
   const [patchError, setPatchError] = useState<string | null>(null)
 
@@ -112,10 +116,18 @@ function TaskDetail() {
         if (batch.length === 0) return
         sinceSeqRef.current = batch[batch.length - 1].seq
         setMessages((prev) => {
+          // Dedupe by seq at merge time. Seq is the channel's primary key, and
+          // two reads CAN return the same rows: StrictMode's doubled mount
+          // effect, or an onAnswered/onSent refresh racing the poll — both
+          // in flight from the same cursor before either advances it. Keying
+          // the merge on seq makes a re-delivered page a no-op whatever the
+          // cause, and the sort keeps order with the log even then.
+          const bySeq = new Map<number, DiaryMessage>()
+          for (const m of [...prev, ...batch]) bySeq.set(m.seq, m)
+          const merged = [...bySeq.values()].sort((a, b) => a.seq - b.seq)
           // A verdict landing updates its question's answered_by on a row this
           // page already holds, so re-derive that join locally: the question is
           // answered by whatever verdict names it.
-          const merged = [...prev, ...batch]
           const answeredBy = new Map<string, string>()
           for (const m of merged) {
             if (m.type === 'verdict' && m.in_reply_to) answeredBy.set(m.in_reply_to, m.msg_id)
@@ -157,43 +169,34 @@ function TaskDetail() {
     (m) => m.task_id === taskId || (m.in_reply_to !== null && taskMsgIds.has(m.in_reply_to)),
   )
 
+  // All three verbs go through the shared PATCH (patchTaskStatus, which the
+  // Inbox rows use too). A failure re-reads the task — a 409 means it moved
+  // under us and the page should show where it actually is.
   const patchStatus = useCallback(
-    async (status: 'done' | 'killed') => {
+    async (body: { status: 'done' | 'killed' | 'queued'; note?: string }) => {
       setConfirming(null)
       setPatching(true)
       setPatchError(null)
-      try {
-        const resp = await fetch(`${CU_BACKEND}/tasks/${encodeURIComponent(taskId)}`, {
-          method: 'PATCH',
-          headers: { ...authHeaders(), 'content-type': 'application/json' },
-          body: JSON.stringify({ status }),
-        })
-        if (!resp.ok) {
-          // A 409 names both states ("illegal transition: X -> Y") — worth
-          // surfacing verbatim, because it means the task moved under us.
-          let detail = `(${resp.status})`
-          try {
-            const body = await resp.json()
-            if (typeof body?.detail === 'string') detail = body.detail
-          } catch {
-            // keep the status code
-          }
-          setPatchError(`Could not update the task: ${detail}`)
-          fetchTask(true)
-          return
-        }
-        setTask((await resp.json()) as TaskRecord)
-      } catch (err) {
-        setPatchError(err instanceof Error ? err.message : 'Network error')
-      } finally {
-        setPatching(false)
+      const out = await patchTaskStatus(taskId, body)
+      setPatching(false)
+      setSendingBack(false)
+      if (!out.ok) {
+        setPatchError(out.message)
+        fetchTask(true)
+        return
       }
+      setTask(out.task)
+      // A send-back writes into the diary too (the directive is part of the
+      // conversation); pick it up now rather than at the next poll tick.
+      fetchDiary()
     },
-    [taskId, fetchTask],
+    [taskId, fetchTask, fetchDiary],
   )
 
   const status = task?.status
-  const canKill = status === 'queued' || status === 'readback' || status === 'running'
+  // Kill is reachable from every non-terminal state — but as a tertiary act:
+  // ending a task's life is not a verdict on its claim.
+  const canKill = task !== null && !taskIsTerminal(status)
   const canJudge = status === 'awaiting_verdict'
 
   return (
@@ -207,17 +210,25 @@ function TaskDetail() {
         gap: 'var(--sp-4)',
       }}
     >
-      {confirming === 'done' && task && (
+      {confirming === 'approve' && task && (
         <ConfirmModal
-          title={`Mark “${task.title}” done?`}
+          title={`Approve “${task.title}”?`}
           body={[
-            'Done is your judgment that the work is actually finished — the worker can claim it, but only you can say it.',
+            'Approve is your judgment that the claim holds — the worker says the work is finished, and you agree.',
             'The task closes for good; nothing about the machine changes.',
           ]}
-          confirmLabel="Mark done"
+          confirmLabel="Approve"
           busy={patching}
-          onConfirm={() => patchStatus('done')}
+          onConfirm={() => patchStatus({ status: 'done' })}
           onCancel={() => setConfirming(null)}
+        />
+      )}
+      {sendingBack && task && (
+        <SendBackModal
+          taskTitle={task.title}
+          busy={patching}
+          onSend={(note) => patchStatus({ status: 'queued', note })}
+          onCancel={() => setSendingBack(false)}
         />
       )}
       {confirming === 'kill' && task && (
@@ -230,7 +241,7 @@ function TaskDetail() {
           confirmLabel="Kill task"
           danger
           busy={patching}
-          onConfirm={() => patchStatus('killed')}
+          onConfirm={() => patchStatus({ status: 'killed' })}
           onCancel={() => setConfirming(null)}
         />
       )}
@@ -292,19 +303,75 @@ function TaskDetail() {
             )}
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 'var(--sp-2)', flexShrink: 0 }}>
+        {/* The verdict pair judges the CLAIM: Approve accepts it, Send back
+            re-queues the task with a note the worker re-reads against. Kill —
+            ending the task's life — is deliberately a small tertiary act off
+            to the side, in every non-terminal state: it is not one of the
+            claim's answers, and it must never read like one. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', flexShrink: 0 }}>
           {canJudge && (
-            <Button variant="primary" size="sm" onClick={() => setConfirming('done')} disabled={patching}>
-              ✓ Mark done
+            <Button variant="primary" size="sm" onClick={() => setConfirming('approve')} disabled={patching}>
+              ✓ Approve
             </Button>
           )}
-          {(canJudge || canKill) && (
-            <Button variant="danger" size="sm" onClick={() => setConfirming('kill')} disabled={patching}>
-              ✕ Kill
+          {canJudge && (
+            <Button variant="secondary" size="sm" onClick={() => setSendingBack(true)} disabled={patching}>
+              ✕ Send back
+            </Button>
+          )}
+          {canKill && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setConfirming('kill')}
+              disabled={patching}
+              title="End this task without a verdict — cannot be undone"
+              style={{ color: 'var(--sb-text-faint)' }}
+            >
+              Kill
             </Button>
           )}
         </div>
       </div>
+
+      {/* The standing directive from the last send-back, kept next to the
+          status it explains: a re-queued task looks like any queued task, and
+          this callout is what says it is on its SECOND lap and why. */}
+      {task && task.last_directive && (
+        <div
+          style={{
+            border: '1px solid var(--sb-border-gold)',
+            background: 'var(--sb-gold-dim)',
+            borderRadius: 'var(--r-md)',
+            padding: 'var(--sp-3)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 'var(--fs-xs)',
+              fontWeight: 600,
+              textTransform: 'uppercase',
+              letterSpacing: '1px',
+              color: 'var(--sb-gold)',
+            }}
+          >
+            sent back with
+          </span>
+          <span
+            style={{
+              fontSize: 'var(--fs-md)',
+              lineHeight: 1.6,
+              color: 'var(--sb-text)',
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            {task.last_directive}
+          </span>
+        </div>
+      )}
 
       {patchError && (
         <Card>
@@ -335,6 +402,10 @@ function TaskDetail() {
       )}
 
       {task && <SpecCard task={task} />}
+
+      {/* Between the spec (what was asked) and the diary (what happened): the
+          checklist is the bridge — the ask broken into judgeable criteria. */}
+      {task && <ChecklistCard task={task} onChanged={() => fetchTask(true)} />}
 
       {task && (
         <Card title={<SectionTitle>Diary</SectionTitle>}>
@@ -421,6 +492,187 @@ function SpecCard({ task }: { task: TaskRecord }) {
             {ws.branch ? ` @ ${ws.branch}` : ''} · {ws.mode}
           </Badge>
         )}
+      </div>
+    </Card>
+  )
+}
+
+// CHECKLIST — the task's definition of done, one judgeable criterion per row.
+//
+// Deliberately NO edit-in-place anywhere: an edit is a delete + add, so the
+// record never lies about what a criterion said when the worker read it. That
+// is also why delete asks for no confirmation — deletion is itself recorded by
+// absence, and add/delete are meant to be frictionless enough that reshaping
+// the definition of done mid-task costs nothing.
+//
+// Every mutation POSTs and then re-reads the task (`onChanged`): the backend
+// copy is the only copy, and rendering our guess instead of its answer is how
+// two open consoles would drift.
+function ChecklistCard({ task, onChanged }: { task: TaskRecord; onChanged: () => void }) {
+  // Defensive on shape: the checklist fields land with parallel backend work,
+  // so an older serializer hands us undefined (or its old opaque slot).
+  const items: ChecklistItem[] = Array.isArray(task.checklist) ? task.checklist : []
+  const [draft, setDraft] = useState('')
+  // The item being mutated ('' while adding) — one at a time keeps the
+  // re-read races away without optimistic state to reconcile.
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // A finished task's checklist is a record, not a form: the criteria are
+  // part of what the verdict judged, so nothing may change after the end.
+  const readonly = taskIsTerminal(task.status)
+
+  const call = useCallback(
+    async (path: string, init: RequestInit, busy: string) => {
+      setBusyId(busy)
+      setError(null)
+      try {
+        const resp = await fetch(
+          `${CU_BACKEND}/tasks/${encodeURIComponent(task.task_id)}/checklist${path}`,
+          { ...init, headers: { ...authHeaders(), 'content-type': 'application/json' } },
+        )
+        if (!resp.ok) {
+          setError(`The checklist change was refused (${resp.status}).`)
+          return false
+        }
+        onChanged()
+        return true
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Network error')
+        return false
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [task.task_id, onChanged],
+  )
+
+  const add = useCallback(async () => {
+    const text = draft.trim()
+    if (!text) return
+    if (await call('', { method: 'POST', body: JSON.stringify({ text }) }, '')) setDraft('')
+  }, [draft, call])
+
+  const approved = items.filter((i) => i.approved).length
+
+  return (
+    <Card
+      title={
+        <>
+          <SectionTitle>Checklist</SectionTitle>
+          {/* The count is the card's one-glance answer: how much of the
+              definition of done the operator has actually signed off. */}
+          {items.length > 0 && (
+            <Badge mono tone={approved === items.length ? 'success' : 'neutral'} style={{ marginLeft: 8 }}>
+              {approved}/{items.length}
+            </Badge>
+          )}
+        </>
+      }
+    >
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+        {items.length === 0 && (
+          <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+            {readonly
+              ? 'This task carried no checklist.'
+              : 'No criteria yet — each one you add becomes part of what the worker reads back and what you judge at the verdict.'}
+          </span>
+        )}
+        {items.map((item) => (
+          <div
+            key={item.item_id}
+            style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--sp-2)' }}
+          >
+            <button
+              onClick={() => call(`/${encodeURIComponent(item.item_id)}/${item.approved ? 'unapprove' : 'approve'}`, { method: 'POST' }, item.item_id)}
+              disabled={readonly || busyId !== null}
+              aria-pressed={item.approved}
+              title={
+                readonly
+                  ? 'The task is closed — the checklist is a record now'
+                  : item.approved
+                    ? 'Withdraw approval of this criterion'
+                    : 'Approve this criterion as met'
+              }
+              style={{
+                width: 18,
+                height: 18,
+                flexShrink: 0,
+                marginTop: 2,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: 12,
+                lineHeight: 1,
+                padding: 0,
+                color: '#0A0A0A',
+                background: item.approved ? 'var(--sb-gold)' : 'transparent',
+                border: `1px solid ${item.approved ? 'var(--sb-gold)' : 'var(--sb-border)'}`,
+                borderRadius: 4,
+                cursor: readonly ? 'default' : 'pointer',
+              }}
+            >
+              {item.approved ? '✓' : ''}
+            </button>
+            <span
+              title={item.added_at ? `added ${utcRelative(item.added_at)}` : undefined}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                fontSize: 'var(--fs-md)',
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                color: item.approved ? 'var(--sb-text-muted)' : 'var(--sb-text)',
+                textDecoration: item.approved ? 'line-through' : 'none',
+              }}
+            >
+              {item.text}
+            </span>
+            {!readonly && (
+              <IconButton
+                size={22}
+                title="Delete this criterion — to reword one, delete it and add it again"
+                disabled={busyId !== null}
+                onClick={() => call(`/${encodeURIComponent(item.item_id)}`, { method: 'DELETE' }, item.item_id)}
+              >
+                ✕
+              </IconButton>
+            )}
+          </div>
+        ))}
+
+        {!readonly && (
+          <div style={{ display: 'flex', gap: 'var(--sp-2)', marginTop: items.length > 0 ? 'var(--sp-2)' : 0 }}>
+            <input
+              className="agent-input"
+              style={{
+                flex: 1,
+                minWidth: 0,
+                boxSizing: 'border-box',
+                padding: '8px 11px',
+                fontFamily: 'inherit',
+                fontSize: 'var(--fs-base)',
+                background: 'var(--sb-surface-3)',
+                color: 'var(--sb-text)',
+                border: '1px solid var(--sb-border)',
+                borderRadius: 'var(--r-sm)',
+              }}
+              placeholder="add a criterion — Enter adds it"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  add()
+                }
+              }}
+              disabled={busyId !== null}
+            />
+            <Button variant="secondary" size="sm" onClick={add} disabled={busyId !== null || !draft.trim()}>
+              {busyId === '' ? 'Adding…' : 'Add'}
+            </Button>
+          </div>
+        )}
+        {error && <div className="error-message">{error}</div>}
       </div>
     </Card>
   )

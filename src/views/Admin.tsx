@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime, safeInvoke } from '../lib'
-import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner } from '../ui'
+import { Badge, Button, Card, ConfirmModal, Divider, EmptyState, IconButton, SectionTitle, Spinner } from '../ui'
 // The runs list lives on its own page now; the pane borrows its row and its
 // reader so a run reads the same in the preview as it does in the full list.
 import { RunRow, useDeviceRuns } from './DeviceRuns'
@@ -1339,8 +1339,19 @@ function NewTaskModal({
   const [repo, setRepo] = useState('')
   const [branch, setBranch] = useState('')
   const [mode, setMode] = useState<'scratch' | 'existing'>('scratch')
+  // The definition-of-done builder: criteria typed one at a time, Enter
+  // appends. Local strings until submit — items only get ids server-side.
+  const [checklist, setChecklist] = useState<string[]>([])
+  const [checkDraft, setCheckDraft] = useState('')
   const [posting, setPosting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const addCriterion = useCallback(() => {
+    const text = checkDraft.trim()
+    if (!text) return
+    setChecklist((prev) => [...prev, text])
+    setCheckDraft('')
+  }, [checkDraft])
 
   const submit = useCallback(async () => {
     setPosting(true)
@@ -1360,6 +1371,14 @@ function NewTaskModal({
           ...(branch.trim() ? { branch: branch.trim() } : {}),
         }
       }
+      // A criterion typed but not yet Entered still counts — losing it to a
+      // missed keystroke is the kind of thing nobody notices until the worker
+      // reads back a definition of done with a hole in it. Only sent when the
+      // builder was used at all: the checklist edge lands with parallel
+      // backend work, and TaskCreate's extra="forbid" must not break a plain
+      // title+spec task against a backend that predates it.
+      const criteria = [...checklist, ...(checkDraft.trim() ? [checkDraft.trim()] : [])]
+      if (criteria.length > 0) body.checklist = criteria
       const resp = await fetch(`${CU_BACKEND}/tasks`, {
         method: 'POST',
         headers: { ...authHeaders(), 'content-type': 'application/json' },
@@ -1375,7 +1394,7 @@ function NewTaskModal({
     } finally {
       setPosting(false)
     }
-  }, [device.device_id, title, spec, repo, branch, mode, onCreated])
+  }, [device.device_id, title, spec, repo, branch, mode, checklist, checkDraft, onCreated])
 
   const ready = title.trim().length > 0 && spec.trim().length > 0
 
@@ -1438,6 +1457,58 @@ function NewTaskModal({
               value={spec}
               onChange={(e) => setSpec(e.target.value)}
             />
+          </Field>
+          {/* The checklist builder mirrors the task page's card: append and
+              remove only, no editing a typed criterion in place — reword by
+              removing and re-adding, so what gets queued is always exactly
+              what was typed last. */}
+          <Field label="Checklist">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+              {checklist.map((item, i) => (
+                <div
+                  // Index keys are fine here: the list only appends and
+                  // removes, and the rows hold no state of their own.
+                  key={i}
+                  style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--sp-2)' }}
+                >
+                  <span style={{ color: 'var(--sb-text-faint)', flexShrink: 0, lineHeight: 1.5 }}>
+                    ○
+                  </span>
+                  <span
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      fontSize: 'var(--fs-md)',
+                      lineHeight: 1.5,
+                      color: 'var(--sb-text)',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {item}
+                  </span>
+                  <IconButton
+                    size={22}
+                    title="Remove this criterion"
+                    onClick={() => setChecklist((prev) => prev.filter((_, j) => j !== i))}
+                  >
+                    ✕
+                  </IconButton>
+                </div>
+              ))}
+              <input
+                className="agent-input"
+                style={inputStyle}
+                placeholder="optional — a criterion of done, Enter adds it"
+                value={checkDraft}
+                onChange={(e) => setCheckDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    addCriterion()
+                  }
+                }}
+              />
+            </div>
           </Field>
           <Field label="Repo">
             <input

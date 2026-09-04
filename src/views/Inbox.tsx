@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime } from '../lib'
-import { Button, Card, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
+import { Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
 
 // Inbox — the "what needs me" page.
 //
@@ -19,6 +19,16 @@ import { Button, Card, Divider, EmptyState, SectionTitle, Spinner, StatusPill } 
 // because this page is the task layer's front door — TaskDetail and the Devices
 // pane import from it the way Admin imports RunRow from DeviceRuns.
 
+// One criterion of a task's definition of done. Items are append-and-delete
+// only — there is deliberately no edit anywhere: a criterion the worker read
+// must stay verbatim in the record, and a change of mind is a delete + add.
+export interface ChecklistItem {
+  item_id: string
+  text: string
+  approved: boolean
+  added_at: string | null
+}
+
 // One task, field-for-field the backend contract (routers/tasks.py::_serialize).
 export interface TaskRecord {
   task_id: string
@@ -35,6 +45,13 @@ export interface TaskRecord {
   } | null
   status: string
   started_by: string
+  // Optional because the definition-of-done fields land with the checklist
+  // backend work: an older serializer (or an older record) simply omits them,
+  // and the UI must read that as "no checklist" rather than crash.
+  checklist?: ChecklistItem[] | null
+  // The operator's note from the last send-back — the standing directive the
+  // worker re-reads the task against. Present only after a send-back.
+  last_directive?: string | null
   run_ids: string[]
   created_at: string | null
   started_at: string | null
@@ -219,6 +236,158 @@ export function VerdictControls({
         </Button>
       </div>
       {notice && <div className="error-message">{notice}</div>}
+    </div>
+  )
+}
+
+export type TaskPatchOutcome = { ok: true; task: TaskRecord } | { ok: false; message: string }
+
+// Move a task through its lifecycle. `note` rides along only on the send-back
+// edge (awaiting_verdict -> queued, a backend edge landing in parallel with
+// this UI; the agreed body is `{status: "queued", note}`): the backend records
+// it as the task's `last_directive`, and the worker reads the task back again
+// against the updated checklist with the note in hand. Shared between the
+// Inbox rows and TaskDetail so the same verb PATCHes identically everywhere.
+export async function patchTaskStatus(
+  taskId: string,
+  body: { status: 'done' | 'killed' | 'queued'; note?: string },
+): Promise<TaskPatchOutcome> {
+  try {
+    const resp = await fetch(`${CU_BACKEND}/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!resp.ok) {
+      // A 409 names both states ("illegal transition: X -> Y") — worth
+      // surfacing verbatim, because it means the task moved under us.
+      let detail = `(${resp.status})`
+      try {
+        const parsed = await resp.json()
+        if (typeof parsed?.detail === 'string') detail = parsed.detail
+      } catch {
+        // keep the status code
+      }
+      return { ok: false, message: `Could not update the task: ${detail}` }
+    }
+    return { ok: true, task: (await resp.json()) as TaskRecord }
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : 'Network error' }
+  }
+}
+
+// The "send back" half of the verdict pair. Not ConfirmModal, because the note
+// is the point: a task sent back without a directive hands the worker the same
+// checklist it already failed — the note is what changes on the re-read, so it
+// is required. Shared with TaskDetail so the verb behaves identically wherever
+// the claim is judged.
+export function SendBackModal({
+  taskTitle,
+  busy,
+  onSend,
+  onCancel,
+}: {
+  taskTitle: string
+  busy?: boolean
+  onSend: (note: string) => void
+  onCancel: () => void
+}) {
+  const [note, setNote] = useState('')
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onCancel])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Send “${taskTitle}” back`}
+      onClick={onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 2000,
+        background: 'rgba(0, 0, 0, 0.72)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 'var(--sp-6)',
+      }}
+    >
+      <div
+        // The backdrop closes; the card must not close through it.
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%',
+          maxWidth: 460,
+          background: 'var(--sb-surface-1)',
+          border: '1px solid var(--sb-border-gold)',
+          borderRadius: 'var(--r-lg)',
+          boxShadow: 'var(--shadow-2)',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--sb-border)',
+            fontSize: 'var(--fs-lg)',
+            fontWeight: 700,
+            color: 'var(--sb-text)',
+          }}
+        >
+          Send “{taskTitle}” back?
+        </div>
+        <div style={{ padding: 'var(--sp-5) 20px', display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+          <p style={{ margin: 0, fontSize: 'var(--fs-md)', lineHeight: 1.6, color: 'var(--sb-text-muted)' }}>
+            The task returns to the worker&rsquo;s queue. It will read the task back to you again —
+            against the updated checklist, with your note in hand.
+          </p>
+          <textarea
+            className="agent-input"
+            autoFocus
+            style={{
+              boxSizing: 'border-box',
+              width: '100%',
+              minHeight: 80,
+              resize: 'vertical',
+              padding: '9px 11px',
+              fontFamily: 'inherit',
+              fontSize: 'var(--fs-base)',
+              lineHeight: 1.5,
+              background: 'var(--sb-surface-3)',
+              color: 'var(--sb-text)',
+              border: '1px solid var(--sb-border)',
+              borderRadius: 'var(--r-sm)',
+            }}
+            placeholder="what to change before it tries again"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={busy}
+          />
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'flex-end',
+            gap: 'var(--sp-3)',
+            padding: '12px 20px',
+            borderTop: '1px solid var(--sb-border)',
+          }}
+        >
+          <Button variant="secondary" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => onSend(note.trim())} disabled={busy || !note.trim()}>
+            {busy ? 'Sending…' : '✕ Send back'}
+          </Button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -500,53 +669,135 @@ function Inbox() {
             {tasks.map((task, i) => (
               <div key={task.task_id}>
                 {i > 0 && <Divider style={{ margin: 0 }} />}
-                <button
-                  onClick={() => openTask(task.device_id, task.task_id)}
-                  title="Open this task — its diary, its runs, and the verdict controls"
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 'var(--sp-3)',
-                    width: '100%',
-                    textAlign: 'left',
-                    padding: '10px 16px',
-                    background: 'transparent',
-                    border: 'none',
-                    cursor: 'pointer',
-                    color: 'var(--sb-text)',
-                    font: 'inherit',
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--sb-gold-dim)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                >
-                  <TaskStatusPill status={task.status} />
-                  <span
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                      fontSize: 'var(--fs-md)',
-                    }}
-                  >
-                    {task.title}
-                  </span>
-                  <span
-                    style={{
-                      fontSize: 'var(--fs-sm)',
-                      color: 'var(--sb-text-muted)',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {deviceName(task.device_id)} · started {utcRelative(task.started_at)}
-                  </span>
-                  <span style={{ color: 'var(--sb-text-muted)' }}>→</span>
-                </button>
+                <VerdictTaskRow
+                  task={task}
+                  deviceName={deviceName(task.device_id)}
+                  onOpen={() => openTask(task.device_id, task.task_id)}
+                  onChanged={() => fetchAll(true)}
+                />
               </div>
             ))}
           </Card>
         </>
+      )}
+    </div>
+  )
+}
+
+// One task claiming to be finished, judged from the row itself. The verdict
+// pair is Approve / Send back — the operator is judging a CLAIM, and those are
+// the claim's two answers ("yes, it holds" / "no, go again with this note").
+// Kill exists too, but as a tertiary act on the task page: ending a task's
+// life is not a verdict on its claim, and does not belong on this row.
+function VerdictTaskRow({
+  task,
+  deviceName,
+  onOpen,
+  onChanged,
+}: {
+  task: TaskRecord
+  deviceName: string
+  onOpen: () => void
+  onChanged: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const [sendingBack, setSendingBack] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+
+  const patch = useCallback(
+    async (body: { status: 'done' | 'queued'; note?: string }) => {
+      setBusy(true)
+      setNotice(null)
+      const out = await patchTaskStatus(task.task_id, body)
+      setBusy(false)
+      setConfirming(false)
+      setSendingBack(false)
+      if (!out.ok) setNotice(out.message)
+      // Refresh either way: success moves the task off this list, and a 409
+      // means it moved under us — both are answered by re-reading the queue.
+      onChanged()
+    },
+    [task.task_id, onChanged],
+  )
+
+  return (
+    <div>
+      {confirming && (
+        <ConfirmModal
+          title={`Approve “${task.title}”?`}
+          body={[
+            'Approve is your judgment that the claim holds — the worker says the work is finished, and you agree.',
+            'The task closes for good; nothing about the machine changes.',
+          ]}
+          confirmLabel="Approve"
+          busy={busy}
+          onConfirm={() => patch({ status: 'done' })}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+      {sendingBack && (
+        <SendBackModal
+          taskTitle={task.title}
+          busy={busy}
+          onSend={(note) => patch({ status: 'queued', note })}
+          onCancel={() => setSendingBack(false)}
+        />
+      )}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--sp-3)',
+          padding: '10px 16px',
+        }}
+      >
+        <TaskStatusPill status={task.status} />
+        {/* The title is the door to the full page (diary, checklist, kill);
+            the verbs live beside it so judging never needs a second screen. */}
+        <button
+          onClick={onOpen}
+          title="Open this task — its diary, checklist and full controls"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            textAlign: 'left',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            fontSize: 'var(--fs-md)',
+            color: 'var(--sb-text)',
+            background: 'none',
+            border: 'none',
+            padding: 0,
+            cursor: 'pointer',
+            font: 'inherit',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--sb-gold)')}
+          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--sb-text)')}
+        >
+          {task.title} <span style={{ color: 'var(--sb-text-muted)' }}>→</span>
+        </button>
+        <span
+          style={{
+            fontSize: 'var(--fs-sm)',
+            color: 'var(--sb-text-muted)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {deviceName} · started {utcRelative(task.started_at)}
+        </span>
+        <Button variant="primary" size="sm" disabled={busy} onClick={() => setConfirming(true)}>
+          ✓ Approve
+        </Button>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => setSendingBack(true)}>
+          ✕ Send back
+        </Button>
+      </div>
+      {notice && (
+        <div className="error-message" style={{ margin: '0 16px 10px' }}>
+          {notice}
+        </div>
       )}
     </div>
   )

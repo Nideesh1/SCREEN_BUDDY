@@ -19,11 +19,13 @@
 //! Two rules shape everything here:
 //!
 //!   1. msg_ids are DETERMINISTIC wherever a message describes a fact that can
-//!      be re-derived (`readback-{task_id}`, `receipt-{msg_id}`,
+//!      be re-derived (`readback-{task_id}[-g{hash}]`, `receipt-{msg_id}`,
 //!      `outcome-{run_id}`). The backend replays a known msg_id as the original
 //!      row, so a crash-and-redeliver cycle re-sends the same message and the
 //!      log stays clean — idempotency is carried by the NAME, not by local
-//!      state that a crash would lose.
+//!      state that a crash would lose. The `-g{hash}` suffix exists because a
+//!      SENT-BACK task (awaiting_verdict→queued with a `last_directive`) is a
+//!      NEW question, not a replay of the old one — see `generation_suffix`.
 //!
 //!   2. The server cursor is advanced only AFTER the turn that consumed a batch
 //!      has actually completed. A crash between fetch and completion therefore
@@ -79,6 +81,16 @@ const DRAIN_LIMIT: usize = 500;
 /// the channel payload cap is 16KB serialized; the readback is a comprehension
 /// check, not an archive — the operator wrote the spec and has it open.
 const READBACK_SPEC_CHARS: usize = 2000;
+
+/// Bounds for the checklist and send-back note inside the readback, same 16KB
+/// payload-cap reasoning as READBACK_SPEC_CHARS. Worst case the readback text
+/// is ~2000 (spec) + ~1200 (checklist) + ~500 (directive) + ~300 (fixed lines)
+/// ≈ 4000 chars — comfortably inside the cap even at 4 bytes/char. The RUN
+/// prompt is deliberately NOT truncated (see `task_run_spec`): the spec is
+/// server-capped and the model, not the channel, is that budget's owner.
+const READBACK_CHECKLIST_CHARS: usize = 1200;
+const READBACK_CHECKLIST_ITEM_CHARS: usize = 200;
+const READBACK_DIRECTIVE_CHARS: usize = 500;
 
 // ---- managed state ---------------------------------------------------------
 
@@ -447,6 +459,84 @@ fn workspace_summary(workspace: &Value) -> Option<String> {
     Some(line)
 }
 
+/// One checklist entry as this module reasons about it. The wire shape is
+/// `[{item_id, text, approved, added_at}]`; only these three fields matter
+/// here — the worker READS the checklist and never writes it (add/delete/
+/// approve are operator-only moves).
+#[derive(Debug, PartialEq)]
+pub struct ChecklistItem {
+    pub item_id: String,
+    pub text: String,
+    pub approved: bool,
+}
+
+/// Parse a task's `checklist` value. Liberal on the envelope for the same
+/// reason `payload_text` is: the contract is a bare array, but a `{items: []}`
+/// wrapper from an older serializer should degrade to the items, not to a
+/// silently checklist-less readback. Entries without text are skipped —
+/// there is nothing to echo or to owe.
+fn checklist_items(checklist: &Value) -> Vec<ChecklistItem> {
+    let arr = checklist
+        .as_array()
+        .or_else(|| checklist.get("items").and_then(|i| i.as_array()));
+    let Some(arr) = arr else { return Vec::new() };
+    arr.iter()
+        .filter_map(|it| {
+            let text = it.get("text").and_then(|t| t.as_str())?;
+            Some(ChecklistItem {
+                item_id: it.get("item_id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
+                text: text.to_string(),
+                approved: it.get("approved").and_then(|a| a.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// The checklist as readback lines — `[done]` for items the operator already
+/// approved (approvals persist across send-backs; only `[ ]` items are still
+/// owed), or None when the task has no checklist. Bounded per item and in
+/// total: the readback is a comprehension check, not an archive.
+pub fn checklist_readback_lines(checklist: &Value) -> Option<String> {
+    let items = checklist_items(checklist);
+    if items.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = items
+        .iter()
+        .map(|it| {
+            let mark = if it.approved { "[done]" } else { "[ ]" };
+            format!("{mark} {}", truncate_chars(&it.text, READBACK_CHECKLIST_ITEM_CHARS))
+        })
+        .collect();
+    Some(truncate_chars(&lines.join("\n"), READBACK_CHECKLIST_CHARS))
+}
+
+/// The `-g{n}` msg_id suffix for a task's readback question (empty on a first
+/// pickup). WHY: the backend replays a known msg_id as the ORIGINAL row —
+/// including the verdict that already answered it — so a sent-back task
+/// re-posting bare `readback-{task_id}` would inherit the PRE-send-back
+/// approval and start work without a fresh confirm, silently defeating the
+/// send-back. The server bumps `sent_back_count` atomically on every
+/// send-back precisely to be this generation number: unambiguous even when
+/// two consecutive send-backs carry a byte-identical note and unchanged
+/// approvals (the case a content hash cannot tell apart — this replaced an
+/// earlier directive-hash scheme for exactly that residue). A crash mid-wait
+/// re-reads the same counter from the same task row and correctly REPLAYS its
+/// own question — idempotency stays carried by the name.
+fn generation_suffix(sent_back_count: u64) -> String {
+    if sent_back_count == 0 {
+        return String::new();
+    }
+    format!("-g{sent_back_count}")
+}
+
+/// The deterministic msg_id for a task's readback question — bare on a first
+/// pickup (unchanged from v1), generation-suffixed after a send-back. See
+/// `generation_suffix` for the WHY.
+pub fn readback_msg_id(task_id: &str, sent_back_count: u64) -> String {
+    format!("readback-{task_id}{}", generation_suffix(sent_back_count))
+}
+
 /// Assemble the readback text — the worker's echo of what it believes it was
 /// asked to do, posted as the `question` the operator must answer before any
 /// work starts.
@@ -457,10 +547,18 @@ fn workspace_summary(workspace: &Value) -> Option<String> {
 /// "did the right task reach the right machine with the right configuration",
 /// which an echo answers exactly; "did the agent UNDERSTAND the spec" needs a
 /// model in the loop and is a later phase's readback.
+///
+/// `checklist` is the pre-rendered lines from `checklist_readback_lines`
+/// (echoed so the operator confirms which items still gate `done`), and
+/// `last_directive` is the operator's own send-back note — echoed back
+/// labeled as such, because on a re-readback THAT note is what the operator
+/// most needs to see restated.
 pub fn readback_text(
     title: &str,
     spec: &str,
     workspace: Option<&str>,
+    checklist: Option<&str>,
+    last_directive: Option<&str>,
     model: &str,
     endpoint_base: &str,
 ) -> String {
@@ -473,11 +571,69 @@ pub fn readback_text(
     if let Some(ws) = workspace {
         text.push_str(&format!("\nWorkspace: {ws}"));
     }
+    if let Some(cl) = checklist {
+        text.push_str(&format!(
+            "\nDefinition of done ([done] = already approved by the operator):\n{cl}"
+        ));
+    }
+    if let Some(d) = last_directive.filter(|d| !d.trim().is_empty()) {
+        text.push_str(&format!(
+            "\nOperator's note from sending this task back: {}",
+            truncate_chars(d.trim(), READBACK_DIRECTIVE_CHARS)
+        ));
+    }
     text.push_str(&format!(
         "\nThis machine will drive {model} at {endpoint_base}.\n\
          Reply with a verdict: anything without an explicit rejection approves."
     ));
     text
+}
+
+/// The spec as `start_run_internal` receives it: the operator's spec verbatim,
+/// then — only when the task carries them — a clearly delimited section with
+/// the definition of done and the send-back note. The model must see all
+/// three or a sent-back task re-runs the ORIGINAL ask: unapproved items are
+/// the goals still owed, approved ones are named as already accepted (redoing
+/// them wastes the run and can un-do accepted work), and the send-back note
+/// is the priority instruction because it is the operator's freshest word.
+/// Untruncated on purpose — see READBACK_CHECKLIST_CHARS for why the caps
+/// belong to the readback and not here.
+pub fn task_run_spec(spec: &str, checklist: &Value, last_directive: Option<&str>) -> String {
+    let items = checklist_items(checklist);
+    let directive = last_directive.map(str::trim).filter(|d| !d.is_empty());
+    if items.is_empty() && directive.is_none() {
+        return spec.to_string();
+    }
+    let mut out = format!(
+        "{spec}\n\n\
+         ==== OPERATOR CONTEXT (appended by the worker at pickup) ===="
+    );
+    if let Some(d) = directive {
+        out.push_str(&format!(
+            "\nOperator's send-back note — the PRIORITY instruction; where it \
+             conflicts with the spec above, the note wins:\n{d}"
+        ));
+    }
+    if !items.is_empty() {
+        let (done, owed): (Vec<_>, Vec<_>) = items.iter().partition(|it| it.approved);
+        out.push_str("\nDefinition of done — items still owed:");
+        if owed.is_empty() {
+            out.push_str("\n(none — every checklist item is already accepted)");
+        } else {
+            for it in owed {
+                out.push_str(&format!("\n- {}", it.text));
+            }
+        }
+        if !done.is_empty() {
+            out.push_str(
+                "\nAlready accepted by the operator — do NOT redo or rework these:",
+            );
+            for it in done {
+                out.push_str(&format!("\n- [done] {}", it.text));
+            }
+        }
+    }
+    out
 }
 
 /// The user message a nudge becomes inside a live run. Its own message, NOT
@@ -996,9 +1152,20 @@ async fn handle_task(
         return;
     }
 
+    // The task's definition-of-done and send-back note. Absent fields read as
+    // "none" — a task minted before the checklist layer behaves exactly as it
+    // did before it.
+    let checklist = task.get("checklist").cloned().unwrap_or(Value::Null);
+    let last_directive = task
+        .get("last_directive")
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
+
     // The readback question. Deterministic msg_id: a worker that crashes
-    // mid-wait and (in a later phase) re-enters readback re-posts the same
-    // question and inherits its original seq — and any verdict already given.
+    // mid-wait re-posts the same question and inherits its original seq — and
+    // any verdict already given. A SENT-BACK task gets a generation-suffixed
+    // id so the re-confirm is a FRESH question rather than an idempotent
+    // replay of the already-approved one (see `generation_suffix`).
     // What this run WILL drive, promised honestly: the pickup's fleet values
     // win; the display resolver (last dispatch frame > env > default) is only
     // the fallback. The same pair is handed to start_run_internal below, so the
@@ -1008,8 +1175,21 @@ async fn handle_task(
     let promised_base = fleet_base.clone().unwrap_or_else(|| ep.base.clone());
     let promised_model = fleet_model.clone().unwrap_or_else(|| ep.model.clone());
     let ws = task.get("workspace").map(workspace_summary).unwrap_or(None);
-    let text = readback_text(&title, &spec, ws.as_deref(), &promised_model, &promised_base);
-    let question_id = format!("readback-{task_id}");
+    let cl_lines = checklist_readback_lines(&checklist);
+    let text = readback_text(
+        &title,
+        &spec,
+        ws.as_deref(),
+        cl_lines.as_deref(),
+        last_directive.as_deref(),
+        &promised_model,
+        &promised_base,
+    );
+    let sent_back_count = task
+        .get("sent_back_count")
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    let question_id = readback_msg_id(&task_id, sent_back_count);
     let Some(verdict) = ask_operator(
         app,
         client,
@@ -1033,9 +1213,11 @@ async fn handle_task(
         // and leave the task in `readback`, where the operator's console shows
         // it and the operator decides its fate.
         eprintln!("[tasks] {task_id}: readback rejected; leaving task in readback");
+        // Same generation suffix as the question it reports on: rejecting a
+        // RE-readback must not idempotently replay the first rejection row.
         post_status(
             app, client, base, device_id,
-            &format!("rejected-{task_id}"),
+            &format!("rejected-{task_id}{}", generation_suffix(sent_back_count)),
             &task_id,
             json!({
                 "text": "readback rejected by operator; task left in readback for the operator to resolve",
@@ -1078,11 +1260,14 @@ async fn handle_task(
     let fleet = crate::agent::last_fleet_endpoint();
     let frame_base = fleet_base.or_else(|| fleet.as_ref().map(|(b, _)| b.clone()));
     let frame_model = fleet_model.or_else(|| fleet.as_ref().and_then(|(_, m)| m.clone()));
+    // The spec the model runs on carries the definition of done and the
+    // send-back note — the readback promised them, the run must honor them.
+    let run_spec = task_run_spec(&spec, &checklist, last_directive.as_deref());
     let agent_state = app.state::<crate::agent::AgentState>();
     let started = crate::agent::start_run_internal(
         app,
         &agent_state,
-        spec.clone(),
+        run_spec,
         String::new(), // no session token; the device credential rides via with_bearer
         Vec::new(),
         run_id.clone(),
@@ -1234,6 +1419,8 @@ mod tests {
             "Migrate CI to uv",
             "Move the pipeline off pip.",
             Some("github.com/x/y (scratch, branch main)"),
+            None,
+            None,
             "qwen-vl",
             "http://self-hosted:8080",
         );
@@ -1250,15 +1437,121 @@ mod tests {
     #[test]
     fn readback_truncates_a_long_spec() {
         let spec = "é".repeat(READBACK_SPEC_CHARS + 500);
-        let text = readback_text("t", &spec, None, "m", "http://e");
+        let text = readback_text("t", &spec, None, None, None, "m", "http://e");
         assert!(text.contains('…'), "truncation is marked");
         assert!(text.chars().count() < READBACK_SPEC_CHARS + 300);
     }
 
     #[test]
     fn readback_omits_a_missing_workspace() {
-        let text = readback_text("t", "s", None, "m", "http://e");
+        let text = readback_text("t", "s", None, None, None, "m", "http://e");
         assert!(!text.contains("Workspace:"));
+        assert!(!text.contains("Definition of done"));
+        assert!(!text.contains("sending this task back"));
+    }
+
+    /// The readback echoes the checklist with approvals marked and the
+    /// send-back note labeled as the operator's own words — the two things a
+    /// re-confirm exists to restate.
+    #[test]
+    fn readback_carries_checklist_and_sendback_note() {
+        let checklist = json!([
+            {"item_id": "a", "text": "tests pass", "approved": true, "added_at": "2026-09-01T00:00:00Z"},
+            {"item_id": "b", "text": "docs updated", "approved": false, "added_at": "2026-09-01T00:00:00Z"},
+        ]);
+        let lines = checklist_readback_lines(&checklist).unwrap();
+        let text = readback_text(
+            "t", "s", None,
+            Some(&lines),
+            Some("the docs section is still missing"),
+            "m", "http://e",
+        );
+        assert!(text.contains("[done] tests pass"));
+        assert!(text.contains("[ ] docs updated"));
+        assert!(text.contains(
+            "Operator's note from sending this task back: the docs section is still missing"
+        ));
+    }
+
+    #[test]
+    fn checklist_lines_mark_approvals_and_stay_bounded() {
+        assert_eq!(checklist_readback_lines(&Value::Null), None);
+        assert_eq!(checklist_readback_lines(&json!([])), None);
+        // The {items: []} envelope degrades to its items rather than to
+        // nothing.
+        let wrapped = json!({"items": [{"item_id": "a", "text": "x", "approved": false}]});
+        assert_eq!(checklist_readback_lines(&wrapped).as_deref(), Some("[ ] x"));
+        // Per-item and total truncation both hold on a char boundary.
+        let big: Vec<Value> = (0..20)
+            .map(|i| json!({"item_id": format!("i{i}"), "text": "é".repeat(400), "approved": false}))
+            .collect();
+        let lines = checklist_readback_lines(&json!(big)).unwrap();
+        assert!(lines.chars().count() <= READBACK_CHECKLIST_CHARS + 1);
+        assert!(lines.contains('…'));
+    }
+
+    // ---- the run prompt ----------------------------------------------------
+
+    /// A task with no checklist and no directive runs on the spec VERBATIM —
+    /// byte-identical, so pre-checklist tasks behave exactly as before.
+    #[test]
+    fn run_spec_is_verbatim_without_operator_context() {
+        assert_eq!(task_run_spec("do the thing", &Value::Null, None), "do the thing");
+        assert_eq!(task_run_spec("do the thing", &json!([]), Some("  ")), "do the thing");
+    }
+
+    /// The appended section splits the checklist by approval — unapproved
+    /// items are the goals still owed, approved ones are named as accepted and
+    /// not-to-redo — and carries the send-back note as the priority word.
+    #[test]
+    fn run_spec_appends_definition_of_done_and_note() {
+        let checklist = json!([
+            {"item_id": "a", "text": "tests pass", "approved": true},
+            {"item_id": "b", "text": "docs updated", "approved": false},
+        ]);
+        let out = task_run_spec("the spec", &checklist, Some("focus on the docs"));
+        assert!(out.starts_with("the spec\n\n"), "the spec leads, untouched");
+        assert!(out.contains("==== OPERATOR CONTEXT"));
+        assert!(out.contains("send-back note — the PRIORITY instruction"));
+        assert!(out.contains("focus on the docs"));
+        assert!(out.contains("items still owed:\n- docs updated"));
+        assert!(out.contains("do NOT redo or rework these:\n- [done] tests pass"));
+    }
+
+    /// All items approved: say so explicitly rather than print an empty owed
+    /// list the model could misread as "nothing was defined".
+    #[test]
+    fn run_spec_names_a_fully_approved_checklist() {
+        let checklist = json!([{"item_id": "a", "text": "tests pass", "approved": true}]);
+        let out = task_run_spec("s", &checklist, None);
+        assert!(out.contains("(none — every checklist item is already accepted)"));
+        assert!(out.contains("- [done] tests pass"));
+        assert!(!out.contains("PRIORITY"), "no note, no note section");
+    }
+
+    // ---- the re-readback msg_id --------------------------------------------
+
+    /// First pickup keeps the v1 id (crash-replay still finds the original
+    /// question); a send-back mints a NEW deterministic id — otherwise the
+    /// backend's idempotent replay hands back the pre-send-back verdict and
+    /// the re-confirm silently never happens. The generation number is the
+    /// server's sent_back_count, bumped atomically with the send-back edge, so
+    /// even two send-backs with byte-identical notes and unchanged approvals
+    /// are distinct questions — the case a content hash could not tell apart.
+    #[test]
+    fn readback_msg_id_regenerates_on_a_send_back() {
+        let first = readback_msg_id("t1", 0);
+        assert_eq!(first, "readback-t1");
+
+        let sent_back = readback_msg_id("t1", 1);
+        assert_ne!(sent_back, first);
+        assert_eq!(sent_back, "readback-t1-g1");
+        // Deterministic: a crash mid-wait re-reads the same counter off the
+        // task row and replays its own question instead of minting a duplicate.
+        assert_eq!(sent_back, readback_msg_id("t1", 1));
+        // Every further send-back is a new question, even with an identical
+        // note and identical approvals.
+        assert_ne!(sent_back, readback_msg_id("t1", 2));
     }
 
     #[test]
