@@ -14,6 +14,9 @@ mod pinned;
 mod remote;
 mod runs_local;
 mod screenshots;
+// UIA grounding prototype. Windows-only in substance; compiles to a
+// same-shaped stub elsewhere, so it needs no cfg at the registration site.
+mod uia;
 mod video;
 mod window;
 
@@ -259,6 +262,10 @@ pub fn run() {
         runs_local::local_runs,
         runs_local::local_run_frames,
         video::extract_frames_from_video,
+        // UIA grounding prototype — invoked by hand from devtools, by nothing
+        // in Rust or the frontend. Read-only; it cannot touch the agent loop.
+        uia::uia_dump,
+        uia::uia_dump_all,
         window::bring_to_front
     ])
     .setup(|app| {

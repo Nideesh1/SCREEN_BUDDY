@@ -83,6 +83,29 @@ objc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 robius-authentication = "0.1"
+# UI Automation grounding PROTOTYPE (uia.rs). Read-only: walks the foreground
+# window's accessibility tree so we can see whether real controls report usable
+# names and screen rects, instead of the model estimating pixel coordinates off
+# a downscaled screenshot. Not wired into the agent loop.
+#
+# WHY THIS CRATE over the alternative (raw COM through the `windows` crate):
+# the whole job is `IUIAutomation` + `IUIAutomationTreeWalker` +
+# `IUIAutomationElement`, which by hand means CoCreateInstance, manual
+# AddRef/Release discipline on every node of a recursive walk, and BSTR/VARIANT
+# marshalling for every property read. That is a few hundred lines of unsafe
+# whose bugs are refcount leaks and use-after-free — the worst possible payload
+# for a process that already holds the user's screen and input. `uiautomation`
+# is a thin, actively maintained safe wrapper (it IS the `windows` crate
+# underneath, so no second COM stack) that turns each property into a
+# `Result<T>` and gives elements RAII lifetimes. We use maybe eight of its
+# methods; the cost is one dependency on the Windows target only, and this is
+# the one place in this task where adding a dependency is the point.
+#
+# NOTE: it brings its own pinned `windows` crate version. uia.rs deliberately
+# does NOT add a direct `windows` dependency — the single Win32 call it needs
+# (`GetForegroundWindow`) is declared as a one-line extern, so we never have to
+# keep two `windows` versions in step.
+uiautomation = "0.25"
 
 # Optimize ALL third-party crates even in `tauri dev`/debug builds. `image`
 # (and its codecs) is ~157x slower when built unoptimized, which dominates
