@@ -254,11 +254,20 @@ function NewRun() {
     setStarting(true)
     setError(null)
     try {
-      // a) Mint the run row on the backend FIRST.
+      // a) Mint the run row on the backend FIRST — stamped with THIS machine,
+      // so a locally launched run files under the same device as a dispatched
+      // one and shows in this machine's run list. A browser (no Tauri bridge)
+      // has no machine identity and simply omits the stamp.
+      const info = await safeInvoke<{ device_id: string }>('device_info')
       const resp = await fetch(`${CU_BACKEND}/runs`, {
         method: 'POST',
         headers: { ...authHeaders(), 'content-type': 'application/json' },
-        body: JSON.stringify({ task: finalTask, model, pinned_image_refs: [] }),
+        body: JSON.stringify({
+          task: finalTask,
+          model,
+          pinned_image_refs: [],
+          ...(info.ok ? { device_id: info.data.device_id } : {}),
+        }),
       })
       if (!resp.ok) {
         setError(`Could not create run (HTTP ${resp.status}). Agent not started.`)
