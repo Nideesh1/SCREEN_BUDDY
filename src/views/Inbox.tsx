@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { CU_BACKEND, authHeaders, relativeTime } from '../lib'
-import { Button, Card, ConfirmModal, Divider, EmptyState, SectionTitle, Spinner, StatusPill } from '../ui'
+import { Button, Card, ConfirmModal, Divider, SectionTitle, Spinner, StatusPill } from '../ui'
 
 // Inbox — the "what needs me" page.
 //
@@ -671,12 +671,13 @@ function Inbox() {
 
           {/* ── Work claimed done: judge it. ── */}
           <Card title={<SectionTitle>Tasks awaiting verdict</SectionTitle>} padded={tasks.length === 0}>
+            {/* One quiet line, matching Questions waiting above. An empty
+                inbox is the normal resting state of this page, so neither
+                section earns an illustration for being in it. */}
             {tasks.length === 0 && (
-              <EmptyState
-                icon="⚖"
-                title="Nothing is awaiting a verdict"
-                hint="When a worker finishes a task it lands here for you to judge — done is your call, never the agent's."
-              />
+              <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+                No finished work is waiting for your verdict.
+              </span>
             )}
             {tasks.map((task, i) => (
               <div key={task.task_id}>
