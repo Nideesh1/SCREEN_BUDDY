@@ -103,6 +103,34 @@ const CLAIM_ITEM_TEXT_CHARS: usize = 160;
 const CLAIM_NOTE_CHARS: usize = 200;
 const CLAIM_SUMMARY_CHARS: usize = 600;
 
+/// How many frames one item's evidence may cite. An item is usually proved by a
+/// small SEQUENCE — "the text was typed", "the text is correct after I fixed
+/// the typo" — which is why this is a list at all; but past a handful the model
+/// has stopped citing and started dumping the run, which costs the operator the
+/// exact thing the citation was for. Eight is generous for the observed shape
+/// (1-3 frames per item) and still bounds the payload: 25 items × 8 seqs is a
+/// few hundred bytes of numbers.
+const CLAIM_MAX_FRAMES: usize = 8;
+
+/// How many mid-run `mark_evidence` calls one run may accumulate. Marks are
+/// append-only (an item may become true, break, and become true again, and all
+/// three moments are the story), so the only bound is a ceiling on the whole
+/// run. Forty is ~1.5 marks per item at the item cap — far more than a truthful
+/// run needs, and low enough that a model stuck in a marking loop is stopped
+/// while the diary payload is still inside the 16KB cap.
+const CLAIM_MAX_MARKS: usize = 40;
+
+/// Hard ceiling on the serialized done-claim payload, under the backend's 16KB
+/// PAYLOAD_MAX_BYTES with room for the message envelope.
+///
+/// This is a ceiling and not an estimate because the failure mode is not a lost
+/// message: `post_status` retries FOREVER, so a payload the backend 422s wedges
+/// the pickup loop before the task ever reaches `awaiting_verdict`. The
+/// per-field bounds above keep a realistic claim an order of magnitude inside
+/// this; `fit_claim_payload` is what makes the pathological one (every field at
+/// its cap, on all 25 items, with 40 marks behind it) still POST.
+const CLAIM_PAYLOAD_MAX_BYTES: usize = 15 * 1024;
+
 // ---- managed state ---------------------------------------------------------
 
 /// A latching wake-up: `ring` from the WS read loop, `wait` from the idle
@@ -605,30 +633,82 @@ pub fn checklist_readback_lines(checklist: &Value) -> Option<String> {
 /// One item's claim as the worker records it: the model's assertion about one
 /// checklist item, plus the checklist text it refers to (denormalized so the
 /// operator's console can render the claim without joining back to the task)
-/// and the frame the model says proves it.
+/// and the frames the model says prove it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimedItem {
     pub item_id: String,
     pub text: String,
     pub satisfied: bool,
     pub evidence_note: String,
-    /// The `seq` of a screenshot event in THIS run, or None. Optional on
-    /// purpose: "the file is on disk in the folder I opened" is a legitimate
-    /// item with no single frame behind it, and forcing a number would only
-    /// teach the model to invent one.
-    pub frame_seq: Option<i64>,
+    /// The `seq`s of screenshot events in THIS run, in the order given, deduped
+    /// — possibly empty. A LIST because one frame is routinely not the proof:
+    /// the first real two-item run had "I typed it" and "I re-read it after
+    /// fixing the typo" as two different frames of one item, and being allowed
+    /// only one forced the model to pick, which threw away half the evidence.
+    /// Empty stays legitimate for the original reason a single seq was optional
+    /// — "the file is on disk in the folder I opened" has no frame behind it,
+    /// and demanding a number only teaches the model to invent one.
+    pub frame_seqs: Vec<i64>,
 }
 
-/// A whole `claim_done` call, validated against the task's real checklist.
+impl ClaimedItem {
+    /// The first cited frame. Exists ONLY to keep the payload's original
+    /// singular `frame_seq` field populated for consumers written against it;
+    /// nothing in the worker reasons about "the" frame any more.
+    fn primary_frame(&self) -> Option<i64> {
+        self.frame_seqs.first().copied()
+    }
+}
+
+/// One mid-run `mark_evidence` call: the model saying, in the turn where it
+/// happened, that an item just became true and which frames show it.
+///
+/// This exists because the end of the run is the WORST moment to ask for
+/// evidence. On the run that motivated it, item 1 became true at step 27 and
+/// item 2 at step 51, and the only place to say so was after step 55 — by which
+/// point both frames had been pruned out of context and the model was citing
+/// from memory. A 27B model citing from memory produces exactly the vague prose
+/// this whole feature replaced. `step` and `at_ms` are carried because "when
+/// did this become true" is the operator's actual question.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceMark {
+    pub item_id: String,
+    pub text: String,
+    pub note: String,
+    pub frame_seqs: Vec<i64>,
+    /// The run loop's turn counter when the mark was made, and wall-clock ms
+    /// since the epoch. Both are context for the operator, never keys.
+    pub step: i64,
+    pub at_ms: u64,
+}
+
+/// A whole `claim_done` call, validated against the task's real checklist, plus
+/// the mid-run marks that preceded it (carried along so the diary row is the
+/// whole account of the run — see `claim_status_payload`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DoneClaim {
     pub items: Vec<ClaimedItem>,
     pub summary: String,
+    pub marks: Vec<EvidenceMark>,
 }
 
 impl DoneClaim {
     fn satisfied_count(&self) -> usize {
         self.items.iter().filter(|c| c.satisfied).count()
+    }
+
+    /// Items that were marked during the run but got no entry in the final
+    /// claim. Read back to the model in the ack: silence about an item it
+    /// itself flagged is a mistake worth one more turn to fix.
+    fn unclaimed_marked_items(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for m in &self.marks {
+            let claimed = self.items.iter().any(|c| c.item_id == m.item_id);
+            if !claimed && !out.contains(&m.item_id.as_str()) {
+                out.push(&m.item_id);
+            }
+        }
+        out
     }
 }
 
@@ -684,8 +764,71 @@ fn valid_ids(items: &[ChecklistItem]) -> String {
         .join(", ")
 }
 
-/// Parse and validate one `claim_done` tool input against the task's checklist
-/// and the screenshot seqs this run has actually posted.
+/// Read one entry's frame citation, accepting either spelling and either shape.
+///
+/// The canonical key is the PLURAL `frame_seqs` with a list. The singular
+/// `frame_seq` keeps working, and either key accepts either a bare number or an
+/// array, for one reason: this is the last tool call of a long run, a rejection
+/// there costs a whole extra turn at the most expensive moment, and the shape
+/// the model reaches for is decided by whatever example is still in its context
+/// — which, across a run whose older turns get pruned and whose prefix is
+/// cached, may well be the singular form from an earlier prompt build. The
+/// distinction carries no meaning worth defending; the SEQ VALUES do, and those
+/// are still checked without mercy.
+///
+/// Every returned seq is one this run actually posted, in the order the model
+/// gave, deduped. `tool` names the caller so the correction the model reads
+/// tells it which call to make again.
+fn parse_frame_list(
+    entry: &Value,
+    posted: &[i64],
+    tool: &str,
+    item_id: &str,
+) -> Result<Vec<i64>, String> {
+    let raw = match (entry.get("frame_seqs"), entry.get("frame_seq")) {
+        (Some(v), _) | (None, Some(v)) => v,
+        (None, None) => return Ok(Vec::new()),
+    };
+    let values: Vec<&Value> = match raw {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    if values.len() > CLAIM_MAX_FRAMES {
+        return Err(format!(
+            "{tool}: item_id '{item_id}' cites {} frames; at most {CLAIM_MAX_FRAMES} are \
+             accepted. Keep the frames that actually show it.",
+            values.len()
+        ));
+    }
+    let mut out: Vec<i64> = Vec::with_capacity(values.len());
+    for v in values {
+        if v.is_null() {
+            continue;
+        }
+        let Some(n) = v.as_i64() else {
+            return Err(format!(
+                "{tool}: `frame_seqs` for item_id '{item_id}' must be numbers \
+                 (or omitted if no screenshot shows it)."
+            ));
+        };
+        if !posted.contains(&n) {
+            return Err(format!(
+                "{tool}: frame_seq {n} is not a screenshot from this run. {} \
+                 Omit frame_seq if you have no frame for this item.",
+                available_frames_sentence(posted)
+            ));
+        }
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse and validate one `claim_done` tool input against the task's checklist,
+/// the screenshot seqs this run has actually posted, and the mid-run
+/// `mark_evidence` marks it accumulated.
 ///
 /// Every rejection returns text meant to be READ BY THE MODEL and acted on: it
 /// names what was wrong and what the legal values are, because the model can
@@ -694,10 +837,25 @@ fn valid_ids(items: &[ChecklistItem]) -> String {
 /// identity — an unknown `item_id` or a `frame_seq` from no frame we posted is
 /// refused outright, since the entire value of the claim to the operator is
 /// that its references resolve.
+///
+/// # Prefill
+///
+/// `marks` turn this call from the first telling into a CONFIRMATION. For an
+/// item the model already marked mid-run, an entry that cites no frames
+/// inherits the marked ones and an entry with no `evidence_note` inherits the
+/// most recent mark's note — so the model's remaining job at the end is the one
+/// thing only it can do, namely say `satisfied` true or false, and it is never
+/// asked to re-derive from memory a citation it already made while looking at
+/// the frame. Anything the model DOES supply wins outright: a mark is a claim
+/// from step 27 and the final entry is the model's word now, which includes
+/// contradicting itself if the item broke. With no marks — the model marked
+/// nothing all run — nothing is inherited and this is byte-for-byte the old
+/// behaviour.
 pub fn parse_done_claim(
     input: &Value,
     checklist: &[ChecklistItem],
     frame_seqs: &[i64],
+    marks: &[EvidenceMark],
 ) -> Result<DoneClaim, String> {
     if checklist.is_empty() {
         return Err("claim_done does not apply to this task: it carries no checklist.".to_string());
@@ -749,38 +907,42 @@ pub fn parse_done_claim(
                 item.item_id
             ));
         };
+        // Everything this item was already marked with mid-run, in the order it
+        // was marked. The prefill source; empty on a run with no marks, which
+        // is what makes that run identical to the pre-mark_evidence flow.
+        let marked: Vec<&EvidenceMark> =
+            marks.iter().filter(|m| m.item_id == item.item_id).collect();
         let note = entry
             .get("evidence_note")
             .and_then(|n| n.as_str())
             .map(str::trim)
             .unwrap_or("");
-        if note.is_empty() {
-            return Err(format!(
-                "claim_done: entry for item_id '{}' is missing `evidence_note` — say what on \
-                 screen shows this item is or is not satisfied.",
-                item.item_id
-            ));
-        }
-        let frame_seq = match entry.get("frame_seq") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let Some(n) = v.as_i64() else {
+        let note = if note.is_empty() {
+            // The most recent mark's note, because if the item was marked twice
+            // the later observation is the one that still holds.
+            match marked.last() {
+                Some(m) => m.note.clone(),
+                None => {
                     return Err(format!(
-                        "claim_done: `frame_seq` for item_id '{}' must be a number \
-                         (or omitted if you have no single frame for it).",
+                        "claim_done: entry for item_id '{}' is missing `evidence_note` — say what \
+                         on screen shows this item is or is not satisfied.",
                         item.item_id
-                    ));
-                };
-                if !frame_seqs.contains(&n) {
-                    return Err(format!(
-                        "claim_done: frame_seq {n} is not a screenshot from this run. {} \
-                         Omit frame_seq if you have no single frame for this item.",
-                        available_frames_sentence(frame_seqs)
-                    ));
+                    ))
                 }
-                Some(n)
             }
+        } else {
+            truncate_chars(note, CLAIM_NOTE_CHARS)
         };
+        let mut frames = parse_frame_list(entry, frame_seqs, "claim_done", &item.item_id)?;
+        if frames.is_empty() {
+            for m in &marked {
+                for s in &m.frame_seqs {
+                    if !frames.contains(s) && frames.len() < CLAIM_MAX_FRAMES {
+                        frames.push(*s);
+                    }
+                }
+            }
+        }
         if items.iter().any(|c| c.item_id == item.item_id) {
             return Err(format!(
                 "claim_done: item_id '{}' appears twice. Send one entry per checklist item.",
@@ -791,8 +953,8 @@ pub fn parse_done_claim(
             item_id: item.item_id.clone(),
             text: truncate_chars(&item.text, CLAIM_ITEM_TEXT_CHARS),
             satisfied,
-            evidence_note: truncate_chars(note, CLAIM_NOTE_CHARS),
-            frame_seq,
+            evidence_note: note,
+            frame_seqs: frames,
         });
     }
 
@@ -806,7 +968,79 @@ pub fn parse_done_claim(
             "claim_done requires a one-line `summary` of what you did in this run.".to_string()
         );
     }
-    Ok(DoneClaim { items, summary: truncate_chars(summary, CLAIM_SUMMARY_CHARS) })
+    Ok(DoneClaim {
+        items,
+        summary: truncate_chars(summary, CLAIM_SUMMARY_CHARS),
+        marks: marks.to_vec(),
+    })
+}
+
+/// Parse and validate one `mark_evidence` call — the mid-run "this item just
+/// became true, here is the frame" note.
+///
+/// Deliberately the SAME validation as `claim_done`, through the same helpers:
+/// `resolve_item_id` for the id (exact, or an unambiguous ≥8-char prefix),
+/// `parse_frame_list` for the frames. Two tools that disagree about what a
+/// valid item_id is would be worse than one tool, because the model would learn
+/// the looser rule and be refused by the stricter one at the end of the run.
+///
+/// `step` and `now_ms` are the caller's — the run loop owns the turn counter
+/// and this module has no business reading a clock the tests then have to
+/// pin down.
+pub fn parse_evidence_mark(
+    input: &Value,
+    checklist: &[ChecklistItem],
+    frame_seqs: &[i64],
+    already: usize,
+    step: i64,
+    now_ms: u64,
+) -> Result<EvidenceMark, String> {
+    if checklist.is_empty() {
+        return Err(
+            "mark_evidence does not apply to this task: it carries no checklist.".to_string()
+        );
+    }
+    if already >= CLAIM_MAX_MARKS {
+        return Err(format!(
+            "mark_evidence: this run has already recorded {CLAIM_MAX_MARKS} marks, which is the \
+             limit. Stop marking, finish the work, and report everything in claim_done."
+        ));
+    }
+    let raw_id = input.get("item_id").and_then(|i| i.as_str()).unwrap_or("");
+    if raw_id.trim().is_empty() {
+        return Err(format!(
+            "mark_evidence needs an `item_id`. Valid item_id values: {}",
+            valid_ids(checklist)
+        ));
+    }
+    let Some(item) = resolve_item_id(raw_id, checklist) else {
+        return Err(format!(
+            "mark_evidence: '{raw_id}' is not an item_id on this task. \
+             Call mark_evidence again using only these item_id values: {}",
+            valid_ids(checklist)
+        ));
+    };
+    let note = input
+        .get("note")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if note.is_empty() {
+        return Err(format!(
+            "mark_evidence: `note` is required for item_id '{}' — say what you can see right now \
+             that makes this item satisfied.",
+            item.item_id
+        ));
+    }
+    let frames = parse_frame_list(input, frame_seqs, "mark_evidence", &item.item_id)?;
+    Ok(EvidenceMark {
+        item_id: item.item_id.clone(),
+        text: truncate_chars(&item.text, CLAIM_ITEM_TEXT_CHARS),
+        note: truncate_chars(note, CLAIM_NOTE_CHARS),
+        frame_seqs: frames,
+        step,
+        at_ms: now_ms,
+    })
 }
 
 /// The tail of the "bad frame_seq" error: which numbers WOULD have worked. The
@@ -835,6 +1069,11 @@ fn available_frames_sentence(frame_seqs: &[i64]) -> String {
 /// number of the picture it is looking at, and a claim could only ever cite
 /// frames by guess. Emitted only on runs where `claim_done` applies — every
 /// other run would be paying context for a number nothing consumes.
+///
+/// It names `mark_evidence` first because THIS turn is the only turn where
+/// these numbers and the picture they name are both in front of the model; by
+/// the end of the run the image is pruned and the number is a digit it has to
+/// remember.
 pub fn frame_seq_note(seqs: &[i64]) -> Option<String> {
     if seqs.is_empty() {
         return None;
@@ -842,8 +1081,89 @@ pub fn frame_seq_note(seqs: &[i64]) -> Option<String> {
     let list = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
     Some(format!(
         "[worker] The screenshot(s) above were filed as frame_seq {list}. \
-         Cite these numbers as `frame_seq` in claim_done."
+         If one of them shows a checklist item is now satisfied, call `mark_evidence` NOW with \
+         these numbers in `frame_seqs`. They are also the numbers to cite in claim_done."
     ))
+}
+
+/// The `mark_evidence` tool schema, or None on a run with nothing owed — the
+/// same `claim_applies` gate as `claim_done`, so the two tools and the prompt
+/// contract that explains them appear and disappear together and a run with no
+/// checklist is untouched.
+///
+/// # Why a second tool rather than a repeatable claim_done
+///
+/// They mean different things and get different acks. `claim_done` is the one
+/// call that moves a claim into the diary and ends the run; `mark_evidence` is
+/// a note the model leaves itself and the operator while the evidence is on
+/// screen. Folding them together would mean either a claim_done that has to be
+/// complete every time it is called (unaffordable mid-run — the other items are
+/// not done yet) or a claim_done that may be partial (and then the final one is
+/// indistinguishable from a stray). Two names, two jobs.
+pub fn mark_evidence_tool(items: &[ChecklistItem]) -> Option<Value> {
+    if !claim_applies(items) {
+        return None;
+    }
+    let ids: Vec<&str> = items.iter().map(|it| it.item_id.as_str()).collect();
+    let owed_list = owed_items(items)
+        .iter()
+        .map(|it| format!("{} = {}", it.item_id, it.text))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(json!({
+        "name": "mark_evidence",
+        "description": format!(
+            "Call this the MOMENT you see a checklist item become satisfied, in that same turn, \
+while the screenshot proving it is still in front of you. Give the frame_seq numbers that were \
+just printed under the screenshots. Items on this task: {owed_list}. Call it again for the same \
+item if it changes or you get better proof — every mark is kept. This does NOT mark anything \
+done and it does NOT end the task: a human reads it and decides; you cannot approve your own \
+work. You must still call claim_done once at the very end."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_id": {
+                    "type": "string",
+                    "enum": ids,
+                    "description": "The checklist item you just saw satisfied, copied exactly."
+                },
+                "frame_seqs": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "The frame_seq numbers of the screenshots that show it, as \
+printed under them. Usually the ones from this turn. Several are fine."
+                },
+                "note": {
+                    "type": "string",
+                    "description": "What you can see right now that makes this item satisfied — \
+the window, the text, the value you read. One sentence."
+                }
+            },
+            "required": ["item_id", "frame_seqs", "note"]
+        }
+    }))
+}
+
+/// What the model is told after a mark is accepted. Names the item back (so a
+/// mis-copied id is visible as the wrong text, not just as an accepted call),
+/// repeats the invariant, and points at the next thing to do — a model that
+/// reads an ack as "done" will stop working with the task half finished.
+pub fn mark_ack_text(mark: &EvidenceMark, total: usize) -> String {
+    let frames = if mark.frame_seqs.is_empty() {
+        "no frames cited".to_string()
+    } else {
+        format!(
+            "frames {}",
+            mark.frame_seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    format!(
+        "Evidence noted for \"{}\" ({frames}). {total} mark(s) recorded this run. This is a note, \
+         not an approval — the operator decides, and the task is not finished. Carry on with the \
+         remaining items, then call claim_done once at the end.",
+        mark.text
+    )
 }
 
 /// The `claim_done` tool schema, or None when this run's task has nothing left
@@ -881,9 +1201,12 @@ pub fn claim_done_tool(items: &[ChecklistItem]) -> Option<Value> {
         "description": format!(
             "Report, item by item, which of this task's checklist items you believe you \
 satisfied. Call this ONCE, as the last thing you do, before you stop. Send one entry for every \
-item still owed: {owed_list}. This does NOT mark anything done — a human reads your claim and \
-decides; you cannot approve your own work. Say satisfied:false for anything you did not finish. \
-A false is free; a claim that turns out to be wrong wastes the operator's review and the run."
+item still owed: {owed_list}. For an item you already reported with mark_evidence, you do not \
+need to repeat the frame numbers or the note — just confirm satisfied true or false, and \
+contradict the earlier mark if the item is no longer true. This does NOT mark anything done — a \
+human reads your claim and decides; you cannot approve your own work. Say satisfied:false for \
+anything you did not finish. A false is free; a claim that turns out to be wrong wastes the \
+operator's review and the run."
         ),
         "input_schema": {
             "type": "object",
@@ -908,10 +1231,12 @@ A false is free; a claim that turns out to be wrong wastes the operator's review
                                 "description": "What on screen shows it — the window, the text, \
 the value you read. One sentence."
                             },
-                            "frame_seq": {
-                                "type": "integer",
-                                "description": "The frame_seq of the screenshot that shows it, as \
-printed under the screenshot. Omit if no single frame shows this item."
+                            "frame_seqs": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "The frame_seq numbers of the screenshots that \
+show it, as printed under them. Omit if you already sent them with mark_evidence, or if no \
+screenshot shows this item."
                             }
                         },
                         "required": ["item_id", "satisfied", "evidence_note"]
@@ -932,12 +1257,26 @@ printed under the screenshot. Omit if no single frame shows this item."
 /// that believes `claim_done` finished the task will happily go on to claim
 /// authority it does not have.
 pub fn claim_ack_text(claim: &DoneClaim) -> String {
-    format!(
+    let mut out = format!(
         "Claim recorded: {} of {} items claimed satisfied. This is a claim, not an approval — \
-         the operator decides. Nothing further is needed; stop now.",
+         the operator decides.",
         claim.satisfied_count(),
         claim.items.len()
-    )
+    );
+    // An item the model flagged mid-run and then said nothing about at the end
+    // is the one gap the marks let us SEE, so it is worth the extra turn: the
+    // model can simply call claim_done again with the missing entry.
+    let missing = claim.unclaimed_marked_items();
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            " You marked evidence for {} during this run but sent no entry for it — call \
+             claim_done again with every item included.",
+            missing.join(", ")
+        ));
+        return out;
+    }
+    out.push_str(" Nothing further is needed; stop now.");
+    out
 }
 
 /// The diary payload for a done claim. A `status` message, because that is what
@@ -950,7 +1289,62 @@ pub fn claim_ack_text(claim: &DoneClaim) -> String {
 /// first clause. That redundancy is the point: this row is read by consumers we
 /// do not control (a phone notification, a future model summarizing the log),
 /// and every one of them must land on "the worker asserts" rather than "done".
+///
+/// # Compatibility
+///
+/// Every field this payload has ever carried still carries the same meaning,
+/// including each claim row's singular `frame_seq` — now the FIRST of the
+/// cited frames rather than the only one. New readers should use `frame_seqs`
+/// (the full list) and `marks` (the mid-run evidence, with the step and the
+/// wall-clock time at which the model said the item had become true, which is
+/// what the operator is really asking when he asks for the screenshots per
+/// item). Nothing was renamed or removed, because a console is rendering this
+/// row already.
+/// Assembled at whatever size fits: see `fit_claim_payload` for the order in
+/// which a pathological claim is shrunk. The claim ROWS are never dropped —
+/// they are the message.
 pub fn claim_status_payload(run_id: &str, claim: &DoneClaim) -> Value {
+    fit_claim_payload(run_id, claim)
+}
+
+/// Shrink to fit, in the order that loses the least: first the oldest mid-run
+/// marks (the newest are the ones nearest the claim, and a dropped one is
+/// counted in `marks_omitted` rather than silently vanishing), and only then
+/// the prose `text` — which is a redundant rendering of rows the payload still
+/// carries structurally. A claim row is never dropped and no field is renamed
+/// on the way down, so a console reading the shrunken payload reads it exactly
+/// like any other.
+fn fit_claim_payload(run_id: &str, claim: &DoneClaim) -> Value {
+    let mut first = 0usize;
+    loop {
+        let p = assemble_claim_payload(run_id, claim, first);
+        if p.to_string().len() <= CLAIM_PAYLOAD_MAX_BYTES {
+            return p;
+        }
+        if first < claim.marks.len() {
+            first += 1;
+            continue;
+        }
+        // Every mark is gone and the claim rows alone are over the cap. Clip
+        // the prose: each character dropped is at least one byte, so budgeting
+        // by chars removes at least the overflow.
+        return clip_payload_text(p);
+    }
+}
+
+/// Last-resort clip of the payload's prose `text` so the message can be POSTed
+/// at all. Reached only by a claim whose every field sits at its cap.
+fn clip_payload_text(mut p: Value) -> Value {
+    let over = p.to_string().len().saturating_sub(CLAIM_PAYLOAD_MAX_BYTES);
+    let text = p["text"].as_str().unwrap_or_default().to_string();
+    let budget = text.chars().count().saturating_sub(over + 8).max(200);
+    p["text"] = json!(truncate_chars(&text, budget));
+    p
+}
+
+/// One candidate payload, carrying `claim.marks[skip..]`.
+fn assemble_claim_payload(run_id: &str, claim: &DoneClaim, skip: usize) -> Value {
+    let marks = &claim.marks[skip.min(claim.marks.len())..];
     let sat = claim.satisfied_count();
     let total = claim.items.len();
     let mut text = format!(
@@ -960,11 +1354,25 @@ pub fn claim_status_payload(run_id: &str, claim: &DoneClaim) -> Value {
     );
     for c in &claim.items {
         let mark = if c.satisfied { "claims YES" } else { "claims NO" };
-        let frame = match c.frame_seq {
-            Some(s) => format!(" (frame {s})"),
-            None => " (no frame cited)".to_string(),
-        };
-        text.push_str(&format!("\n- {} — {}{}: {}", c.text, mark, frame, c.evidence_note));
+        text.push_str(&format!(
+            "\n- {} — {}{}: {}",
+            c.text,
+            mark,
+            frames_phrase(&c.frame_seqs),
+            c.evidence_note
+        ));
+    }
+    if !marks.is_empty() {
+        text.push_str("\nDuring the run the worker reported:");
+        for m in marks {
+            text.push_str(&format!(
+                "\n- step {}: {}{} — {}",
+                m.step,
+                m.text,
+                frames_phrase(&m.frame_seqs),
+                m.note
+            ));
+        }
     }
     json!({
         "kind": "done_claim",
@@ -981,10 +1389,43 @@ pub fn claim_status_payload(run_id: &str, claim: &DoneClaim) -> Value {
                 "text": c.text,
                 "satisfied": c.satisfied,
                 "evidence_note": c.evidence_note,
-                "frame_seq": c.frame_seq,
+                // Kept, and kept meaning what it meant: the frame to show if a
+                // reader can only show one. `frame_seqs` is the whole answer.
+                "frame_seq": c.primary_frame(),
+                "frame_seqs": c.frame_seqs,
+            }))
+            .collect::<Vec<_>>(),
+        // How many of the oldest marks were dropped to fit the cap. Always
+        // present, almost always 0 — a reader that sees a non-zero here knows
+        // the mark list is a tail, not the whole run.
+        "marks_omitted": skip.min(claim.marks.len()),
+        "marks": marks
+            .iter()
+            .map(|m| json!({
+                "item_id": m.item_id,
+                "text": m.text,
+                "note": m.note,
+                "frame_seqs": m.frame_seqs,
+                "step": m.step,
+                "at_ms": m.at_ms,
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// " (frame 12)" / " (frames 12, 14)" / " (no frame cited)" — the prose form of
+/// a citation. The one-frame spelling is deliberately identical to what this
+/// row said before evidence became a list, so a reader that greps the text for
+/// it keeps working.
+fn frames_phrase(seqs: &[i64]) -> String {
+    match seqs {
+        [] => " (no frame cited)".to_string(),
+        [one] => format!(" (frame {one})"),
+        many => format!(
+            " (frames {})",
+            many.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// The `-g{n}` msg_id suffix for a task's readback question (empty on a first
@@ -1126,20 +1567,36 @@ pub fn task_run_spec(spec: &str, checklist: &Value, last_directive: Option<&str>
 /// not have).
 ///
 /// Written for the weakest model in the fleet — a qwen3-8B or a 27B — which is
-/// why it is short, gives ONE literal call shape rather than describing a
-/// schema, and states the honest-false incentive in a single clause. The
-/// closing sentence is not decoration: the failure this whole feature exists to
-/// avoid is a confident final narration, and a model that thinks `claim_done`
-/// settles the matter produces exactly that in a different wrapper.
-const CLAIM_CONTRACT: &str = "\n\nBefore you stop you MUST call the `claim_done` tool, once, \
-with one entry for EVERY item_id listed above:\n\
+/// why it is short, gives ONE literal call shape per tool rather than
+/// describing a schema, and states the honest-false incentive in a single
+/// clause. The closing sentence is not decoration: the failure this whole
+/// feature exists to avoid is a confident final narration, and a model that
+/// thinks `claim_done` settles the matter produces exactly that in a different
+/// wrapper.
+///
+/// The DURING half leads because it is the half that has to fire while the
+/// evidence is on screen. On the run that motivated it the model was asked for
+/// its citations only after step 55, for items that came true at steps 27 and
+/// 51 — by then the frames had been pruned from its context and it was
+/// answering from memory. A small model answering from memory writes prose.
+const CLAIM_CONTRACT: &str = "\n\nREPORTING — two things, and neither one finishes the task:\n\
+DURING the run: the moment you see one of the items above become true, in that same turn, call \
+the `mark_evidence` tool:\n\
+{\"item_id\": \"<the id above>\", \"frame_seqs\": [<the numbers printed under the screenshots \
+that show it>], \"note\": \"what you can see that makes this true\"}\n\
+Use the frame numbers you were just told in that turn — do not save them for later, you will not \
+have the picture then. Mark each item as it happens. Mark the same item again if it changes.\n\
+AT THE END, before you stop, you MUST call the `claim_done` tool, once, with one entry for EVERY \
+item_id listed above:\n\
 {\"items\": [{\"item_id\": \"<the id above>\", \"satisfied\": true, \"evidence_note\": \"what on \
-screen shows this\", \"frame_seq\": <the number printed under the screenshot that shows it>}], \
+screen shows this\", \"frame_seqs\": [<the numbers of the screenshots that show it>]}], \
 \"summary\": \"<one line on what you did>\"}\n\
-Set satisfied to false for anything you did not finish — a false is free, and a claim that turns \
-out to be wrong wastes the run. Omit frame_seq when no single screenshot shows the item. \
-claim_done does NOT complete the task: you are telling a human what you believe, and the human \
-decides. Do not claim an item is satisfied because it should be — claim it because you saw it.";
+If you already marked an item, you may leave out its evidence_note and frame_seqs — they are \
+kept — and just confirm satisfied true or false; say false if it stopped being true. Set \
+satisfied to false for anything you did not finish — a false is free, and a claim that turns out \
+to be wrong wastes the run. Leave frame_seqs out when no screenshot shows the item. Neither tool \
+completes the task: you are telling a human what you believe, and the human decides. Do not claim \
+an item is satisfied because it should be — claim it because you saw it.";
 
 /// The user message a nudge becomes inside a live run. Its own message, NOT
 /// appended to messages[0]: that message owns the static cache breakpoint, and
@@ -2090,6 +2547,21 @@ mod tests {
         ]))
     }
 
+    /// `claim_done` with no mid-run marks behind it — the flow a model that
+    /// never calls `mark_evidence` still gets, unchanged.
+    fn parse_claim(
+        input: &Value,
+        checklist: &[ChecklistItem],
+        frame_seqs: &[i64],
+    ) -> Result<DoneClaim, String> {
+        parse_done_claim(input, checklist, frame_seqs, &[])
+    }
+
+    /// One accepted mark, the way the run loop makes them.
+    fn mark(input: Value, items: &[ChecklistItem], frames: &[i64], step: i64) -> EvidenceMark {
+        parse_evidence_mark(&input, items, frames, 0, step, 1_700_000_000_000).unwrap()
+    }
+
     fn full_claim() -> Value {
         json!({
             "items": [
@@ -2112,17 +2584,25 @@ mod tests {
 
         let out = task_run_spec("s", &owed, None);
         assert!(out.contains("call the `claim_done` tool"));
-        assert!(out.contains("\"frame_seq\""), "one literal call shape, not a schema");
-        assert!(out.contains("does NOT complete the task"), "the claim is never an approval");
+        assert!(out.contains("call the `mark_evidence` tool"));
+        assert!(out.contains("\"frame_seqs\""), "one literal call shape, not a schema");
+        assert!(
+            out.contains("Neither tool completes the task"),
+            "neither call is ever an approval"
+        );
         assert!(claim_done_tool(&checklist_items(&owed)).is_some());
+        assert!(mark_evidence_tool(&checklist_items(&owed)).is_some());
 
         let out = task_run_spec("s", &all_done, None);
         assert!(!out.contains("claim_done"), "nothing owed, nothing to claim");
+        assert!(!out.contains("mark_evidence"), "the two are gated together");
         assert!(claim_done_tool(&checklist_items(&all_done)).is_none());
+        assert!(mark_evidence_tool(&checklist_items(&all_done)).is_none());
 
         // No checklist at all: unchanged from before this layer existed.
         assert_eq!(task_run_spec("s", &Value::Null, None), "s");
         assert!(claim_done_tool(&[]).is_none());
+        assert!(mark_evidence_tool(&[]).is_none());
     }
 
     /// The tool contract: every valid id is in the `item_id` enum (constrained
@@ -2141,8 +2621,9 @@ mod tests {
         assert_eq!(ids, vec![items[0].item_id.as_str(), items[1].item_id.as_str()]);
         assert_eq!(
             entry["required"].as_array().unwrap().len(), 3,
-            "frame_seq is the only optional field"
+            "frame_seqs is the only optional field"
         );
+        assert_eq!(entry["properties"]["frame_seqs"]["type"], "array");
         assert_eq!(
             schema["input_schema"]["required"],
             json!(["items", "summary"])
@@ -2158,13 +2639,13 @@ mod tests {
     /// claim so the console needs no join, and an omitted frame_seq stays None.
     #[test]
     fn claim_parses_and_denormalizes_the_item_text() {
-        let claim = parse_done_claim(&full_claim(), &two_items(), &[9, 12]).unwrap();
+        let claim = parse_claim(&full_claim(), &two_items(), &[9, 12]).unwrap();
         assert_eq!(claim.items.len(), 2);
         assert!(claim.items[0].satisfied);
-        assert_eq!(claim.items[0].frame_seq, Some(12));
+        assert_eq!(claim.items[0].frame_seqs, vec![12]);
         assert_eq!(claim.items[0].text, "Notepad contains the text \"checklist item one\"");
         assert!(!claim.items[1].satisfied);
-        assert_eq!(claim.items[1].frame_seq, None, "no frame is legitimate");
+        assert!(claim.items[1].frame_seqs.is_empty(), "no frame is legitimate");
         assert_eq!(claim.summary, "typed the line, calculator not done");
     }
 
@@ -2175,7 +2656,7 @@ mod tests {
     fn claim_rejects_an_unknown_item_id() {
         let mut input = full_claim();
         input["items"][0]["item_id"] = json!("made-up-id");
-        let err = parse_done_claim(&input, &two_items(), &[12]).unwrap_err();
+        let err = parse_claim(&input, &two_items(), &[12]).unwrap_err();
         assert!(err.contains("'made-up-id' is not an item_id on this task"));
         assert!(err.contains("e4777019-5f63-4776-a800-577c965bb88c"));
         assert!(err.contains("d6d7e296-e8b2-4535-92cc-d74ec0b3fba0"));
@@ -2194,20 +2675,20 @@ mod tests {
             "items": [{"item_id": "aaaa1111-2", "satisfied": true, "evidence_note": "n"}],
             "summary": "s",
         });
-        let claim = parse_done_claim(&ok, &items, &[]).unwrap();
+        let claim = parse_claim(&ok, &items, &[]).unwrap();
         assert_eq!(claim.items[0].item_id, "aaaa1111-2222", "stored canonical");
 
         let ambiguous = json!({
             "items": [{"item_id": "aaaa1111", "satisfied": true, "evidence_note": "n"}],
             "summary": "s",
         });
-        assert!(parse_done_claim(&ambiguous, &items, &[]).is_err());
+        assert!(parse_claim(&ambiguous, &items, &[]).is_err());
         // Too short to be a prefix at all — an id that happens to head both.
         let short = json!({
             "items": [{"item_id": "aaaa", "satisfied": true, "evidence_note": "n"}],
             "summary": "s",
         });
-        assert!(parse_done_claim(&short, &items, &[]).is_err());
+        assert!(parse_claim(&short, &items, &[]).is_err());
     }
 
     /// The fields with no safe default. `satisfied` read as false would report
@@ -2220,7 +2701,7 @@ mod tests {
         let strip = |key: &str| {
             let mut input = full_claim();
             input["items"][0].as_object_mut().unwrap().remove(key);
-            parse_done_claim(&input, &items, &[12]).unwrap_err()
+            parse_claim(&input, &items, &[12]).unwrap_err()
         };
         assert!(strip("satisfied").contains("missing `satisfied`"));
         assert!(strip("evidence_note").contains("missing `evidence_note`"));
@@ -2228,16 +2709,16 @@ mod tests {
 
         let mut no_summary = full_claim();
         no_summary.as_object_mut().unwrap().remove("summary");
-        assert!(parse_done_claim(&no_summary, &items, &[12])
+        assert!(parse_claim(&no_summary, &items, &[12])
             .unwrap_err()
             .contains("one-line `summary`"));
 
-        assert!(parse_done_claim(&json!({"summary": "s"}), &items, &[]).is_err());
-        assert!(parse_done_claim(&json!({"items": [], "summary": "s"}), &items, &[]).is_err());
+        assert!(parse_claim(&json!({"summary": "s"}), &items, &[]).is_err());
+        assert!(parse_claim(&json!({"items": [], "summary": "s"}), &items, &[]).is_err());
         // Whitespace is not evidence.
         let mut blank = full_claim();
         blank["items"][0]["evidence_note"] = json!("   ");
-        assert!(parse_done_claim(&blank, &items, &[12]).is_err());
+        assert!(parse_claim(&blank, &items, &[12]).is_err());
     }
 
     /// A frame_seq must name a screenshot THIS run actually posted — the whole
@@ -2245,28 +2726,25 @@ mod tests {
     #[test]
     fn claim_rejects_a_frame_seq_from_no_frame_we_posted() {
         let items = two_items();
-        let err = parse_done_claim(&full_claim(), &items, &[3, 5]).unwrap_err();
+        let err = parse_claim(&full_claim(), &items, &[3, 5]).unwrap_err();
         assert!(err.contains("frame_seq 12 is not a screenshot from this run"));
         assert!(err.contains("3, 5"), "the correction names what would work");
         assert!(err.contains("Omit frame_seq"));
 
         // No frames posted at all: still refused, with an honest reason.
-        assert!(parse_done_claim(&full_claim(), &items, &[])
+        assert!(parse_claim(&full_claim(), &items, &[])
             .unwrap_err()
             .contains("posted no screenshots yet"));
 
         // Not a number.
         let mut bad = full_claim();
         bad["items"][0]["frame_seq"] = json!("twelve");
-        assert!(parse_done_claim(&bad, &items, &[12]).unwrap_err().contains("must be a number"));
+        assert!(parse_claim(&bad, &items, &[12]).unwrap_err().contains("must be numbers"));
 
         // Explicit null is "I have no frame", not an error.
         let mut null_frame = full_claim();
         null_frame["items"][0]["frame_seq"] = Value::Null;
-        assert_eq!(
-            parse_done_claim(&null_frame, &items, &[]).unwrap().items[0].frame_seq,
-            None
-        );
+        assert!(parse_claim(&null_frame, &items, &[]).unwrap().items[0].frame_seqs.is_empty());
     }
 
     /// Two entries for one item would leave the operator with two verdicts to
@@ -2276,9 +2754,9 @@ mod tests {
         let items = two_items();
         let mut dup = full_claim();
         dup["items"][1]["item_id"] = dup["items"][0]["item_id"].clone();
-        assert!(parse_done_claim(&dup, &items, &[12]).unwrap_err().contains("appears twice"));
+        assert!(parse_claim(&dup, &items, &[12]).unwrap_err().contains("appears twice"));
 
-        assert!(parse_done_claim(&full_claim(), &[], &[12])
+        assert!(parse_claim(&full_claim(), &[], &[12])
             .unwrap_err()
             .contains("carries no checklist"));
     }
@@ -2291,7 +2769,7 @@ mod tests {
         let mut long = full_claim();
         long["items"][0]["evidence_note"] = json!("é".repeat(CLAIM_NOTE_CHARS + 400));
         long["summary"] = json!("x".repeat(CLAIM_SUMMARY_CHARS + 400));
-        let claim = parse_done_claim(&long, &items, &[12]).unwrap();
+        let claim = parse_claim(&long, &items, &[12]).unwrap();
         assert!(claim.items[0].evidence_note.ends_with('…'));
         assert!(claim.items[0].evidence_note.chars().count() <= CLAIM_NOTE_CHARS + 1);
         assert!(claim.summary.chars().count() <= CLAIM_SUMMARY_CHARS + 1);
@@ -2299,7 +2777,7 @@ mod tests {
         let many: Vec<Value> = (0..CLAIM_MAX_ITEMS + 1)
             .map(|_| json!({"item_id": items[0].item_id, "satisfied": true, "evidence_note": "n"}))
             .collect();
-        assert!(parse_done_claim(&json!({"items": many, "summary": "s"}), &items, &[])
+        assert!(parse_claim(&json!({"items": many, "summary": "s"}), &items, &[])
             .unwrap_err()
             .contains("at most"));
     }
@@ -2310,15 +2788,19 @@ mod tests {
     /// false claim, never as a fact.
     #[test]
     fn claim_payload_is_structured_and_never_says_done() {
-        let claim = parse_done_claim(&full_claim(), &two_items(), &[12]).unwrap();
+        let claim = parse_claim(&full_claim(), &two_items(), &[12]).unwrap();
         let p = claim_status_payload("run-1", &claim);
         assert_eq!(p["kind"], "done_claim");
         assert_eq!(p["run_id"], "run-1");
         assert_eq!(p["claimed_satisfied"], 1);
         assert_eq!(p["claimed_total"], 2);
         assert_eq!(p["claims"][0]["frame_seq"], 12);
+        assert_eq!(p["claims"][0]["frame_seqs"], json!([12]));
         assert_eq!(p["claims"][0]["item_id"], "e4777019-5f63-4776-a800-577c965bb88c");
         assert_eq!(p["claims"][1]["frame_seq"], Value::Null);
+        assert_eq!(p["claims"][1]["frame_seqs"], json!([]));
+        // A run with no mid-run marks still carries the key, empty.
+        assert_eq!(p["marks"], json!([]));
 
         let text = p["text"].as_str().unwrap();
         assert!(text.starts_with("The worker CLAIMS 1 of 2"));
@@ -2347,6 +2829,328 @@ mod tests {
         let note = frame_seq_note(&[7, 9]).unwrap();
         assert!(note.contains("frame_seq 7, 9"));
         assert!(note.contains("claim_done"));
+        assert!(note.contains("mark_evidence"), "the turn it happened is the turn to say so");
+    }
+
+    // ---- multi-frame evidence and the mid-run mark --------------------------
+
+    /// Evidence is a LIST: an item is routinely proved by "I typed it" plus "I
+    /// re-read it after fixing the typo". Both spellings and both shapes are
+    /// accepted for the reason in `parse_frame_list` — this is the last call of
+    /// a long run and a rejection over a key name costs a whole turn.
+    #[test]
+    fn claim_accepts_several_frames_under_either_spelling() {
+        let items = two_items();
+        let posted = [7, 9, 12];
+        let with = |k: &str, v: Value| {
+            let mut input = full_claim();
+            let entry = input["items"][0].as_object_mut().unwrap();
+            entry.remove("frame_seq");
+            entry.insert(k.to_string(), v);
+            parse_claim(&input, &items, &posted).unwrap().items[0].frame_seqs.clone()
+        };
+        assert_eq!(with("frame_seqs", json!([9, 12])), vec![9, 12], "the canonical shape");
+        assert_eq!(with("frame_seq", json!([9, 12])), vec![9, 12], "singular key, list value");
+        assert_eq!(with("frame_seqs", json!(12)), vec![12], "plural key, one number");
+        assert_eq!(with("frame_seq", json!(12)), vec![12], "the pre-list shape, still fine");
+        // Order is the model's; a repeat is not two pieces of evidence.
+        assert_eq!(with("frame_seqs", json!([12, 9, 12])), vec![12, 9]);
+        // Every seq is still checked against what this run posted.
+        let mut bad = full_claim();
+        bad["items"][0]["frame_seqs"] = json!([9, 400]);
+        assert!(parse_claim(&bad, &items, &posted)
+            .unwrap_err()
+            .contains("frame_seq 400 is not a screenshot from this run"));
+    }
+
+    /// Past a handful the model has stopped citing and started dumping the run.
+    #[test]
+    fn frames_are_capped_per_item() {
+        let items = two_items();
+        let posted: Vec<i64> = (1..=20).collect();
+        let too_many: Vec<i64> = (1..=(CLAIM_MAX_FRAMES as i64 + 1)).collect();
+        let mut input = full_claim();
+        input["items"][0]["frame_seqs"] = json!(too_many);
+        let err = parse_claim(&input, &items, &posted).unwrap_err();
+        assert!(err.contains(&format!("at most {CLAIM_MAX_FRAMES}")));
+
+        let ok: Vec<i64> = (1..=CLAIM_MAX_FRAMES as i64).collect();
+        input["items"][0]["frame_seqs"] = json!(ok);
+        assert_eq!(
+            parse_claim(&input, &items, &posted).unwrap().items[0].frame_seqs.len(),
+            CLAIM_MAX_FRAMES
+        );
+
+        // Same ceiling on a mark, through the same helper.
+        let m = json!({"item_id": items[0].item_id, "note": "n", "frame_seqs": too_many});
+        assert!(parse_evidence_mark(&m, &items, &posted, 0, 1, 0)
+            .unwrap_err()
+            .contains("at most"));
+    }
+
+    /// The mark reuses `claim_done`'s identity rules exactly — one tool being
+    /// looser than the other would teach the model a shape the strict one then
+    /// refuses at the end of the run, which is the worst possible moment.
+    #[test]
+    fn mark_validates_identity_the_same_way_as_the_claim() {
+        let items = two_items();
+        let posted = [12];
+        let call = |v: Value| parse_evidence_mark(&v, &items, &posted, 0, 4, 0);
+
+        let ok = call(json!({"item_id": items[0].item_id, "frame_seqs": [12], "note": "typed it"}))
+            .unwrap();
+        assert_eq!(ok.item_id, items[0].item_id);
+        assert_eq!(ok.text, items[0].text, "denormalized, like a claim row");
+        assert_eq!(ok.frame_seqs, vec![12]);
+        assert_eq!(ok.step, 4);
+
+        // An unambiguous prefix resolves and is STORED canonical.
+        let short = &items[0].item_id[..10];
+        assert_eq!(
+            call(json!({"item_id": short, "note": "n", "frame_seqs": [12]})).unwrap().item_id,
+            items[0].item_id
+        );
+        // Unknown id names the legal ones; nothing is guessed.
+        let err = call(json!({"item_id": "nope", "note": "n"})).unwrap_err();
+        assert!(err.contains("is not an item_id on this task"));
+        assert!(err.contains(&items[1].item_id));
+        // A frame from no frame we posted is refused, with what would work.
+        let err = call(json!({"item_id": items[0].item_id, "frame_seqs": [88], "note": "n"}))
+            .unwrap_err();
+        assert!(err.contains("frame_seq 88 is not a screenshot from this run"));
+        assert!(err.contains("12"));
+        // A mark with no note is the prose blob this feature replaced.
+        assert!(call(json!({"item_id": items[0].item_id, "frame_seqs": [12]}))
+            .unwrap_err()
+            .contains("`note` is required"));
+        // No checklist, no marking — same gate as the claim.
+        assert!(parse_evidence_mark(&json!({"item_id": "x"}), &[], &posted, 0, 1, 0)
+            .unwrap_err()
+            .contains("carries no checklist"));
+    }
+
+    /// Marks ACCUMULATE, including for the same item twice: an item can become
+    /// true, break, and become true again, and all three moments are the story
+    /// the operator asked for. The cap is on the run, not on the item.
+    #[test]
+    fn marks_accumulate_and_re_marking_one_item_is_legal() {
+        let items = two_items();
+        let posted = [7, 9, 12];
+        let first = mark(
+            json!({"item_id": items[0].item_id, "frame_seqs": [7], "note": "typed the line"}),
+            &items, &posted, 27,
+        );
+        let again = mark(
+            json!({"item_id": items[0].item_id, "frame_seqs": [9, 12], "note": "fixed the typo"}),
+            &items, &posted, 33,
+        );
+        assert_ne!(first, again, "two observations of one item, not one overwritten");
+        assert_eq!(first.step, 27);
+        assert_eq!(again.frame_seqs, vec![9, 12]);
+
+        // The ceiling is on the whole run, and the refusal tells the model what
+        // to do instead of marking again.
+        let err = parse_evidence_mark(
+            &json!({"item_id": items[0].item_id, "note": "n"}),
+            &items, &posted, CLAIM_MAX_MARKS, 40, 0,
+        )
+        .unwrap_err();
+        assert!(err.contains(&CLAIM_MAX_MARKS.to_string()));
+        assert!(err.contains("claim_done"));
+
+        // The ack never reads as an approval or as the end of the task.
+        let ack = mark_ack_text(&first, 1);
+        assert!(ack.contains("not an approval"));
+        assert!(ack.contains("the task is not finished"));
+        assert!(ack.contains("frames 7"));
+        assert!(mark_ack_text(&again, 2).contains("frames 9, 12"));
+    }
+
+    /// The end-of-run call becomes a CONFIRMATION: what was marked mid-run,
+    /// while the frame was on screen, is inherited, and what the model says now
+    /// wins over it — including a contradiction.
+    #[test]
+    fn claim_prefills_from_marks_and_the_model_still_gets_the_last_word() {
+        let items = two_items();
+        let posted = [7, 9, 12];
+        let marks = vec![
+            mark(
+                json!({"item_id": items[0].item_id, "frame_seqs": [7], "note": "typed the line"}),
+                &items, &posted, 27,
+            ),
+            mark(
+                json!({"item_id": items[0].item_id, "frame_seqs": [9], "note": "typo fixed"}),
+                &items, &posted, 33,
+            ),
+            mark(
+                json!({"item_id": items[1].item_id, "frame_seqs": [12], "note": "shows 42"}),
+                &items, &posted, 51,
+            ),
+        ];
+        // Item 0: nothing but `satisfied` — the whole point of marking early.
+        // Item 1: the model re-cites, and its word wins.
+        let input = json!({
+            "items": [
+                {"item_id": items[0].item_id, "satisfied": true},
+                {"item_id": items[1].item_id, "satisfied": false,
+                 "evidence_note": "it went back to 0", "frame_seqs": [7]},
+            ],
+            "summary": "one done, one broke",
+        });
+        let claim = parse_done_claim(&input, &items, &posted, &marks).unwrap();
+        assert_eq!(claim.items[0].frame_seqs, vec![7, 9], "every marked frame, in order");
+        assert_eq!(claim.items[0].evidence_note, "typo fixed", "the LATEST observation");
+        assert!(claim.items[0].satisfied, "satisfied is always the model's own word");
+        assert_eq!(claim.items[1].frame_seqs, vec![7], "the model's citation wins");
+        assert_eq!(claim.items[1].evidence_note, "it went back to 0");
+        assert!(!claim.items[1].satisfied, "a mark can be contradicted");
+
+        // An item marked and then not mentioned is a gap worth one more turn.
+        let partial = json!({
+            "items": [{"item_id": items[0].item_id, "satisfied": true}],
+            "summary": "s",
+        });
+        let claim = parse_done_claim(&partial, &items, &posted, &marks).unwrap();
+        let ack = claim_ack_text(&claim);
+        assert!(ack.contains("marked evidence for"));
+        assert!(ack.contains(&items[1].item_id));
+        assert!(!ack.contains("stop now"), "do not send it away with a gap");
+    }
+
+    /// With no marks the claim is exactly the pre-mark_evidence one: nothing is
+    /// inherited, a missing `evidence_note` is still refused, and the payload
+    /// gains only empty additions. A model that marks nothing all run must land
+    /// on the old behaviour.
+    #[test]
+    fn a_run_that_marks_nothing_behaves_as_before() {
+        let items = two_items();
+        let bare = json!({
+            "items": [{"item_id": items[0].item_id, "satisfied": true}],
+            "summary": "s",
+        });
+        assert!(parse_claim(&bare, &items, &[12]).unwrap_err().contains("missing `evidence_note`"));
+
+        let claim = parse_claim(&full_claim(), &items, &[12]).unwrap();
+        assert!(claim.marks.is_empty());
+        assert!(claim_ack_text(&claim).ends_with("stop now."));
+        let p = claim_status_payload("run-1", &claim);
+        assert!(!p["text"].as_str().unwrap().contains("During the run"));
+        assert!(p["text"].as_str().unwrap().contains("claims YES (frame 12)"));
+    }
+
+    /// The marks reach the operator with the step and the time at which the
+    /// model said the item had become true — "when did this become true" is the
+    /// question the per-item screenshots are being asked for.
+    #[test]
+    fn the_payload_carries_per_item_frames_and_the_mid_run_marks() {
+        let items = two_items();
+        let posted = [7, 9, 12];
+        let marks = vec![mark(
+            json!({"item_id": items[0].item_id, "frame_seqs": [7, 9], "note": "typed and checked"}),
+            &items, &posted, 27,
+        )];
+        let input = json!({
+            "items": [{"item_id": items[0].item_id, "satisfied": true}],
+            "summary": "did the first one",
+        });
+        let claim = parse_done_claim(&input, &items, &posted, &marks).unwrap();
+        let p = claim_status_payload("run-9", &claim);
+
+        // Nothing renamed: every field the console already reads still resolves.
+        assert_eq!(p["kind"], "done_claim");
+        assert_eq!(p["run_id"], "run-9");
+        assert_eq!(p["claimed_satisfied"], 1);
+        assert_eq!(p["claimed_total"], 1);
+        assert_eq!(p["summary"], "did the first one");
+        assert_eq!(p["claims"][0]["item_id"], items[0].item_id);
+        assert_eq!(p["claims"][0]["satisfied"], true);
+        assert_eq!(p["claims"][0]["evidence_note"], "typed and checked");
+        assert_eq!(p["claims"][0]["frame_seq"], 7, "the singular field is the first frame");
+        // ...and the addition.
+        assert_eq!(p["claims"][0]["frame_seqs"], json!([7, 9]));
+        assert_eq!(p["marks"][0]["item_id"], items[0].item_id);
+        assert_eq!(p["marks"][0]["frame_seqs"], json!([7, 9]));
+        assert_eq!(p["marks"][0]["step"], 27);
+        assert_eq!(p["marks"][0]["at_ms"], 1_700_000_000_000u64);
+        assert_eq!(p["marks"][0]["note"], "typed and checked");
+
+        let text = p["text"].as_str().unwrap();
+        assert!(text.contains("claims YES (frames 7, 9)"), "plural reads as plural");
+        assert!(text.contains("During the run the worker reported:"));
+        assert!(text.contains("step 27"));
+        assert!(text.contains("NOT an approval"));
+        assert!(p.to_string().len() < PAYLOAD_SANITY_BYTES);
+    }
+
+    /// The mid-run tool says, in its own description, that it approves nothing
+    /// and ends nothing — the ack repeats it, and so does the prompt.
+    #[test]
+    fn mark_tool_schema_carries_the_ids_and_the_invariant() {
+        let items = two_items();
+        let schema = mark_evidence_tool(&items).expect("items are owed");
+        assert_eq!(schema["name"], "mark_evidence");
+        let ids: Vec<&str> = schema["input_schema"]["properties"]["item_id"]["enum"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec![items[0].item_id.as_str(), items[1].item_id.as_str()]);
+        assert_eq!(
+            schema["input_schema"]["required"],
+            json!(["item_id", "frame_seqs", "note"])
+        );
+        let desc = schema["description"].as_str().unwrap();
+        assert!(desc.contains(&items[1].item_id), "ids inlined next to the call");
+        assert!(desc.contains("does NOT mark anything done"));
+        assert!(desc.contains("every mark is kept"));
+        assert!(desc.contains("claim_done once at the very end"));
+    }
+
+    /// The worst case the payload cap must survive: the item ceiling, the frame
+    /// ceiling on every one of them, and the mark ceiling.
+    #[test]
+    fn the_payload_stays_inside_the_cap_at_every_ceiling() {
+        let raw: Vec<Value> = (0..CLAIM_MAX_ITEMS)
+            .map(|i| json!({
+                "item_id": format!("item-{i:04}-aaaa-bbbb"),
+                "text": "x".repeat(CLAIM_ITEM_TEXT_CHARS),
+                "approved": false,
+            }))
+            .collect();
+        let items = checklist_items(&json!(raw));
+        let posted: Vec<i64> = (1..=40).collect();
+        let frames: Vec<i64> = (1..=CLAIM_MAX_FRAMES as i64).collect();
+        let marks: Vec<EvidenceMark> = (0..CLAIM_MAX_MARKS)
+            .map(|i| mark(
+                json!({
+                    "item_id": items[i % items.len()].item_id,
+                    "frame_seqs": frames,
+                    "note": "n".repeat(CLAIM_NOTE_CHARS),
+                }),
+                &items, &posted, i as i64,
+            ))
+            .collect();
+        let entries: Vec<Value> = items
+            .iter()
+            .map(|it| json!({
+                "item_id": it.item_id,
+                "satisfied": true,
+                "evidence_note": "e".repeat(CLAIM_NOTE_CHARS),
+                "frame_seqs": frames,
+            }))
+            .collect();
+        let input = json!({"items": entries, "summary": "s".repeat(CLAIM_SUMMARY_CHARS)});
+        let claim = parse_done_claim(&input, &items, &posted, &marks).unwrap();
+        let p = claim_status_payload("r", &claim);
+        assert!(p.to_string().len() < PAYLOAD_SANITY_BYTES, "the backend would 422 it");
+        // It shrank by dropping the OLDEST marks, and said so — the claim rows,
+        // which are the message, all survived.
+        assert_eq!(p["claims"].as_array().unwrap().len(), CLAIM_MAX_ITEMS);
+        let omitted = p["marks_omitted"].as_u64().unwrap() as usize;
+        assert!(omitted > 0, "this input does not fit; something must give");
+        assert_eq!(p["marks"].as_array().unwrap().len(), CLAIM_MAX_MARKS - omitted);
+        assert_eq!(p["kind"], "done_claim", "nothing about the shape changes on the way down");
+
+        // A realistic claim is nowhere near the cap and keeps every mark.
+        let small = claim_status_payload("r", &parse_claim(&full_claim(), &two_items(), &[12]).unwrap());
+        assert_eq!(small["marks_omitted"], 0);
     }
 
     // ---- the re-readback msg_id --------------------------------------------

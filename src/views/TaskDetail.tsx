@@ -52,6 +52,17 @@ import {
 // counts as done (checklist) → what the worker asserts and the screen it
 // stopped on (claim + frames) → what it actually did (trajectory) → the
 // conversation (diary). Nothing on that path is a navigation.
+//
+// The CHECKLIST is where that path ends, so it is where the evidence had to
+// land. Promoting one final frame answered "where did the machine stop", which
+// is not the question a two-item checklist asks: on the run this was judged
+// against, item one became true at frame #27 and item two at #51, and the run
+// stopped at #55 — one picture cannot prove two criteria, and on a long task it
+// proves neither. So each checklist row now carries its OWN evidence: the
+// frames the worker cited for THAT item, thumbnailed beside the approve toggle,
+// enlarging in place. The operator ticks a criterion while looking at the
+// pictures of that criterion, which is why the run's events are fetched once at
+// this level and shared down instead of living inside the run card.
 
 // One diary entry, field-for-field routers/channel.py::_serialize.
 interface DiaryMessage {
@@ -103,10 +114,17 @@ const MAX_PAGES_PER_TICK = 25
 // and points at the full run page, which has the whole thing.
 const TRAJECTORY_ROWS = 400
 
-// Thumbnails in the evidence strip beside the promoted final frame. The strip
-// is for "what did the screen look like on the way here", not an archive — the
-// trajectory below carries every frame in its place in the story.
+// Thumbnails in the run's undirected "how it got there" strip. That strip is
+// now a FALLBACK — see FinalFrame — so this is the cap on the one case that
+// still draws it: a run that cited no frames against any criterion.
 const STRIP_FRAMES = 12
+
+// Thumbnails rendered inline for ONE checklist item. A criterion's evidence is
+// "typed it" and "fixed it", not an archive; a worker that cites twenty frames
+// for one item has stopped citing and started dumping, and the checklist card
+// must stay a list of criteria rather than become a contact sheet. Past this
+// the row says how many it is not drawing, and the seqs are still named.
+const ITEM_FRAMES = 6
 
 // Lines of narration or payload before a row collapses. FleetRun's number.
 const CLAMP_LINES = 12
@@ -258,6 +276,20 @@ function TaskDetail() {
   // second source of truth about which run belongs to this task.
   const runs = useMemo(() => runsInThread(thread, task), [thread, task])
   const claims = useMemo(() => claimsInThread(thread, runs), [thread, runs])
+
+  // The latest run's timeline, read ONCE here and handed to both the checklist
+  // above and the run card below. It lives at this level because the checklist
+  // is now the verdict surface and needs the frames a criterion cites, and the
+  // run card is the only other thing that wants them — two hooks would be two
+  // drains of the same run and two independent re-signing clocks for the same
+  // presigned URLs, which is how one frame in a strip goes dead while the
+  // identical frame in the trajectory stays alive.
+  //
+  // The consequence, stated rather than hidden: collapsing the latest run no
+  // longer stops its poll. The checklist is still showing that run's frames, so
+  // stopping would be stopping the thing the operator is looking at.
+  const latestRun = runs.length > 0 ? runs[runs.length - 1] : null
+  const latestFeed = useRunEvents(latestRun?.run_id ?? '', latestRun !== null)
 
   // All three verbs go through the shared PATCH (patchTaskStatus, which the
   // Inbox rows use too). A failure re-reads the task — a 409 means it moved
@@ -494,14 +526,32 @@ function TaskDetail() {
       {task && <SpecCard task={task} />}
 
       {/* Between the spec (what was asked) and the diary (what happened): the
-          checklist is the bridge — the ask broken into judgeable criteria. */}
-      {task && <ChecklistCard task={task} onChanged={() => fetchTask(true)} />}
+          checklist is the bridge — the ask broken into judgeable criteria, and
+          now the surface the verdict is actually reached on, each criterion
+          carrying the frames cited for it. */}
+      {task && (
+        <ChecklistCard
+          task={task}
+          runs={runs}
+          claims={claims}
+          feed={latestFeed}
+          onChanged={() => fetchTask(true)}
+        />
+      )}
 
       {/* THE RUN — directly under the criteria it is evidence for, and above
           the diary. The claim ("the worker says both items are met") is
           worthless without the screen behind it, so the two are adjacent and
           the operator never leaves this page to see either. */}
-      {task && <TaskRuns task={task} runs={runs} claims={claims} deviceId={deviceId} />}
+      {task && (
+        <TaskRuns
+          task={task}
+          runs={runs}
+          claims={claims}
+          latestFeed={latestFeed}
+          deviceId={deviceId}
+        />
+      )}
 
       {task && (
         <Card title={<SectionTitle>Diary</SectionTitle>}>
@@ -604,7 +654,30 @@ function SpecCard({ task }: { task: TaskRecord }) {
 // Every mutation POSTs and then re-reads the task (`onChanged`): the backend
 // copy is the only copy, and rendering our guess instead of its answer is how
 // two open consoles would drift.
-function ChecklistCard({ task, onChanged }: { task: TaskRecord; onChanged: () => void }) {
+//
+// It is also the VERDICT SURFACE. Each row carries, inline: the criterion, the
+// approve toggle, what the worker asserts about it, and the frames the worker
+// cited for THAT criterion — so approving happens with the pictures of the
+// thing being approved on screen, rather than after a scroll to a separate
+// evidence section and a mental join against a strip of thumbnails.
+//
+// Everything the claim adds is additive and conditional: a task with no
+// checklist, or a run that made no claim, renders exactly the rows this card
+// rendered before any of it existed.
+function ChecklistCard({
+  task,
+  runs,
+  claims,
+  feed,
+  onChanged,
+}: {
+  task: TaskRecord
+  runs: RunRef[]
+  claims: Map<string, TaskClaim>
+  /** The LATEST run's feed — the only run whose events this page holds. */
+  feed: RunFeed
+  onChanged: () => void
+}) {
   // Defensive on shape: the checklist fields land with parallel backend work,
   // so an older serializer hands us undefined (or its old opaque slot).
   const items: ChecklistItem[] = Array.isArray(task.checklist) ? task.checklist : []
@@ -649,6 +722,9 @@ function ChecklistCard({ task, onChanged }: { task: TaskRecord; onChanged: () =>
   }, [draft, call])
 
   const approved = items.filter((i) => i.approved).length
+  // Which claim speaks for each criterion, and which frames back it. Derived
+  // from the runs and the ONE feed this page holds — never a per-frame request.
+  const evidence = useMemo(() => itemEvidence(runs, claims, feed.events), [runs, claims, feed.events])
 
   return (
     <Card
@@ -676,8 +752,9 @@ function ChecklistCard({ task, onChanged }: { task: TaskRecord; onChanged: () =>
         {items.map((item) => (
           <div
             key={item.item_id}
-            style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--sp-2)' }}
+            style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}
           >
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--sp-2)' }}>
             <button
               onClick={() => call(`/${encodeURIComponent(item.item_id)}/${item.approved ? 'unapprove' : 'approve'}`, { method: 'POST' }, item.item_id)}
               disabled={readonly || busyId !== null}
@@ -733,6 +810,10 @@ function ChecklistCard({ task, onChanged }: { task: TaskRecord; onChanged: () =>
                 ✕
               </IconButton>
             )}
+          </div>
+            {/* Indented to the criterion's own text column, so a row's evidence
+                reads as belonging to that row and not to the list. */}
+            <ItemEvidenceRow evidence={evidence.get(item.item_id) ?? null} feed={feed} />
           </div>
         ))}
 
@@ -888,8 +969,20 @@ interface ClaimItem {
   /** null when the worker named the item but said nothing either way. */
   satisfied: boolean | null
   evidence_note: string | null
-  /** The frame the worker points at, by run event seq. */
-  frame_seq: number | null
+  /** Every frame the worker points at for THIS item, by run event seq, in run
+   *  order. Plural because one criterion routinely takes more than one picture
+   *  to show — "typed it" and "fixed it" are two frames of one claim — and
+   *  because the mid-run mark tool lets the model cite as it goes, so the seqs
+   *  accumulate across turns. Empty is a real and meaningful answer. */
+  frame_seqs: number[]
+  /** The turn the worker says this became true, when it said. A claim posted at
+   *  the end of a 300-turn run cannot answer "when" from its position in the
+   *  log; only the mark that was made in the turn itself can. The worker's
+   *  `step` is the run loop's turn counter — the same number the trajectory
+   *  rules off as "Turn N" — so it is shown as a turn. */
+  marked_turn: number | null
+  /** Epoch ms, from `at_ms` (the worker's own clock) or a timestamp string. */
+  marked_at_ms: number | null
 }
 
 interface TaskClaim {
@@ -897,18 +990,80 @@ interface TaskClaim {
   items: ClaimItem[]
 }
 
+// One seq citation. `frame_seq` is genuinely optional and arrives as JSON null
+// when the worker cited no frame. Number(null) is 0 and Number('') is 0, and 0
+// is a real seq — so an absent frame read through Number() claims the run's
+// FIRST frame as the evidence for the item. Only a number or a non-blank string
+// is a citation.
+function seqOrNull(raw: unknown): number | null {
+  if (typeof raw !== 'number' && !(typeof raw === 'string' && raw.trim() !== '')) return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+// Every frame a claim row cites, from either spelling.
+//
+// `frame_seqs` is the shape the worker is moving to and `frame_seq` the one it
+// shipped with; the singular is kept for tolerance rather than deprecated, so
+// both are read and unioned. Sorted ascending because the seqs are the run's
+// own order and an operator reading two frames of one criterion is reading a
+// before and an after — reversing them would invert the story.
+function frameSeqsFrom(r: Record<string, unknown>): number[] {
+  const out: number[] = []
+  const push = (v: unknown) => {
+    const n = seqOrNull(v)
+    if (n !== null && !out.includes(n)) out.push(n)
+  }
+  const many = r.frame_seqs ?? r.frames
+  if (Array.isArray(many)) for (const v of many) push(v)
+  push(r.frame_seq)
+  return out.sort((a, b) => a - b)
+}
+
+// The turn a mark was made in. `step` is what the worker sends; the others are
+// spellings a payload might reasonably use for the same number. Turn numbers
+// are 1-based in the trajectory's own rule, so 0 is not a turn and is not
+// treated as one — which also keeps a zero-valued default from reading as
+// "marked in the very first turn".
+function turnFrom(r: Record<string, unknown>): number | null {
+  const n = seqOrNull(r.step ?? r.marked_turn ?? r.satisfied_turn ?? r.turn)
+  return n !== null && n > 0 ? n : null
+}
+
+// When a mark was made. `at_ms` is epoch millis off the worker's own clock;
+// everything else is a timestamp string, read as UTC like every other one on
+// this page.
+function markedMs(r: Record<string, unknown>): number | null {
+  const raw = r.at_ms ?? r.marked_at_ms
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw
+  const iso = str(r.marked_at) ?? str(r.satisfied_at) ?? str(r.at)
+  const ms = iso ? parseUtcMs(iso) : NaN
+  return Number.isFinite(ms) ? ms : null
+}
+
 // Parse a per-item claim out of a diary payload.
 //
 // The shape is channel.rs's `claim_status_payload`: a `status` message tagged
 // `kind: "done_claim"`, carrying `claims: [{item_id, text, satisfied,
-// evidence_note, frame_seq}]`, a `summary`, and the whole thing again as prose
-// in `text` for consumers that read no structure.
+// evidence_note, frame_seq(s)}]`, a `summary`, and the whole thing again as
+// prose in `text` for consumers that read no structure.
 //
-// Read tolerantly all the same, and NOTHING here may be required. A payload
-// that is not a claim returns null and the page renders exactly as it did
-// before the worker learned to claim — off the trajectory and the frames, which
-// are a complete answer on their own. Every run before this shipped, and every
-// task with no checklist, is that case.
+// The worker also marks items satisfied MID-RUN — `mark_evidence`, called in
+// the turn an item becomes true, while the frame proving it is still in front of
+// the model — and those marks ride along in the same payload as a `marks` array
+// of `{item_id, text, note, frame_seqs, step, at_ms}`. Both landing places are
+// read: the marks array, merged in by item_id, and the same fields on a claim
+// row directly, since the plural key is new on both sides and neither is worth
+// being brittle about.
+//
+// `frame_seq` is still sent beside `frame_seqs`, holding the FIRST of them, so
+// the union below dedupes rather than double-counting.
+//
+// Read tolerantly throughout, and NOTHING here may be required. A payload that
+// is not a claim returns null and the page renders exactly as it did before the
+// worker learned to claim — off the trajectory and the frames, which are a
+// complete answer on their own. Every run before this shipped, and every task
+// with no checklist, is that case.
 function parseClaim(payload: Record<string, unknown>): TaskClaim | null {
   const nested = (payload.claim ?? null) as Record<string, unknown> | null
   const root = nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : payload
@@ -921,28 +1076,54 @@ function parseClaim(payload: Record<string, unknown>): TaskClaim | null {
     const itemId = str(r.item_id) ?? str(r.id)
     if (!itemId) continue
     const sat = r.satisfied ?? r.met
-    // `frame_seq` is genuinely optional and arrives as JSON null when the
-    // worker cited no frame. Number(null) is 0 and Number('') is 0, and 0 is a
-    // real seq — so an absent frame read through Number() claims the run's
-    // FIRST frame as the evidence for the item. Only a number or a non-blank
-    // string is a citation.
-    const rawFrame = r.frame_seq
-    const frame =
-      typeof rawFrame === 'number' || (typeof rawFrame === 'string' && rawFrame.trim() !== '')
-        ? Number(rawFrame)
-        : NaN
     items.push({
       item_id: itemId,
       text: str(r.text),
       satisfied: typeof sat === 'boolean' ? sat : null,
       evidence_note: str(r.evidence_note) ?? str(r.note),
-      frame_seq: Number.isFinite(frame) ? frame : null,
+      frame_seqs: frameSeqsFrom(r),
+      marked_turn: turnFrom(r),
+      marked_at_ms: markedMs(r),
     })
   }
   // An array that carried no usable row is not a claim — heading a card with
   // "what the worker claims" over nothing would assert something nobody said.
   if (items.length === 0) return null
+  mergeMarks(items, root)
   return { summary: str(root.summary), items }
+}
+
+// Fold the marks array into the claim rows it is about.
+//
+// Frames union. "When" takes the LAST mark, not the first: the worker appends a
+// mark every time an item becomes true, deliberately, because an item can break
+// and be fixed again — so the turn that answers "when did this become true"
+// for an item the worker is now asserting IS satisfied is the most recent one.
+// Every frame from every mark still shows, which is what lets the operator see
+// the break as well as the fix.
+//
+// A mark that names an item the final claim did NOT is dropped on purpose: the
+// claim is what the worker is willing to assert at the end, and a mid-run mark
+// it then left out of that assertion is not evidence the operator should see
+// presented as one. It stays in the diary payload either way — as does
+// `marks_omitted`, the worker's count of the oldest marks it dropped to fit its
+// payload cap, which changes no claim rendered here.
+function mergeMarks(items: ClaimItem[], root: Record<string, unknown>) {
+  const raw = root.marks ?? root.item_marks ?? root.satisfied_marks
+  if (!Array.isArray(raw)) return
+  const byId = new Map(items.map((c) => [c.item_id, c]))
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const m = entry as Record<string, unknown>
+    const hit = byId.get(str(m.item_id) ?? str(m.id) ?? '')
+    if (!hit) continue
+    for (const s of frameSeqsFrom(m)) if (!hit.frame_seqs.includes(s)) hit.frame_seqs.push(s)
+    hit.frame_seqs.sort((a, b) => a - b)
+    const turn = turnFrom(m)
+    if (turn !== null && (hit.marked_turn === null || turn > hit.marked_turn)) hit.marked_turn = turn
+    const at = markedMs(m)
+    if (at !== null && (hit.marked_at_ms === null || at > hit.marked_at_ms)) hit.marked_at_ms = at
+  }
 }
 
 // Claims by run id. A claim naming no run belongs to the newest run — the
@@ -960,6 +1141,181 @@ function claimsInThread(thread: DiaryMessage[], runs: RunRef[]): Map<string, Tas
     out.set(runId, claim)
   }
   return out
+}
+
+// ── what one criterion has to show for itself ───────────────────────────────
+
+interface ItemEvidence {
+  claim: ClaimItem
+  /** 1-based ordinal of the run whose claim this is, and how many runs exist. */
+  ordinal: number
+  runCount: number
+  /** The claim came from a run whose events this page has not fetched. */
+  otherRun: boolean
+  /** Cited frames, resolved out of the run events already in hand. */
+  frames: RunEventRow[]
+  /** Cited seqs that resolved to no frame we hold. */
+  missing: number[]
+}
+
+// Which claim speaks for each criterion, and which frames back it.
+//
+// Newest run wins. A send-back runs the task again, and the operator is judging
+// the latest attempt — but an item satisfied on the FIRST lap and left alone on
+// the second is claimed only by the first lap's claim, and dropping it would
+// leave a criterion looking unaddressed when it was addressed a run ago. So the
+// walk goes backwards and the first claim that names an item keeps it.
+//
+// Frames resolve ONLY out of `events`, which is the latest run's timeline. A
+// claim from an earlier run therefore resolves nothing here and says so — a
+// strip is a strip of one run, and quietly filling it with same-numbered frames
+// from a different run would be a lie in the shape of evidence. Its frames are
+// on that run's own card, one screen down, where opening it fetches them.
+function itemEvidence(
+  runs: RunRef[],
+  claims: Map<string, TaskClaim>,
+  events: RunEventRow[],
+): Map<string, ItemEvidence> {
+  const out = new Map<string, ItemEvidence>()
+  const bySeq = new Map(events.filter(isShot).map((f) => [f.seq, f]))
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const claim = claims.get(runs[i].run_id)
+    if (!claim) continue
+    const latest = i === runs.length - 1
+    for (const c of claim.items) {
+      if (out.has(c.item_id)) continue
+      const frames: RunEventRow[] = []
+      const missing: number[] = []
+      for (const s of c.frame_seqs) {
+        const hit = latest ? bySeq.get(s) : undefined
+        if (hit) frames.push(hit)
+        else missing.push(s)
+      }
+      out.set(c.item_id, {
+        claim: c,
+        ordinal: i + 1,
+        runCount: runs.length,
+        otherRun: !latest,
+        frames,
+        missing,
+      })
+    }
+  }
+  return out
+}
+
+// How an assertion is worded. Hedged in every branch on purpose: the agent is
+// the one saying this, and the human is on the page because that is not the
+// same as it being true.
+function assertedLine(claim: ClaimItem | null): { text: string; tone: string } {
+  if (claim === null) {
+    return { text: 'the worker said nothing about this one', tone: 'var(--sb-text-faint)' }
+  }
+  if (claim.satisfied === true) return { text: 'the worker claims this is met', tone: 'var(--sb-gold)' }
+  if (claim.satisfied === false) {
+    return { text: 'the worker says this is NOT met', tone: 'var(--sb-danger-bright)' }
+  }
+  return {
+    text: 'the worker named this one without saying either way',
+    tone: 'var(--sb-text-faint)',
+  }
+}
+
+// "When did this become true" — the question a claim posted at the END of a run
+// cannot answer by itself, and the mid-run mark can.
+function whenClaimed(claim: ClaimItem): string | null {
+  if (claim.marked_turn !== null) return `marked at turn ${claim.marked_turn}`
+  if (claim.marked_at_ms !== null) return `marked ${relativeTime(claim.marked_at_ms)}`
+  return null
+}
+
+// One criterion's claim and its own frames, under the criterion in the
+// checklist. Renders NOTHING when no claim named this item — a pre-claim run
+// leaves the checklist exactly as it was.
+function ItemEvidenceRow({ evidence, feed }: { evidence: ItemEvidence | null; feed: RunFeed }) {
+  if (!evidence) return null
+  const { claim, frames, missing, otherRun, ordinal, runCount } = evidence
+  const said = assertedLine(claim)
+  const when = whenClaimed(claim)
+  const shown = frames.slice(0, ITEM_FRAMES)
+  const cited = claim.frame_seqs.length
+  const seqList = missing.map((s) => `#${s}`).join(', ')
+
+  return (
+    <div
+      style={{
+        // The 18px toggle plus its gap: the evidence lines up under the
+        // criterion's text, not under the checkbox.
+        marginLeft: 26,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        minWidth: 0,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 'var(--fs-sm)', color: said.tone }}>{said.text}</span>
+        {when && <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>{when}</span>}
+        {/* Never let a frame number stand without the run it belongs to once
+            there is more than one run to confuse it with. */}
+        {runCount > 1 && (
+          <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
+            claimed on run {ordinal} of {runCount}
+          </span>
+        )}
+      </div>
+      {claim.evidence_note && (
+        <span
+          style={{
+            fontSize: 'var(--fs-sm)',
+            lineHeight: 1.5,
+            color: 'var(--sb-text-muted)',
+            whiteSpace: 'pre-wrap',
+          }}
+        >
+          “{claim.evidence_note}”
+        </span>
+      )}
+
+      {/* A claim with no picture behind it is a weaker claim, and it has to
+          LOOK like one. The end frame is not borrowed to fill the gap: it shows
+          where the machine stopped, which is not where this criterion became
+          true, and putting it here would manufacture evidence. */}
+      {cited === 0 && (
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+          no frame cited for this one — nothing on screen was offered as proof of it
+        </span>
+      )}
+      {cited > 0 && otherRun && (
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+          cites {missing.length === 1 ? 'frame' : 'frames'} {seqList} from run {ordinal} — open that
+          run below to see {missing.length === 1 ? 'it' : 'them'}
+        </span>
+      )}
+      {shown.length > 0 && (
+        <div style={{ display: 'flex', gap: 'var(--sp-2)', flexWrap: 'wrap', marginTop: 2 }}>
+          {shown.map((f) => (
+            <Shot key={`${f.seq}:item`} ev={f} width={150} feed={feed} caption={`#${f.seq}`} />
+          ))}
+        </div>
+      )}
+      {frames.length > shown.length && (
+        <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
+          showing {shown.length} of {frames.length} cited frames — the rest are in the trajectory
+          below, in their place in the run
+        </span>
+      )}
+      {!otherRun && missing.length > 0 && (
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+          {feed.loading
+            ? 'reading this run for the frames it cites…'
+            : `cites ${missing.length === 1 ? 'frame' : 'frames'} ${seqList}, which ${
+                missing.length === 1 ? 'is' : 'are'
+              } not in this run's timeline`}
+        </span>
+      )}
+    </div>
+  )
 }
 
 // ── the feed ────────────────────────────────────────────────────────────────
@@ -1144,11 +1500,14 @@ function TaskRuns({
   task,
   runs,
   claims,
+  latestFeed,
   deviceId,
 }: {
   task: TaskRecord
   runs: RunRef[]
   claims: Map<string, TaskClaim>
+  /** Already drained upstairs for the checklist; the latest card reuses it. */
+  latestFeed: RunFeed
   deviceId: string
 }) {
   if (runs.length === 0) {
@@ -1177,6 +1536,7 @@ function TaskRuns({
             latest={i === newest}
             claim={claims.get(run.run_id) ?? null}
             checklist={Array.isArray(task.checklist) ? task.checklist : []}
+            sharedFeed={i === newest ? latestFeed : null}
             deviceId={deviceId}
           />
         ))}
@@ -1191,6 +1551,7 @@ function RunCard({
   latest,
   claim,
   checklist,
+  sharedFeed,
   deviceId,
 }: {
   run: RunRef
@@ -1199,11 +1560,17 @@ function RunCard({
   latest: boolean
   claim: TaskClaim | null
   checklist: ChecklistItem[]
+  /** The feed the checklist above is already reading, for the latest run only.
+   *  An earlier lap has none and pays for its own events when opened. */
+  sharedFeed: RunFeed | null
   deviceId: string
 }) {
   const navigate = useNavigate()
   const [open, setOpen] = useState(latest)
-  const feed = useRunEvents(run.run_id, open)
+  // The hook still runs when a feed was handed down — hooks are unconditional —
+  // but inactive, so it fetches nothing.
+  const ownFeed = useRunEvents(run.run_id, open && sharedFeed === null)
+  const feed = sharedFeed ?? ownFeed
 
   const frames = useMemo(() => feed.events.filter(isShot), [feed.events])
   // The frame the claim rests on: the LAST one the worker managed to put in
@@ -1214,6 +1581,9 @@ function RunCard({
     return frames.length > 0 ? frames[frames.length - 1] : null
   }, [frames])
   const bySeq = useMemo(() => new Map(frames.map((f) => [f.seq, f])), [frames])
+  // Did this run point any frame at any criterion? That is what decides whether
+  // the undirected "how it got there" strip still earns its space below.
+  const addressed = claim !== null && claim.items.some((c) => c.frame_seqs.length > 0)
 
   const label = total > 1 ? `Run ${ordinal} of ${total}` : 'The run'
   const shots = frames.length
@@ -1291,9 +1661,21 @@ function RunCard({
             </div>
           )}
 
-          <ClaimRows claim={claim} checklist={checklist} frames={bySeq} feed={feed} />
+          <ClaimRows
+            claim={claim}
+            checklist={checklist}
+            frames={bySeq}
+            feed={feed}
+            upstairs={latest}
+          />
 
-          <FinalFrame frame={finalFrame} frames={frames} live={feed.live} feed={feed} />
+          <FinalFrame
+            frame={finalFrame}
+            frames={frames}
+            live={feed.live}
+            feed={feed}
+            addressed={addressed}
+          />
 
           <Trajectory feed={feed} />
         </div>
@@ -1302,13 +1684,17 @@ function RunCard({
   )
 }
 
-// WHAT THE WORKER SAYS IT DID, one row per criterion.
+// WHAT THE WORKER SAYS IT DID — the part of it the checklist card cannot show.
 //
-// Every word here is hedged on purpose. An agent asserting that it satisfied a
+// For the LATEST run the per-item claims live upstairs, next to the toggle that
+// judges them; what is left here is the run-scoped remainder: the summary, and
+// claims about criteria that are no longer on the checklist and so have no row
+// up there to sit under. An EARLIER lap still renders in full — its claim has
+// no home on the checklist, which speaks for the newest claim about each item.
+//
+// Every word is hedged on purpose. An agent asserting that it satisfied a
 // criterion is precisely the thing the human is on this page to check, so the
-// UI never says "item met" — it says who says so. The operator's own approval
-// of a criterion stays where it was, in the checklist card above: this card
-// reports, it does not decide.
+// UI never says "item met" — it says who says so.
 //
 // Renders nothing at all when no claim was posted. Older runs and the worker
 // build shipping today post none, and the frames and trajectory below are a
@@ -1319,11 +1705,15 @@ function ClaimRows({
   checklist,
   frames,
   feed,
+  upstairs,
 }: {
   claim: TaskClaim | null
   checklist: ChecklistItem[]
   frames: Map<number, RunEventRow>
   feed: RunFeed
+  /** This run's per-item claims are already rendered on the checklist card, so
+   *  only what the checklist has no row for belongs here. */
+  upstairs: boolean
 }) {
   if (!claim) {
     if (checklist.length === 0) return null
@@ -1339,8 +1729,12 @@ function ClaimRows({
   // one-for-one. An item the worker said nothing about is a row too — silence
   // about a criterion is a finding, and dropping it would hide one.
   const byItem = new Map(claim.items.map((c) => [c.item_id, c]))
-  const rows = checklist.length > 0 ? checklist : []
-  const orphans = claim.items.filter((c) => !rows.some((r) => r.item_id === c.item_id))
+  // For the run whose claim is already up on the checklist, the only rows left
+  // to draw are the ones the checklist HAS no row for. Drawing the rest again
+  // would put the same assertion on the page twice and split the operator's
+  // attention across two copies of one decision.
+  const rows = upstairs ? [] : checklist
+  const orphans = claim.items.filter((c) => !checklist.some((r) => r.item_id === c.item_id))
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
@@ -1355,6 +1749,12 @@ function ClaimRows({
       >
         what the worker claims
       </div>
+      {upstairs && checklist.length > 0 && (
+        <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', lineHeight: 1.5 }}>
+          Item by item, with the frames cited for each, on the checklist above — that is where you
+          approve them.
+        </span>
+      )}
       {rows.map((item) => (
         <ClaimRow
           key={item.item_id}
@@ -1410,15 +1810,14 @@ function ClaimRow({
   /** The criterion this claim names is no longer on the checklist. */
   stale?: boolean
 }) {
-  const frame = claim?.frame_seq != null ? (frames.get(claim.frame_seq) ?? null) : null
-  const asserted =
-    claim === null
-      ? { text: 'the worker said nothing about this one', tone: 'var(--sb-text-faint)' }
-      : claim.satisfied === true
-        ? { text: 'the worker claims this is met', tone: 'var(--sb-gold)' }
-        : claim.satisfied === false
-          ? { text: 'the worker says this is NOT met', tone: 'var(--sb-danger-bright)' }
-          : { text: 'the worker named this one without saying either way', tone: 'var(--sb-text-faint)' }
+  const cited = claim?.frame_seqs ?? []
+  const shown = cited
+    .map((s) => frames.get(s))
+    .filter((f): f is RunEventRow => f !== undefined)
+    .slice(0, ITEM_FRAMES)
+  const missing = cited.filter((s) => !frames.has(s))
+  const asserted = assertedLine(claim)
+  const when = claim ? whenClaimed(claim) : null
 
   return (
     <div
@@ -1447,7 +1846,10 @@ function ClaimRow({
             no longer on the checklist — it was reworded or removed after the worker read it
           </span>
         )}
-        <span style={{ fontSize: 'var(--fs-sm)', color: asserted.tone }}>{asserted.text}</span>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 'var(--fs-sm)', color: asserted.tone }}>{asserted.text}</span>
+          {when && <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>{when}</span>}
+        </div>
         {claim?.evidence_note && (
           <span
             style={{
@@ -1460,37 +1862,69 @@ function ClaimRow({
             “{claim.evidence_note}”
           </span>
         )}
-        {claim?.frame_seq != null && !frame && (
+        {claim !== null && cited.length === 0 && (
           <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
-            points at frame #{claim.frame_seq}, which is not in this run's timeline
+            no frame cited for this one
+          </span>
+        )}
+        {missing.length > 0 && (
+          <span style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
+            points at {missing.length === 1 ? 'frame' : 'frames'}{' '}
+            {missing.map((s) => `#${s}`).join(', ')}, which{' '}
+            {missing.length === 1 ? 'is' : 'are'} not in this run's timeline
           </span>
         )}
       </div>
-      {/* The frame the worker points at, beside the thing it is offered as
+      {/* The frames the worker points at, beside the thing they are offered as
           proof of — the join the operator would otherwise do by hand, scrolling
-          a strip of fourteen thumbnails looking for the right one. */}
-      {frame && <Shot ev={frame} width={200} feed={feed} caption={`frame #${frame.seq}`} />}
+          a strip of fourteen thumbnails looking for the right ones. */}
+      {shown.length > 0 && (
+        <div style={{ display: 'flex', gap: 'var(--sp-2)', flexWrap: 'wrap', flexShrink: 0 }}>
+          {shown.map((f) => (
+            <Shot key={`${f.seq}:claim`} ev={f} width={200} feed={feed} caption={`frame #${f.seq}`} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
-// THE LAST FRAME, large and first.
+// THE LAST FRAME, large — where the machine stopped.
 //
-// Fourteen thumbnails in a row make the final one the fourteenth, and the final
-// one is the only one the claim actually rests on: it is the state of the
-// machine at the moment the worker decided it was finished. Everything else is
-// how it got there. So it is promoted, said out loud, and the rest of the
-// frames follow it as a strip.
+// It keeps its place: "the screen at the moment the worker decided it was
+// finished" is a real fact about the run, and the one frame that is about the
+// RUN rather than about any criterion. What it no longer is, is the evidence —
+// on the two-item run this was judged against it showed a Calculator that had
+// been right for four turns and said nothing at all about Notepad.
+//
+// The undirected "how it got there" strip below it is now a FALLBACK, and the
+// argument for cutting it in the addressed case rather than keeping both:
+//   - Every frame it showed that matters is now shown against the criterion it
+//     is offered as proof of, which is the only reading of a thumbnail that
+//     answers a question. A second, unlabelled copy of the same pictures asks
+//     the operator to do the join by eye again, right after being handed it.
+//   - The trajectory below already carries EVERY frame, in order, with the
+//     action and the narration around it — strictly more than a reversed grid
+//     of twelve, and the honest place to go for "what else happened".
+//   - At 300 turns the strip is an arbitrary window on the last twelve frames
+//     of a hundred. It was never an archive and cannot become one.
+// So it draws only when this run pointed no frame at any criterion — a
+// pre-claim run, or a claim that cited nothing — where it is still the only
+// overview of the run's frames there is, and where cutting it would take
+// something away and give nothing back.
 function FinalFrame({
   frame,
   frames,
   live,
   feed,
+  addressed,
 }: {
   frame: RunEventRow | null
   frames: RunEventRow[]
   live: boolean
   feed: RunFeed
+  /** This run cited at least one frame against at least one criterion. */
+  addressed: boolean
 }) {
   if (!frame) {
     if (feed.events.length === 0) return null
@@ -1502,7 +1936,7 @@ function FinalFrame({
     )
   }
   // Newest-first, and never the promoted frame twice.
-  const strip = frames.filter((f) => f !== frame).reverse()
+  const strip = addressed ? [] : frames.filter((f) => f !== frame).reverse()
   const shown = strip.slice(0, STRIP_FRAMES)
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
@@ -1941,7 +2375,7 @@ function DiaryEntry({
     const claimLine = claim
       ? `claimed the checklist item by item — ${
           claim.items.filter((c) => c.satisfied === true).length
-        } of ${claim.items.length} asserted satisfied, shown with the run above`
+        } of ${claim.items.length} asserted satisfied, shown item by item on the checklist above`
       : null
     return (
       <div

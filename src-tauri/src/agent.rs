@@ -1707,6 +1707,9 @@ async fn run_agent(
     // None for those: only a run that owes typed items has typed items to claim.
     let claim_checklist = crate::channel::take_run_checklist(&app);
     let claim_tool = crate::channel::claim_done_tool(&claim_checklist);
+    // Its mid-run half: same gate, so the two tools and the prompt paragraph
+    // that explains them exist together or not at all.
+    let mark_tool = crate::channel::mark_evidence_tool(&claim_checklist);
     eprintln!("[agent] model endpoint {} ({:?})", ep.base, ep.source);
 
     // --- persistence bootstrap ---
@@ -1838,10 +1841,17 @@ async fn run_agent(
     let tool = computer_tool(disp_w, disp_h);
     // Built once: the set is fixed for the run, and it serializes byte-identically
     // every turn, which the prompt-cache prefix depends on.
-    let tools: Vec<Value> = [Some(tool), Some(cred_tool), Some(element_tool), Some(browser_tool), claim_tool.clone()]
-        .into_iter()
-        .flatten()
-        .collect();
+    let tools: Vec<Value> = [
+        Some(tool),
+        Some(cred_tool),
+        Some(element_tool),
+        Some(browser_tool),
+        mark_tool.clone(),
+        claim_tool.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     // Screenshot event seqs posted so far, in order — the numbers a `claim_done`
     // entry's `frame_seq` may cite. Kept only because the model cannot otherwise
@@ -1849,6 +1859,13 @@ async fn run_agent(
     // that produced the frame, so it is fed back in `frame_seq_note` and checked
     // against this list here.
     let mut frame_seqs: Vec<i64> = Vec::new();
+
+    // The mid-run `mark_evidence` calls, in the order the model made them.
+    // Run-local like `frame_seqs` and for the same reason: they are only ever
+    // read by this run's `claim_done` (which prefills from them) and then ride
+    // into the diary inside the claim, so parking them in ChannelState would
+    // buy nothing but a second run-id match to get wrong.
+    let mut evidence_marks: Vec<crate::channel::EvidenceMark> = Vec::new();
 
     // Consecutive empty assistant turns; reset by any turn that carries content.
     let mut empty_turns: usize = 0;
@@ -2250,6 +2267,43 @@ async fn run_agent(
                     };
                     persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
                     results.push(tool_result(id, outcome));
+                } else if name == "mark_evidence" && mark_tool.is_some() {
+                    // The mid-run half of the claim: "item X just became true,
+                    // here are the frames". It APPROVES NOTHING and does not end
+                    // anything — it accumulates locally and rides into the diary
+                    // inside the final claim. Same availability rule as
+                    // claim_done: a run that was not given the tool treats the
+                    // call as the hallucination it is.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let outcome = match crate::channel::parse_evidence_mark(
+                        &tu["input"],
+                        &claim_checklist,
+                        &frame_seqs,
+                        evidence_marks.len(),
+                        steps,
+                        now_ms,
+                    ) {
+                        Ok(mark) => {
+                            // Append, never replace: an item can become true,
+                            // break, and become true again, and each of those
+                            // moments is evidence the operator asked for by
+                            // name. Dropping the earlier mark would delete the
+                            // first proof at exactly the moment the second one
+                            // is in dispute.
+                            let ack = crate::channel::mark_ack_text(
+                                &mark,
+                                evidence_marks.len() + 1,
+                            );
+                            evidence_marks.push(mark);
+                            ok_text(ack)
+                        }
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
+                    results.push(tool_result(id, outcome));
                 } else if name == "claim_done" && claim_tool.is_some() {
                     // The model's per-item assertion about the task's checklist.
                     // It APPROVES NOTHING — it is stashed and posted to the diary
@@ -2263,10 +2317,17 @@ async fn run_agent(
                     // availability: a run that was not given the tool treats the
                     // call as the hallucination it is, via the `unknown tool` arm
                     // below.
+                    //
+                    // `evidence_marks` makes this a CONFIRMATION rather than the
+                    // first telling: anything the model already reported mid-run
+                    // is prefilled, so the end of the run is not where it has to
+                    // remember frame numbers. On a run with no marks it is empty
+                    // and this is the original flow exactly.
                     let outcome = match crate::channel::parse_done_claim(
                         &tu["input"],
                         &claim_checklist,
                         &frame_seqs,
+                        &evidence_marks,
                     ) {
                         Ok(claim) => {
                             let ack = crate::channel::claim_ack_text(&claim);
