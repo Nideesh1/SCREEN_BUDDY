@@ -595,6 +595,13 @@ fn tasklist_has_other(out: &str, our_pid: Option<u32>) -> bool {
 }
 
 /// Same question for `pgrep -x` output: one pid per line.
+///
+/// Only the non-Windows branch below calls this, but the tests exercise it on
+/// every platform — a parser is worth checking wherever it is read, and the
+/// alternative (gating the tests too) would leave it unverified on the machine
+/// most of this work happens on. `cfg(any(...))` rather than `allow(dead_code)`
+/// so a genuine future orphaning still shows up as a warning.
+#[cfg(any(not(windows), test))]
 fn pgrep_has_other(out: &str, our_pid: Option<u32>) -> bool {
     out.lines().filter_map(|l| l.trim().parse::<u32>().ok()).any(|pid| Some(pid) != our_pid)
 }
