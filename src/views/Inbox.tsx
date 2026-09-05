@@ -240,7 +240,9 @@ export function VerdictControls({
   )
 }
 
-export type TaskPatchOutcome = { ok: true; task: TaskRecord } | { ok: false; message: string }
+export type TaskPatchOutcome =
+  | { ok: true; task: TaskRecord }
+  | { ok: false; message: string; alreadyInState?: boolean }
 
 // Move a task through its lifecycle. `note` rides along only on the send-back
 // edge (awaiting_verdict -> queued, a backend edge landing in parallel with
@@ -268,7 +270,17 @@ export async function patchTaskStatus(
       } catch {
         // keep the status code
       }
-      return { ok: false, message: `Could not update the task: ${detail}` }
+      // "illegal transition: X -> X" is the task already being where we are
+      // asking it to go, which is not a failure of intent: the operator killed
+      // an already-killed task, because a question row survives its task's
+      // death (killing a task does not answer the question the worker blocks
+      // on). Flagged rather than swallowed, so a caller with follow-up work —
+      // the release verdict — can carry on, while a caller that needs the
+      // updated document still knows it did not get one. Newer backends make
+      // this a no-op and never send the 409 at all.
+      const alreadyInState =
+        body.status !== undefined && detail === `illegal transition: ${body.status} -> ${body.status}`
+      return { ok: false, message: `Could not update the task: ${detail}`, alreadyInState }
     }
     return { ok: true, task: (await resp.json()) as TaskRecord }
   } catch (err) {
@@ -721,7 +733,9 @@ function VerdictTaskRow({
       setBusy(false)
       setConfirming(null)
       setSendingBack(false)
-      if (!out.ok) setNotice(out.message)
+      // A task already in the state we asked for is not worth an error banner —
+      // the refresh below drops the row, which is the answer.
+      if (!out.ok && !out.alreadyInState) setNotice(out.message)
       // Refresh either way: success moves the task off this list, and a 409
       // means it moved under us — both are answered by re-reading the queue.
       onChanged()
@@ -959,7 +973,11 @@ function QuestionCard({
     setBusy(true)
     setNotice(null)
     const killed = await patchTaskStatus(taskId, { status: 'killed' })
-    if (!killed.ok) {
+    // An already-killed task is the outcome this button wants, so it falls
+    // through to the release verdict rather than stopping here — stopping was
+    // the bug: the second kill of a task whose question was still open left the
+    // worker exactly as blocked as before, and said only "illegal transition".
+    if (!killed.ok && !killed.alreadyInState) {
       setBusy(false)
       setKilling(false)
       setNotice(killed.message)
