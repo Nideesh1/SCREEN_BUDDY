@@ -417,22 +417,30 @@ keyboard shortcut modifier is `{modifier}` (for example `{modifier}+c` to copy, 
 /// authoritative as the current one.
 const SYSTEM_PROMPT_GROUNDING: &str = "Aiming: after each screenshot you may also receive a \
 numbered list of UI elements read from the operating system's accessibility tree. When a target \
-appears in that list, click it with the `click_element` tool rather than estimating pixel \
-coordinates — the list carries the control's exact rectangle, so it cannot miss, while \
-coordinates read off a downscaled screenshot regularly land on the wrong control. Copy the \
+appears in that list, click it with a `click_element` STEP of the `batch` tool rather than \
+estimating pixel coordinates — the list carries the control's exact rectangle, so it cannot miss, \
+while coordinates read off a downscaled screenshot regularly land on the wrong control. Copy the \
 index, control_type and name exactly as printed. The list is REGENERATED every turn and its \
 indices are valid only for the turn it was printed in: never cite an index from an earlier \
-screenshot, and if a click_element call is rejected because the element moved, take a fresh \
-screenshot and use the new list. When no list is printed, when it is reported empty, or when \
-your target is simply not in it (the Start menu, Electron apps, browsers, games and canvas-drawn \
-UIs commonly expose nothing), fall back to the computer tool's coordinate clicks — that is \
-expected, not a malfunction. The screenshot is always how you UNDERSTAND the screen; the element \
-list only helps you AIM at it.";
+screenshot, and if a step is rejected because the element moved, take a fresh screenshot and use \
+the new list. When no list is printed, when it is reported empty, or when your target is simply \
+not in it (the Start menu, Electron apps, browsers, games and canvas-drawn UIs commonly expose \
+nothing), fall back to the computer tool's coordinate clicks — that is expected, not a \
+malfunction. The screenshot is always how you UNDERSTAND the screen; the element list only helps \
+you AIM at it.\n\n\
+Keystrokes and element clicks exist ONLY as steps of the `batch` tool — there is no way to send \
+one on its own, and trying will be refused without doing anything. So plan ahead: put every step \
+you already know you need into ONE batch. Entering '137' then '+' is a single batch of four \
+steps, not four batches of one. Selecting all and typing replacement text is one batch of two. A \
+batch takes up to four steps and returns one screenshot of the result, which is why it is much \
+faster than acting one step at a time. Coordinate clicks, scrolling and screenshots stay on the \
+computer tool and are still sent one at a time: a guessed coordinate has to be checked before you \
+act again.";
 
 const SYSTEM_PROMPT_BASE: &str = "You are ScreenBuddy, a computer-use agent operating a desktop on the \
 user's behalf. You see the screen via screenshots and act through the `computer` tool \
-(mouse, keyboard, scroll, clipboard), the `click_element` tool and the `batch` tool. \
-Coordinates are pixels in the most recent \
+(screenshots, coordinate clicks, scroll) and the `batch` tool (keystrokes, typing, and clicks \
+aimed at listed elements). Coordinates are pixels in the most recent \
 screenshot, origin top-left. Take a screenshot before acting when you are unsure of the \
 current state. Work in verifiable steps: after any action whose RESULT YOU NEED TO SEE — a \
 click at a guessed coordinate, opening a menu, anything that might not have worked — look at \
@@ -440,9 +448,10 @@ the screen before acting again. But when you already know what an action does an
 action does not depend on seeing it, do not spend a turn looking: send them together with the \
 `batch` tool, up to four at a time, and you get one screenshot for the whole sequence. \
 Pressing 'ctrl+a' and then typing replacement text is one batch, not two turns. Several presses \
-on a keypad or toolbar already visible in the element list are one batch. Coordinate clicks are \
-the exception and `batch` refuses them: a guessed coordinate must be checked before you act \
-again. When the \
+on a keypad or toolbar already visible in the element list are one batch. Keystrokes and element \
+clicks are ONLY available as batch steps, so this is not a suggestion — it is the only way to \
+send them. Coordinate clicks are the exception and `batch` refuses them: a guessed coordinate \
+must be checked before you act again. When the \
 task is complete, stop and summarize what you did. Reference materials for this task are \
 provided at the start of the conversation; consult them as needed. To enter a saved username \
 or password, call the use_credential tool with the target label and field — never type \
@@ -542,62 +551,11 @@ target label (e.g. 'mail.google.com' or 'Amazon — desktop app') and which fiel
     })
 }
 
-/// The `click_element` tool schema — clicking by UI Automation element instead
-/// of by estimated pixel.
-///
-/// # Why a separate tool and not a `computer` action
-///
-/// It cannot be a `computer` action. `computer_20251124` is the server-defined,
-/// schema-LESS tool: we send no `input_schema` and the action vocabulary lives
-/// inside the model. There is no field in which to declare an extra action, and
-/// a model that has never been trained on `uia_click` will not emit it. A custom
-/// tool alongside it is the only mechanism the API offers, and `use_credential`
-/// already establishes the pattern (and the dispatch site) for exactly this: a
-/// local capability the model calls by name, dispatched next to the computer
-/// tool rather than inside it.
-///
-/// # Why the model must echo the identity back
-///
-/// `index` alone is not a safe handle — see `uia::resolve`. The list is rebuilt
-/// every turn and older lists stay in the model's context, so `control_type` and
-/// `name` are required: they turn a stale index into a tool error instead of a
-/// confident click on the wrong control.
-fn click_element_tool() -> Value {
-    json!({
-        "name": "click_element",
-        "description": "Click a UI control by its index in the element list printed with the most \
-recent screenshot. This aims EXACTLY — it clicks the control's real rectangle instead of a \
-coordinate estimated from the image — so prefer it over computer clicks whenever the target \
-appears in that list. You must copy `control_type` and `name` exactly as printed for the index \
-you cite: the list is regenerated every turn, and this call is rejected (nothing is clicked) if \
-the element at that index is no longer the one you named. When no list is printed, or the target \
-is not in it, use the computer tool's click actions with pixel coordinates instead.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "index": {
-                    "type": "integer",
-                    "description": "The element's index in the list printed with the latest screenshot."
-                },
-                "control_type": {
-                    "type": "string",
-                    "description": "The element's control type as printed, e.g. 'Button', 'MenuItem', 'Pane'."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "The element's name as printed, copied exactly (including any \
-keyboard hint such as '(Ctrl+B)'). Use an empty string for an element printed with an empty name."
-                },
-                "button": {
-                    "type": "string",
-                    "enum": ["left", "right", "double"],
-                    "description": "Which click to perform. Defaults to 'left'."
-                }
-            },
-            "required": ["index", "control_type", "name"]
-        }
-    })
-}
+// The click_element SCHEMA is gone: the tool is no longer offered, and its
+// step now lives inside `batch` (same four identity fields, same meaning). The
+// aiming contract it used to carry is in SYSTEM_PROMPT_GROUNDING, and
+// `dispatch_click_element` below still performs the click for a batch step.
+// See `batch_only_refusal` for why it stopped being callable on its own.
 
 // ---- SSE parsing ----------------------------------------------------------
 
@@ -957,6 +915,47 @@ fn push_element_list(content: &mut Vec<Value>) {
 
 
 // ---- batch --------------------------------------------------------------
+
+/// Actions that are no longer reachable one at a time, and the refusal that
+/// steers them into `batch`.
+///
+/// # Why a refusal and not a schema
+///
+/// `computer` is server-defined (`computer_20251124`) and carries no schema of
+/// ours, so its action vocabulary cannot be narrowed from here — `key` and
+/// `type` can only be taken away at dispatch. `click_element` we simply stopped
+/// offering, but a model with an older list still in context will name it
+/// anyway, and answering that with "unknown tool" teaches nothing.
+///
+/// # Why take them away at all
+///
+/// Three runs, three attempts, zero batches. The tool was offered, the system
+/// prompt asked for it, and the contradiction that told the model to screenshot
+/// after every action was removed — and it still pressed 1, 3, 7, +, 2, 4 as six
+/// separate turns with six screenshots. A 27B model imitates its own transcript
+/// far more readily than it follows a rule, and every turn of that transcript
+/// showed single actions working fine.
+///
+/// So the one-at-a-time path is gone rather than discouraged. Reaching for any
+/// of these now means filling in a `steps` array, and an array with one entry
+/// looks unfinished in a way a paragraph of instructions never managed to.
+/// Coordinate clicks, scrolls and screenshots are untouched: those genuinely
+/// need a look between them, which is the whole distinction `batch` encodes.
+fn batch_only_refusal(action: &str) -> Option<String> {
+    let what = match action {
+        "key" => "Pressing a key",
+        "type" => "Typing text",
+        "click_element" => "Clicking a listed element",
+        _ => return None,
+    };
+    Some(format!(
+        "{what} is not available on its own — use the `batch` tool, which takes up to \
+{MAX_BATCH_STEPS} of these steps and returns one screenshot for all of them. Put every step you \
+already know you need into ONE call: if you are entering '137' and then '+', that is one batch of \
+four steps, not four batches of one. Nothing was done; re-send this as a batch."
+    ))
+}
+
 
 /// How many steps one `batch` may carry.
 ///
@@ -1898,7 +1897,6 @@ async fn run_agent(
     // schema-less, so its action vocabulary lives in the model and cannot be
     // extended from here.
     let browser_tool = crate::browser::tool_schema();
-    let element_tool = click_element_tool();
     // Several actions, one screenshot — see `batch_tool` for which actions
     // may be sent unwatched, and why coordinate clicks may not.
     let batch_tool = batch_tool();
@@ -2045,7 +2043,9 @@ async fn run_agent(
     let tools: Vec<Value> = [
         Some(tool),
         Some(cred_tool),
-        Some(element_tool),
+        // click_element is deliberately absent: its step lives inside `batch`
+        // now, which is what makes several presses one turn. See
+        // `batch_only_refusal`.
         Some(browser_tool),
         Some(batch_tool),
         mark_tool.clone(),
@@ -2373,12 +2373,16 @@ async fn run_agent(
                 if name == "computer" || name == "click_element" || name == "batch" {
                     let action =
                         tu["input"].get("action").and_then(|a| a.as_str()).unwrap_or("");
-                    let is_click_element = name == "click_element";
                     let is_batch = name == "batch";
+                    // What the model NAMED, so a bare `click_element` call is
+                    // refused by the same rule as a bare `key`: the tool is no
+                    // longer offered, but an older list stays in context and
+                    // looks just as callable as the current one.
+                    let named = if name == "click_element" { "click_element" } else { action };
                     let mut outcome = if is_batch {
                         dispatch_batch(&app, &comp_state, &tu["input"], &mut last_sent)
-                    } else if is_click_element {
-                        dispatch_click_element(&comp_state, &tu["input"])
+                    } else if let Some(msg) = batch_only_refusal(named) {
+                        err_text(msg)
                     } else {
                         dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent)
                     };
@@ -2386,8 +2390,11 @@ async fn run_agent(
                     // carry changes the screen — and a PARTIAL batch has moved
                     // the screen too, which is why dispatch_batch reports a
                     // failed step without setting `is_error`.
-                    let changes_screen =
-                        is_batch || is_click_element || action_changes_screen(action);
+                    // A refusal did nothing, so the screen has not moved and
+                    // there is no new frame worth attaching — `is_error` on the
+                    // outcome already suppresses the capture below, and this
+                    // keeps the two from disagreeing.
+                    let changes_screen = is_batch || action_changes_screen(action);
 
                     // Show the model what its action did. Without this, a model
                     // that never calls `screenshot` acts on a stale view for the
@@ -3306,23 +3313,50 @@ data: {\"type\":\"message_stop\"}
         );
     }
 
+    /// The identity fields are what turn a stale index into a rejected step
+    /// rather than a confident click on the wrong control, so they must stay
+    /// required now that the click lives inside a batch step. The standalone
+    /// click_element tool is gone (see `batch_only_refusal`), and this is where
+    /// that invariant moved to.
     #[test]
-    fn click_element_tool_requires_the_identity_fields() {
-        let t = click_element_tool();
-        assert_eq!(t["name"], "click_element");
-        let req: Vec<&str> = t["input_schema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        for k in ["index", "control_type", "name"] {
-            assert!(req.contains(&k), "{k} must be required");
+    fn a_batch_click_step_still_carries_the_element_identity() {
+        let t = batch_tool();
+        let props = &t["input_schema"]["properties"]["steps"]["items"]["properties"];
+        for field in ["index", "control_type", "name"] {
+            assert!(
+                props.get(field).is_some(),
+                "a batch step must be able to carry {field}"
+            );
         }
-        // A client-side tool with a schema, NOT a server-defined computer tool:
-        // the schema-less `computer_20251124` has no room for an extra action.
-        assert!(t.get("type").is_none(), "must not claim a server tool type");
-        assert!(t["input_schema"]["properties"]["button"]["enum"].is_array());
+    }
+
+    /// The one-at-a-time paths must refuse rather than work, and must say what
+    /// to do instead — three live runs showed that a model with a working
+    /// single-action path never reaches for the batching one.
+    #[test]
+    fn single_step_actions_are_refused_into_batch() {
+        for action in ["key", "type", "click_element"] {
+            let msg = batch_only_refusal(action)
+                .unwrap_or_else(|| panic!("{action} should be refused on its own"));
+            assert!(msg.contains("batch"), "the refusal must name the tool to use");
+            assert!(
+                msg.contains("Nothing was done"),
+                "the refusal must say the action did not happen"
+            );
+        }
+    }
+
+    /// Coordinate clicks, scrolling and screenshots genuinely need a look
+    /// between them, which is the distinction batch encodes — refusing them
+    /// would leave no way to act on a UI the accessibility tree cannot see.
+    #[test]
+    fn coordinate_actions_are_still_sent_one_at_a_time() {
+        for action in ["left_click", "right_click", "scroll", "screenshot", "mouse_move", "wait"] {
+            assert!(
+                batch_only_refusal(action).is_none(),
+                "{action} must stay available on the computer tool"
+            );
+        }
     }
 
     /// A malformed call is refused before anything is clicked. These are the
