@@ -1016,8 +1016,9 @@ function AccessCard({
     return (
       <Card title={<SectionTitle>Access</SectionTitle>}>
         <div style={{ fontSize: 'var(--fs-md)', lineHeight: 1.5, color: 'var(--sb-text-muted)' }}>
-          Not enrolled — this machine signs in with Google rather than holding a worker pass, so
-          there is nothing here to revoke.
+          This is the machine running the console, not a worker. It signs in with your Google
+          account rather than holding a worker pass, so it takes no tasks and answers no snapshots —
+          and there is nothing here to revoke.
         </div>
       </Card>
     )
@@ -1224,12 +1225,26 @@ function TasksCard({
   }, [device.device_id, nonce])
 
   const listed = tasks !== null && tasks.length > 0
+  const worker = isWorker(device)
 
   return (
     <Card
       title={<SectionTitle>Tasks</SectionTitle>}
       actions={
-        <Button variant="primary" size="sm" onClick={() => setCreating(true)}>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => setCreating(true)}
+          // The console's own machine holds no worker pass, so it never polls
+          // for tasks. Work queued at it would sit `queued` forever with no
+          // readback and no error — the quietest possible failure.
+          disabled={!worker}
+          title={
+            worker
+              ? 'Hand this machine a task'
+              : 'This is the machine running the console, not a worker — it never picks up tasks.'
+          }
+        >
           + New task
         </Button>
       }
@@ -1263,8 +1278,9 @@ function TasksCard({
 
       {tasks !== null && tasks.length === 0 && (
         <span style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
-          Nothing queued or in flight. New task hands this machine work: it reads the spec back to
-          you before it starts, and only you can mark the result done.
+          {worker
+            ? 'Nothing queued or in flight. New task hands this machine work: it reads the spec back to you before it starts, and only you can mark the result done.'
+            : 'This is the machine running the console, not a worker — it takes no tasks. Enrol another machine to hand out work.'}
         </span>
       )}
 
@@ -1762,6 +1778,16 @@ function expired(frame: Frame | null): boolean {
   return Number.isFinite(ms) && ms <= Date.now()
 }
 
+// A device row with no enrollment is not a worker. It is the machine running
+// this console: every install self-registers, so the admin's own laptop appears
+// in the fleet like any other, but it authenticates with the operator's Google
+// session and never holds a worker pass. Everything the fleet asks OF a machine
+// — a snapshot, a dispatch — is answered by a pass-holding worker, so on this
+// row those controls cannot work, and offering them produced a bare "(409)".
+export function isWorker(device: Pick<Device, 'enrollment_state'>): boolean {
+  return device.enrollment_state !== 'not_enrolled'
+}
+
 function ScreenCard({ device }: { device: Device }) {
   const deviceId = device.device_id
   const revoked = device.enrollment_state === 'revoked'
@@ -1934,11 +1960,13 @@ function ScreenCard({ device }: { device: Device }) {
   // could conceivably answer. A powered-off or locked-out machine would take the
   // click, queue a command nobody will read, and leave the operator watching a
   // 45-second timer for an answer that was never possible.
-  const blocked = revoked
-    ? 'Access revoked — this machine cannot be asked for anything until it is re-enrolled.'
-    : !device.online
-      ? 'Offline — this machine is not checked in, so there is nothing to ask. The last frame it uploaded is below.'
-      : null
+  const blocked = !isWorker(device)
+    ? 'This is the machine running the console, not a worker — it holds no worker pass, so it cannot be asked for a snapshot.'
+    : revoked
+      ? 'Access revoked — this machine cannot be asked for anything until it is re-enrolled.'
+      : !device.online
+        ? 'Offline — this machine is not checked in, so there is nothing to ask. The last frame it uploaded is below.'
+        : null
 
   return (
     <Card

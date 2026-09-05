@@ -83,7 +83,14 @@ export function SectionTitle({ children, style }: { children: React.ReactNode; s
 
 // ───────────────────────────────────────────────────────── StatusPill
 
-type StatusKind = 'running' | 'completed' | 'failed' | 'cancelled' | 'pending' | 'error'
+type StatusKind =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'abandoned'
+  | 'pending'
+  | 'error'
 
 interface StatusMeta {
   label: string
@@ -112,6 +119,12 @@ function normalizeStatus(status?: string): StatusKind {
     case 'cancelled':
     case 'canceled':
       return 'cancelled'
+    // Distinct from `cancelled` on purpose: cancelled is somebody deciding to
+    // stop this, abandoned is nobody ever picking it up. Without its own arm it
+    // fell through to `pending`, which is the one thing it certainly is not —
+    // a reaped run would go on claiming it was still about to start.
+    case 'abandoned':
+      return 'abandoned'
     case 'pending':
     case 'queued':
     case 'idle':
@@ -155,6 +168,13 @@ const STATUS_META: Record<StatusKind, StatusMeta> = {
     icon: '⊘',
     color: 'var(--sb-text-muted)',
     bg: 'rgba(255, 255, 255, 0.05)',
+    border: 'var(--sb-border)',
+  },
+  abandoned: {
+    label: 'Abandoned',
+    icon: '⊘',
+    color: 'var(--sb-text-faint)',
+    bg: 'rgba(255, 255, 255, 0.04)',
     border: 'var(--sb-border)',
   },
   pending: {

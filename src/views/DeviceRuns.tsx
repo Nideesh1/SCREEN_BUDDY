@@ -102,9 +102,16 @@ export function useDevice(deviceId: string | undefined): DeviceHead | null {
 // because the two disagree in the cases worth noticing: a machine stuck
 // re-clicking the same button burns minutes without adding steps, and a run that
 // died on its first turn never adds any.
-export function runDuration(run: DeviceRun): string | null {
+export function runDuration(run: DeviceRun, live: boolean): string | null {
   const start = Date.parse(String(run.started_at ?? run.created_at ?? ''))
   if (!Number.isFinite(start)) return null
+  // Only a LIVE run may be measured against the clock. A run with no
+  // `completed_at` that is not live never finished — it was minted and
+  // abandoned, or its worker vanished — and clocking it to now reported the
+  // hours since it was created as though it had spent them working: a run that
+  // did nothing showed the longest duration on the page. It gets no duration
+  // instead, and the row says what actually happened.
+  if (!run.completed_at && !live) return null
   const end = run.completed_at ? Date.parse(run.completed_at) : Date.now()
   if (!Number.isFinite(end) || end < start) return null
   const secs = Math.round((end - start) / 1000)
@@ -167,7 +174,10 @@ export function RunRow({
   live: boolean
   onOpen: () => void
 }) {
-  const duration = runDuration(run)
+  const duration = runDuration(run, live)
+  // A run with no duration and no steps never got off the ground. Saying so
+  // beats an empty gap where every other row carries a measurement.
+  const stalled = !duration && !live && (run.num_steps ?? 0) === 0
   return (
     <button
       onClick={onOpen}
@@ -205,7 +215,8 @@ export function RunRow({
         style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', whiteSpace: 'nowrap' }}
       >
         {run.num_steps ?? 0} steps
-        {duration && (live ? ` · running for ${duration}` : ` · took ${duration}`)} ·{' '}
+        {duration && (live ? ` · running for ${duration}` : ` · took ${duration}`)}
+        {stalled && ' · never started'} ·{' '}
         {relativeTime(run.started_at ?? run.created_at)}
       </span>
     </button>
