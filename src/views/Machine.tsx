@@ -160,6 +160,7 @@ function Machine() {
           nothing to do, and nobody is sitting at it to tell the difference. */}
       <PermissionsCard refreshKey={nonce} />
       <ModelEndpointCard refreshKey={nonce} />
+      <UiaProbeCard />
       <EnrollmentCard refreshKey={nonce} />
     </div>
   )
@@ -1040,6 +1041,126 @@ function EnrollmentCard({ refreshKey }: { refreshKey: number }) {
             ? 'Not enrolled — this machine signs in with an account rather than holding a worker pass. It runs agents for whoever is signed in.'
             : 'Not enrolled — this machine holds no credential, so nothing can dispatch work to it.'}
       </p>
+    </Card>
+  )
+}
+
+
+// ───────────────────────────────────────────────────────── uia probe
+
+// UIA PROBE — a prototype's front door, deliberately a button rather than a
+// devtools incantation.
+//
+// The worker aims clicks by pixel: a vision model estimates a point from a
+// downscaled screenshot, and that estimate is our dominant failure mode.
+// Windows already publishes the answer through UI Automation — every control's
+// name, type and exact rectangle — so the question worth answering is what real
+// applications actually report. This dumps that, read-only: nothing here
+// clicks, and no part of the agent loop consults it yet.
+//
+// The delay is the whole ergonomics problem. UIA reads the FOREGROUND window,
+// and while the operator is looking at this panel, the foreground window is
+// ScreenBuddy — a dump taken now would faithfully describe the wrong thing. So
+// the button counts down and the operator spends it clicking the app they
+// actually want measured.
+const UIA_COUNTDOWN_SECS = 5
+
+function UiaProbeCard() {
+  const [countdown, setCountdown] = useState<number | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [dump, setDump] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const run = useCallback(async (command: 'uia_dump' | 'uia_dump_all') => {
+    setError(null)
+    setDump(null)
+    setCopied(false)
+    // Count down in the UI so the operator knows exactly how long they have to
+    // bring the target window forward.
+    for (let n = UIA_COUNTDOWN_SECS; n > 0; n--) {
+      setCountdown(n)
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    setCountdown(null)
+    setBusy(true)
+    const res = await safeInvoke<unknown>(command)
+    setBusy(false)
+    if (!res.ok) {
+      setError(res.error)
+      return
+    }
+    setDump(JSON.stringify(res.data, null, 2))
+  }, [])
+
+  const copy = useCallback(() => {
+    if (!dump) return
+    navigator.clipboard?.writeText(dump)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1600)
+  }, [dump])
+
+  if (!isTauri()) return null
+
+  return (
+    <Card title={<SectionTitle>UI Automation probe</SectionTitle>}>
+      <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', lineHeight: 1.5 }}>
+        Reads the controls Windows reports for whichever window is in front —
+        names, types and exact rectangles. Press a button, then click the app you
+        want measured; the countdown is there so the dump describes that app and
+        not this panel. Read-only: nothing clicks, and no run consults it.
+      </p>
+      <div style={{ display: 'flex', gap: 'var(--sp-2)', marginTop: 'var(--sp-3)', flexWrap: 'wrap' }}>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => run('uia_dump')}
+          disabled={busy || countdown !== null}
+        >
+          {countdown !== null
+            ? `Switch windows… ${countdown}`
+            : busy
+              ? 'Reading…'
+              : 'Dump clickable controls'}
+        </Button>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => run('uia_dump_all')}
+          disabled={busy || countdown !== null}
+        >
+          Dump everything
+        </Button>
+        {dump && (
+          <Button variant="ghost" size="sm" onClick={copy}>
+            {copied ? 'Copied' : 'Copy JSON'}
+          </Button>
+        )}
+      </div>
+      {error && (
+        <p className="error-message" style={{ marginTop: 'var(--sp-3)' }}>
+          {error}
+        </p>
+      )}
+      {dump && (
+        <pre
+          style={{
+            marginTop: 'var(--sp-3)',
+            maxHeight: 320,
+            overflow: 'auto',
+            fontSize: 'var(--fs-xs)',
+            fontFamily: 'var(--font-mono)',
+            color: 'var(--sb-text)',
+            background: 'var(--sb-surface-1)',
+            border: '1px solid var(--sb-border)',
+            borderRadius: 'var(--r-sm)',
+            padding: 'var(--sp-3)',
+            whiteSpace: 'pre',
+          }}
+        >
+          {dump}
+        </pre>
+      )}
     </Card>
   )
 }
