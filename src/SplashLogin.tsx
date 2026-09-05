@@ -1,12 +1,30 @@
+import { useState } from 'react'
+import { isTauri } from './lib'
+import EnrolMachine from './EnrolMachine'
+
 interface SplashLoginProps {
   login: () => void
   isLoading: boolean
   error: string | null
+  /** Called once this machine holds a device token, so App can re-read the
+   *  credential class and swap the splash for the worker shell. */
+  onEnrolled: () => void
 }
 
-// Branded, centered gold/black login screen. The single gate before the
-// authenticated "inside" of the app (see App.tsx).
-function SplashLogin({ login, isLoading, error }: SplashLoginProps) {
+// Branded, centered gold/black login screen. The gate before the authenticated
+// "inside" of the app (see App.tsx), with two doors behind it: sign in with
+// Google to become an admin, or redeem an enrollment key to become a worker.
+//
+// Google is the primary action and the enrollment link is deliberately quiet —
+// most installs are the operator's own machine, and someone who has been handed
+// a key has been told to look for it.
+function SplashLogin({ login, isLoading, error, onEnrolled }: SplashLoginProps) {
+  const [enrolling, setEnrolling] = useState(false)
+
+  if (enrolling) {
+    return <EnrolMachine onEnrolled={onEnrolled} onCancel={() => setEnrolling(false)} />
+  }
+
   return (
     <div
       style={{
@@ -83,6 +101,33 @@ function SplashLogin({ login, isLoading, error }: SplashLoginProps) {
       >
         {isLoading ? 'Signing in…' : 'Sign in with Google'}
       </button>
+
+      {/* Desktop only, and not because enrolling is privileged: the key is
+          redeemed by a Rust command that persists the token, and a browser tab
+          has neither the bridge nor anywhere to put the result. */}
+      {isTauri() && (
+        <div style={{ textAlign: 'center' }}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={() => setEnrolling(true)}
+            disabled={isLoading}
+            style={{ justifyContent: 'center' }}
+          >
+            Enrol this machine
+          </button>
+          <p
+            style={{
+              margin: '6px 0 0',
+              fontSize: 'var(--fs-sm)',
+              color: 'var(--sb-text-faint)',
+              maxWidth: 280,
+            }}
+          >
+            Joining a fleet with a key from its operator.
+          </p>
+        </div>
+      )}
 
       {error && (
         <div

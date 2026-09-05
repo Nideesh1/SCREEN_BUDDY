@@ -24,12 +24,18 @@ export const CU_BACKEND =
 // string, so an entry that lies about which model ran is a debugging trap. Add
 // an option here for any endpoint you actually run against.
 export const MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'qwen38', label: 'Qwen3.8 27B (self-hosted)' },
   { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
   { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
-  { value: 'qwen38', label: 'Qwen3.8 27B (self-hosted)' },
 ]
 
 // Fallback when nothing else (a template, a schedule) specifies one.
+//
+// The self-hosted endpoint leads deliberately. The Anthropic options are a paid
+// API, and a default that costs money on every unattended run is the wrong way
+// round — an enrolled worker refuses to drive api.anthropic.com at all, so a
+// template defaulting there was simply unrunnable on the fleet. Choosing to pay
+// should be an act, not an oversight.
 export const DEFAULT_MODEL = MODEL_OPTIONS[0].value
 
 // Deadline for the best-effort artifact metadata mirror. `fetch` has no default
@@ -40,6 +46,12 @@ const MIRROR_TIMEOUT_MS = 8000
 
 // Bearer header built from the backend session token (the only credential the
 // renderer trusts — set by useGoogleAuth after the /auth/google exchange).
+//
+// An ENROLLED machine has nothing to put here: its device token lives in the
+// Rust credential store and never crosses into the webview, so a fetch made from
+// this file is unauthenticated on a worker. Anything a worker shell needs from
+// the backend has to go through a Rust command, which carries whichever
+// credential the machine actually holds.
 export function authHeaders(): Record<string, string> {
   const token = localStorage.getItem('screen_buddy_session_token')
   return token ? { Authorization: `Bearer ${token}` } : {}
@@ -380,21 +392,160 @@ export function relativeTime(value: string | number | null | undefined): string 
   return new Date(ms).toLocaleDateString()
 }
 
+// ---- Host detection --------------------------------------------------------
+
+// True when the renderer is running inside the Tauri webview rather than a plain
+// browser tab. The admin panel is served on the web too (a finish-claim gets
+// approved from a phone, away from the desk), so every Tauri-only path — invoke,
+// notifications, the remote listener, capture — must be SKIPPED there rather
+// than left to throw. Tauri v2 injects `__TAURI_INTERNALS__` onto window before
+// any app code runs, which is why this is a reliable synchronous check that
+// needs no plugin (same reasoning as IS_WINDOWS at the top of this file).
+export function isTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
 // Wrap a Tauri invoke so a not-yet-implemented command (the Rust agents merge in
 // parallel) never crashes the UI. Returns { ok, data } | { ok:false, error }.
+//
+// `raw` is the rejection exactly as Rust threw it. Most commands reject with a
+// plain string and `error` is the whole story, but a command that rejects with a
+// struct (`enroll`, whose kind is the classification) would lose everything but
+// its message on the way through — so the value is carried alongside for the one
+// caller that knows its shape.
 export type InvokeResult<T> =
   | { ok: true; data: T }
-  | { ok: false; error: string }
+  | { ok: false; error: string; raw?: unknown }
 
 export async function safeInvoke<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<InvokeResult<T>> {
+  // Outside the Tauri webview there is no command bridge at all, so bail before
+  // importing it: the dynamic import resolves fine in a browser build and the
+  // failure would otherwise surface as an opaque "window.__TAURI_INTERNALS__ is
+  // undefined" instead of something a caller can put in front of a user.
+  if (!isTauri()) {
+    return { ok: false, error: `${command} is unavailable outside the desktop app` }
+  }
   try {
     const { invoke } = await import('@tauri-apps/api/core')
     const data = (await invoke(command, args)) as T
     return { ok: true, data }
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    return { ok: false, error: invokeErrorMessage(err), raw: err }
   }
+}
+
+// A Rust command rejects with whatever its error type serializes to, so the
+// value reaching here is an Error only sometimes. `String(err)` on a struct
+// rejection is the literal "[object Object]" — useless in front of a user and
+// worse than useless in a bug report — hence the message probe in between.
+function invokeErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (err && typeof err === 'object') {
+    const message = (err as { message?: unknown }).message
+    if (typeof message === 'string') return message
+  }
+  return String(err)
+}
+
+// ───────────────────────────────────────────────────────── enrollment
+
+// Which credential this machine holds, and therefore what it is: a Google
+// session makes it the operator's own install, a device token makes it a worker
+// that redeemed a one-time enrollment key and never touches the operator's
+// account. A machine holds one or the other, never both.
+export type CredentialClass = 'session' | 'device' | 'none'
+
+// Everything the Rust half of enrollment exposes is named HERE and nowhere else,
+// so if that side renames a command these three strings are the entire edit.
+const CREDENTIAL_CLASS_COMMAND = 'credential_class'
+const ENROLL_COMMAND = 'enroll'
+const CLEAR_DEVICE_TOKEN_COMMAND = 'clear_device_token'
+
+// Rust emits this when the backend refuses a call this machine made WHILE
+// HOLDING A DEVICE TOKEN: the enrollment is dead — revoked, or the device row
+// forgotten — and only a fresh key gets the machine back in. Rust deliberately
+// does nothing about it beyond saying so (it does not drop the token, and it
+// never falls back to Google sign-in, which would recreate the exposure
+// enrollment exists to remove), so the recovery is entirely the UI's.
+export const DEVICE_REJECTED_EVENT = 'device://rejected'
+
+// The frontend's half of the credential question. `credential_class` can see the
+// device token in the Rust store but never this one, which lives in localStorage
+// and is therefore invisible from Rust.
+function hasSessionToken(): boolean {
+  return !!localStorage.getItem('screen_buddy_session_token')
+}
+
+// What this machine is. Never throws: the answer decides which shell renders at
+// all, so every failure resolves to what the renderer can see by itself.
+export async function credentialClass(): Promise<CredentialClass> {
+  const hasSession = hasSessionToken()
+  // A browser tab has no command bridge and cannot hold a device token —
+  // enrollment writes to the Rust credential store, not localStorage — so a
+  // Google session is the only credential it could possibly have.
+  if (!isTauri()) return hasSession ? 'session' : 'none'
+  const res = await safeInvoke<CredentialClass>(CREDENTIAL_CLASS_COMMAND, { hasSession })
+  if (res.ok && (res.data === 'session' || res.data === 'device' || res.data === 'none')) {
+    return res.data
+  }
+  // Command absent (a desktop build without the Rust half yet) or failed: fall
+  // back to the session token, which keeps such a build signing in exactly as it
+  // does today rather than stranding it on a splash it cannot get past.
+  return hasSession ? 'session' : 'none'
+}
+
+// Why an enrollment failed, and therefore what to do about it. The three lead to
+// three different next steps: get a fresh key, try again in a moment, or report
+// a bug — so they are kept apart rather than collapsed into "it didn't work".
+export type EnrollFailureKind = 'rejected' | 'unreachable' | 'internal'
+
+export type EnrollResult =
+  | { ok: true }
+  | { ok: false; reason: EnrollFailureKind; message: string }
+
+// Redeem a one-time enrollment key for a device token. Success means the token
+// is persisted Rust-side and this machine is a worker from here on.
+export async function enrollMachine(key: string): Promise<EnrollResult> {
+  // Hand over the backend the rest of the renderer talks to. Left to itself the
+  // command guesses from env/localhost, which is right in a dev build and wrong
+  // in a release one pointed at a real host.
+  const res = await safeInvoke<unknown>(ENROLL_COMMAND, {
+    key: key.trim(),
+    backend: CU_BACKEND,
+  })
+  if (res.ok) return { ok: true }
+  return { ok: false, reason: enrollFailureKind(res.raw, res.error), message: res.error }
+}
+
+// `enroll` rejects with { kind, message }, and the kind is a judgement made where
+// the HTTP status actually was — so it is believed whenever it is there. The
+// regex covers only the paths that cannot produce one: safeInvoke refusing
+// outside Tauri, or a desktop build whose Rust half predates the struct.
+// Anything naming a transport failure is worth retrying; everything else is
+// treated as a refused key, which is the safer default — a key is single-use,
+// and telling someone to keep retrying one the backend has already rejected
+// wastes the only attempt it had.
+function enrollFailureKind(raw: unknown, message: string): EnrollFailureKind {
+  const kind = (raw as { kind?: unknown } | null | undefined)?.kind
+  if (kind === 'rejected' || kind === 'unreachable' || kind === 'internal') return kind
+  return /network|unreachable|connect|refused|timed?\s?out|dns|offline|transport|send request/i.test(
+    message,
+  )
+    ? 'unreachable'
+    : 'rejected'
+}
+
+// Drop this machine's device token, un-enrolling it: the next credential read
+// answers 'none' and the splash comes back with both doors on it again. Two
+// callers — Sign out on a worker, and the recovery after the backend refuses the
+// token — and both need the same thing afterwards, so neither of them decides
+// what "signed out" means for a worker on its own.
+//
+// Returns false when the command failed, so a caller can say so rather than
+// showing a splash for a machine that is still holding a token.
+export async function unenrollMachine(): Promise<boolean> {
+  return (await safeInvoke<null>(CLEAR_DEVICE_TOKEN_COMMAND)).ok
 }

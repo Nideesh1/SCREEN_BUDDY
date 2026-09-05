@@ -46,7 +46,7 @@ interface RunRecord {
 // Coerce any value to a display string. Backend may store result/error_message
 // as objects (e.g. { ok: true }) or null; rendering those raw as React children
 // throws and white-screens the view, so always stringify first.
-function asText(v: unknown): string {
+export function asText(v: unknown): string {
   if (v == null) return ''
   if (typeof v === 'string') return v
   try {
@@ -576,7 +576,7 @@ function Telemetry({ run }: { run: RunRecord }) {
 
 // Extract the run summary text. The backend stores result as { summary: "<md>" }
 // (preferred), but tolerate a plain-string result too. Anything else → no card.
-function summaryText(result: unknown): string {
+export function summaryText(result: unknown): string {
   if (result == null) return ''
   if (typeof result === 'string') return result.trim()
   if (typeof result === 'object') {
@@ -604,7 +604,7 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 
 // Tiny inline markdown renderer (no dependency): ## headings, - / * bullets,
 // **bold**, preserved line breaks. Emojis pass through unchanged.
-function Markdown({ text }: { text: string }) {
+export function Markdown({ text }: { text: string }) {
   const lines = text.split('\n')
   return (
     <div

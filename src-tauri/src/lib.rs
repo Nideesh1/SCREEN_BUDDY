@@ -4,12 +4,23 @@ use tauri::{Manager, State};
 
 mod agent;
 mod artifacts;
+// Launching a browser with `--force-renderer-accessibility` so UIA can see page
+// content. Same shape on every platform (macOS/Linux launch for real; the pure
+// lookup/argument logic compiles and is tested everywhere), so no cfg here.
+mod browser;
 mod capture;
+mod channel;
 mod computer;
 mod credentials;
+mod device;
 mod permissions;
 mod pinned;
 mod remote;
+mod runs_local;
+mod screenshots;
+// UIA grounding prototype. Windows-only in substance; compiles to a
+// same-shaped stub elsewhere, so it needs no cfg at the registration site.
+mod uia;
 mod video;
 mod window;
 
@@ -225,8 +236,11 @@ pub fn run() {
         agent::stop_agent_task,
         agent::model_endpoint,
         agent::check_model_endpoint,
+        device::device_info,
+        device::enroll,
         remote::start_remote_listener,
         remote::stop_remote_listener,
+        remote::remote_status,
         credentials::cred_list,
         credentials::cred_add,
         credentials::cred_delete,
@@ -234,6 +248,8 @@ pub fn run() {
         credentials::has_anthropic_key,
         credentials::clear_anthropic_key,
         credentials::validate_anthropic_key,
+        credentials::credential_class,
+        credentials::clear_device_token,
         permissions::check_permissions,
         permissions::request_screen_recording,
         permissions::request_accessibility,
@@ -247,7 +263,19 @@ pub fn run() {
         artifacts::artifact_thumb,
         artifacts::artifact_rename,
         artifacts::artifact_delete,
+        runs_local::local_runs,
+        runs_local::local_run_frames,
         video::extract_frames_from_video,
+        // UIA grounding prototype — invoked by hand from devtools, by nothing
+        // in Rust or the frontend. Read-only; it cannot touch the agent loop.
+        uia::uia_dump,
+        uia::uia_dump_all,
+        // Browser launch with renderer accessibility forced on — the only way
+        // UIA can see page content (see browser.rs). Commands so the frontend
+        // and a devtools paste can drive it; the agent loop reaches it through
+        // `browser::tool_schema` / `tool_result_text`, not through here.
+        browser::launch_browser,
+        browser::browser_status,
         window::bring_to_front
     ])
     .setup(|app| {
@@ -266,6 +294,15 @@ pub fn run() {
       app.manage(agent::AgentState::default());
       // Remote-listener cancellation state (no listener running at startup).
       app.manage(remote::RemoteState::default());
+      // Diary state: the mail doorbell, the run-outcome slot, and the shutdown
+      // token every channel wait selects against.
+      app.manage(channel::ChannelState::default());
+      // The worker's idle task-pickup loop. Spawned unconditionally but inert
+      // on anything that is not an enrolled worker: it re-checks enrollment
+      // every iteration and an operator's Mac never touches /tasks (see
+      // `task_pickup_loop`). Lives for the life of the app; its waits are all
+      // cancellable via the ChannelState shutdown token.
+      tauri::async_runtime::spawn(channel::task_pickup_loop(app.handle().clone()));
 
       Ok(())
     })

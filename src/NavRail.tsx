@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
+import { isTauri, safeInvoke } from './lib'
+import { useInboxCount } from './views/Inbox'
+import type { AppMode } from './mode'
 import sbLogo from './assets/sb-logo.svg'
 
 // Live remote-channel indicator. Subscribes to the Rust-emitted `remote://status`
@@ -10,10 +13,24 @@ import sbLogo from './assets/sb-logo.svg'
 function RemoteIndicator() {
   const [connected, setConnected] = useState(false)
   useEffect(() => {
+    // There is no Rust side to listen to in a browser tab (the same bundle is
+    // served for the admin panel), and `listen` would reject there with an
+    // unhandled promise rejection — so stay dim and subscribe to nothing.
+    if (!isTauri()) return
+    let alive = true
+    // Subscribe first, then ask. The event alone only reports CHANGES, so a
+    // machine that connected before this mounted — which is every reload, and
+    // any long-running session — showed "offline" while it was in fact
+    // connected and taking work. Subscribing first means a change landing
+    // between the two is not lost; the read only seeds what the events cannot.
     const unlisten = listen<{ connected: boolean }>('remote://status', (e) => {
-      setConnected(!!e.payload?.connected)
+      if (alive) setConnected(!!e.payload?.connected)
+    })
+    safeInvoke<boolean>('remote_status').then((res) => {
+      if (alive && res.ok) setConnected(res.data)
     })
     return () => {
+      alive = false
       unlisten.then((un) => un())
     }
   }, [])
@@ -54,6 +71,9 @@ function RemoteIndicator() {
 // caller that still thinks in view ids has one source of truth.
 export type ViewId =
   | 'dashboard'
+  | 'inbox'
+  | 'machine'
+  | 'admin'
   | 'artifacts'
   | 'pinned'
   | 'runs'
@@ -70,6 +90,9 @@ interface NavItem {
 
 const ITEMS: NavItem[] = [
   { id: 'dashboard', Icon: HomeIcon, label: 'Dashboard' },
+  { id: 'inbox', Icon: InboxIcon, label: 'Inbox' },
+  { id: 'machine', Icon: MachineIcon, label: 'This machine' },
+  { id: 'admin', Icon: DeviceIcon, label: 'Devices' },
   { id: 'artifacts', Icon: ArtifactIcon, label: 'Artifacts' },
   { id: 'pinned', Icon: PinIcon, label: 'Pinned library' },
   { id: 'runs', Icon: PlusIcon, label: 'Runs' },
@@ -79,9 +102,47 @@ const ITEMS: NavItem[] = [
   { id: 'settings', Icon: GearIcon, label: 'Settings' },
 ]
 
+// Which items each shell shows. Mode is a VIEW choice — hiding an item here
+// removes it from the rail, not from the router or from what the backend will
+// answer, so nothing about this map is a permission boundary.
+//
+// Worker is down to two entries, and that is the point of the mode rather than
+// an oversight: nobody is sitting in front of a fleet node, so the only screens
+// worth reaching are the machine itself and the settings that fix it. The views
+// it lost were not merely surplus — Dashboard and History read the backend with
+// `authHeaders()`, which an enrolled machine has nothing to put in, so they
+// could only ever render empty there.
+const MODE_ITEMS: Record<AppMode, ViewId[]> = {
+  // Inbox leads for admin: it is THE page a supervisor opens — everything on
+  // it is a machine standing still until a human acts.
+  admin: ['inbox', 'admin', 'settings'],
+  worker: ['machine', 'settings'],
+  consumer: [
+    'dashboard',
+    // The same supervision applies to a personal fleet: a blocked question or
+    // an unjudged task waits identically whoever owns the machines.
+    'inbox',
+    // ...and This machine: the person running agents on their own desktop is
+    // the person who wants to know whether it has the permissions to.
+    'machine',
+    // Consumer keeps the Devices entry: the person running their own agents is
+    // also the person who wants to see which of their machines are up. Worker
+    // doesn't — a fleet node has no business supervising the fleet.
+    'admin',
+    'artifacts',
+    'pinned',
+    'runs',
+    'scheduled',
+    'history',
+    'credentials',
+    'settings',
+  ],
+}
+
 interface NavRailProps {
   userEmail: string | null
   onSignOut: () => void
+  mode: AppMode
 }
 
 // Which nav item the current path highlights. Matched by path prefix so a
@@ -100,12 +161,19 @@ function activeIdFor(pathname: string): ViewId | null {
 // nav icons in the middle, and a Sign out control pushed to the very bottom via
 // a flex spacer. Route-aware: the active item derives from the current path and
 // a click navigates to that route. Sign out still calls the passed callback.
-function NavRail({ userEmail, onSignOut }: NavRailProps) {
+function NavRail({ userEmail, onSignOut, mode }: NavRailProps) {
   const navigate = useNavigate()
   const location = useLocation()
   const active = activeIdFor(location.pathname)
+  const visible = MODE_ITEMS[mode]
+  const items = ITEMS.filter((item) => visible.includes(item.id))
+  // Blocked questions + tasks awaiting verdict, polled quietly. Only when the
+  // rail actually shows the item — a worker shell must not poll operator
+  // endpoints it could never render (and has no credentials for anyway).
+  const inboxCount = useInboxCount(visible.includes('inbox'))
   return (
     <nav
+      className="nav-rail"
       style={{
         width: 68,
         flexShrink: 0,
@@ -138,8 +206,8 @@ function NavRail({ userEmail, onSignOut }: NavRailProps) {
         }}
       />
 
-      {/* Nav icons. */}
-      {ITEMS.map((item) => {
+      {/* Nav icons — the current mode's set. */}
+      {items.map((item) => {
         const isActive = item.id === active
         return (
           <button
@@ -151,6 +219,33 @@ function NavRail({ userEmail, onSignOut }: NavRailProps) {
             style={navButtonStyle(isActive)}
           >
             <item.Icon />
+            {/* The waiting count, worn by the Inbox icon itself so a blocked
+                machine is visible from every page, not just the inbox. */}
+            {item.id === 'inbox' && inboxCount !== null && inboxCount > 0 && (
+              <span
+                aria-label={`${inboxCount} waiting`}
+                style={{
+                  position: 'absolute',
+                  top: 3,
+                  right: 3,
+                  minWidth: 16,
+                  height: 16,
+                  boxSizing: 'border-box',
+                  padding: '0 4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 10,
+                  fontWeight: 700,
+                  lineHeight: 1,
+                  color: '#0A0A0A',
+                  background: 'var(--sb-gold)',
+                  borderRadius: 'var(--r-pill)',
+                }}
+              >
+                {inboxCount > 99 ? '99+' : inboxCount}
+              </span>
+            )}
             {/* Styled gold/black tooltip, revealed on hover to the right of the
                 icon (left rail). Pure CSS — see .nav-tooltip in index.css. */}
             <span className="nav-tooltip" role="tooltip">
@@ -240,6 +335,16 @@ function HomeIcon() {
   )
 }
 
+function InboxIcon() {
+  // A tray with a slot — things arrive here to be dealt with.
+  return (
+    <IconBase>
+      <path d="M22 12h-6l-2 3h-4l-2-3H2" />
+      <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+    </IconBase>
+  )
+}
+
 function PlusIcon() {
   return (
     <IconBase>
@@ -276,6 +381,29 @@ function ArtifactIcon() {
       <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
       <path d="M3 12.5 12 17l9-4.5" />
       <path d="M3 17 12 21.5 21 17" />
+    </IconBase>
+  )
+}
+
+function MachineIcon() {
+  // A single tower/box, distinct from the fleet's monitor: this is the machine
+  // you are standing on, not the machines you are looking at.
+  return (
+    <IconBase>
+      <rect x="6" y="3" width="12" height="18" rx="2" />
+      <line x1="9" y1="7" x2="15" y2="7" />
+      <circle cx="12" cy="16" r="1.6" />
+    </IconBase>
+  )
+}
+
+function DeviceIcon() {
+  // A monitor on a stand — the fleet, seen one machine at a time.
+  return (
+    <IconBase>
+      <rect x="3" y="4" width="18" height="12" rx="1.5" />
+      <path d="M9 20h6" />
+      <path d="M12 16v4" />
     </IconBase>
   )
 }

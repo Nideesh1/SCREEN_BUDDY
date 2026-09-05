@@ -8,7 +8,7 @@
 //
 // Restyling agents will import from here; existing views are untouched.
 
-import React from 'react'
+import React, { useEffect } from 'react'
 
 // ───────────────────────────────────────────────────────── Card
 
@@ -83,7 +83,14 @@ export function SectionTitle({ children, style }: { children: React.ReactNode; s
 
 // ───────────────────────────────────────────────────────── StatusPill
 
-type StatusKind = 'running' | 'completed' | 'failed' | 'cancelled' | 'pending' | 'error'
+type StatusKind =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'abandoned'
+  | 'pending'
+  | 'error'
 
 interface StatusMeta {
   label: string
@@ -112,6 +119,12 @@ function normalizeStatus(status?: string): StatusKind {
     case 'cancelled':
     case 'canceled':
       return 'cancelled'
+    // Distinct from `cancelled` on purpose: cancelled is somebody deciding to
+    // stop this, abandoned is nobody ever picking it up. Without its own arm it
+    // fell through to `pending`, which is the one thing it certainly is not —
+    // a reaped run would go on claiming it was still about to start.
+    case 'abandoned':
+      return 'abandoned'
     case 'pending':
     case 'queued':
     case 'idle':
@@ -155,6 +168,13 @@ const STATUS_META: Record<StatusKind, StatusMeta> = {
     icon: '⊘',
     color: 'var(--sb-text-muted)',
     bg: 'rgba(255, 255, 255, 0.05)',
+    border: 'var(--sb-border)',
+  },
+  abandoned: {
+    label: 'Abandoned',
+    icon: '⊘',
+    color: 'var(--sb-text-faint)',
+    bg: 'rgba(255, 255, 255, 0.04)',
     border: 'var(--sb-border)',
   },
   pending: {
@@ -689,5 +709,121 @@ export function ActionChip({ name, input, style }: ActionChipProps) {
       <span>{head || label}</span>
       {tail && <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--sb-text-muted)' }}>{tail}</span>}
     </span>
+  )
+}
+
+// Confirmation dialog for a destructive action.
+//
+// The app used `window.confirm` for these until it turned out the Tauri webview
+// does not reliably show it — so Forget was deleting a device, and Sign out
+// un-enrolling a machine, with no prompt at all. That is the worst possible
+// failure for exactly the controls that cannot be undone, so anything guarding
+// a destructive action is rendered by us rather than by the platform.
+//
+// Escape and a backdrop click both cancel; nothing here dismisses by confirming
+// accidentally, and the confirm button is never the one under the cursor when
+// the dialog opens.
+export function ConfirmModal({
+  title,
+  body,
+  confirmLabel,
+  danger,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  title: string
+  /** Rendered one paragraph per entry, so the copy can breathe. */
+  body: string[]
+  confirmLabel: string
+  /** Irreversible actions wear the danger colour; reversible ones do not. */
+  danger?: boolean
+  busy?: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onCancel])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 2000,
+        background: 'rgba(0, 0, 0, 0.72)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 'var(--sp-6)',
+      }}
+    >
+      <div
+        // The backdrop closes; the card must not close through it.
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%',
+          maxWidth: 460,
+          background: 'var(--sb-surface-1)',
+          border: `1px solid ${danger ? 'var(--sb-danger)' : 'var(--sb-border-gold)'}`,
+          borderRadius: 'var(--r-lg)',
+          boxShadow: 'var(--shadow-2)',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--sb-border)',
+            fontSize: 'var(--fs-lg)',
+            fontWeight: 700,
+            color: 'var(--sb-text)',
+          }}
+        >
+          {title}
+        </div>
+        <div style={{ padding: 'var(--sp-5) 20px' }}>
+          {body.map((para, i) => (
+            <p
+              key={i}
+              style={{
+                margin: i === 0 ? 0 : 'var(--sp-3) 0 0',
+                fontSize: 'var(--fs-md)',
+                lineHeight: 1.6,
+                color: 'var(--sb-text-muted)',
+              }}
+            >
+              {para}
+            </p>
+          ))}
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'flex-end',
+            gap: 'var(--sp-3)',
+            padding: '12px 20px',
+            borderTop: '1px solid var(--sb-border)',
+          }}
+        >
+          <Button variant="secondary" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant={danger ? 'danger' : 'primary'} onClick={onConfirm} disabled={busy}>
+            {busy ? 'Working…' : confirmLabel}
+          </Button>
+        </div>
+      </div>
+    </div>
   )
 }

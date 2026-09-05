@@ -5,10 +5,21 @@
 //! a locally-launched run takes. The wire is deliberately tiny:
 //!
 //!   backend → desktop  {"type":"run","run_id":"uuid","task":"…","model":"…",
+//!                       "model_endpoint":"https://…",
 //!                       "pinned_set_names":"[\"Set name\"]"}
+//!                      {"type":"snapshot"}
+//!                      {"type":"mail","seq":N}      (channel doorbell; no reply)
 //!                      {"type":"ping"}
 //!   desktop → backend  {"type":"ack","run_id":"uuid"}
+//!                      {"type":"ack","kind":"snapshot"}
 //!                      {"type":"pong"}
+//!
+//! A `snapshot` frame asks "what is this machine looking at right now" — the
+//! console's way of pulling a fresh frame from a machine that is idle, and so it
+//! carries no `run_id` and the uploaded object belongs to no run. Its ack means
+//! CAPTURE ACCEPTED, not uploaded: the frame reaches the backend out of band via
+//! `POST /screenshots/commit`, and the ack goes out long before that lands. The
+//! console learns the upload happened from the commit, never from this socket.
 //!
 //! A `run` frame is ack'd immediately, then funneled through
 //! `agent::start_run_internal` (the exact lock/RunLease/persistence path that
@@ -18,12 +29,18 @@
 //! skip — the backend learns the desktop is busy via the absence of progress,
 //! not a dropped frame.
 //!
+//! `model_endpoint` is the operator's fleet setting, travelling with the work so
+//! the machine no longer has to be told separately what to drive. It is OPTIONAL
+//! on the wire: an older backend omits it and this desktop then falls back to
+//! its own `CU_ANTHROPIC_BASE` exactly as before (see `agent::resolve_endpoint`).
+//!
 //! Resilience: the task reconnects with exponential backoff (1s → 30s) on any
 //! close/error and loops forever until the managed `RemoteState` token is
 //! cancelled (`stop_remote_listener`, or a second `start_remote_listener` which
 //! cancels the prior task first). A `remote://status` event with `{connected}`
 //! is emitted on every connect/disconnect so the UI can show an indicator.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -52,9 +69,26 @@ const WS_PING_EVERY: Duration = Duration::from_secs(20);
 #[derive(Default)]
 pub struct RemoteState(pub Mutex<Option<CancellationToken>>);
 
+/// Last value pushed to `remote://status`, so a view that mounts between
+/// connect/disconnect events can ask instead of waiting for the next one.
+///
+/// The event alone is enough for an indicator that lives for the life of the
+/// app, but the worker machine panel is opened cold and the link is the one
+/// thing on it that says whether the machine can receive work at all — leaving
+/// that reading "checking..." until the socket next changes state is the wrong
+/// answer for the longest, and a machine that has been happily connected for an
+/// hour is exactly the case that never fires an event.
+pub static CONNECTED: AtomicBool = AtomicBool::new(false);
+
 /// Derive the WebSocket URL from the backend HTTP(S) base: http→ws, https→wss,
 /// and append the listen path with the session token as a query param.
-fn ws_url(backend: &str, token: &str) -> String {
+///
+/// `device_id` rides along so the backend can stamp liveness against the right
+/// machine: the token identifies the *user*, and one user can have several
+/// desktops connected at once. It stays SECOND in the query string on purpose —
+/// `ws_url_redacted` truncates at `?token=`, so anything after the token is
+/// hidden along with it and the redaction keeps working unchanged.
+fn ws_url(backend: &str, token: &str, device_id: &str) -> String {
     let base = backend.trim_end_matches('/');
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -64,7 +98,11 @@ fn ws_url(backend: &str, token: &str) -> String {
         // Already a ws(s) scheme or bare host — pass through untouched.
         base.to_string()
     };
-    format!("{ws_base}/agent/listen?token={}", urlencoding::encode(token))
+    format!(
+        "{ws_base}/agent/listen?token={}&device_id={}",
+        urlencoding::encode(token),
+        urlencoding::encode(device_id)
+    )
 }
 
 /// The same URL with the token query stripped, for logging.
@@ -81,8 +119,19 @@ fn ws_url_redacted(url: &str) -> &str {
 }
 
 /// Emit the `remote://status` event so the UI indicator can reflect the link.
+/// Also records it for `remote_status`, so the push and the pull can never
+/// disagree — every state change goes through here.
 fn emit_status(app: &AppHandle, connected: bool) {
+    CONNECTED.store(connected, Ordering::Relaxed);
     let _ = app.emit(EV_REMOTE_STATUS, json!({ "connected": connected }));
+}
+
+/// Whether the command channel is up right now. Pull counterpart to the
+/// `remote://status` event; a view should read this on mount and subscribe for
+/// changes.
+#[tauri::command]
+pub fn remote_status() -> bool {
+    CONNECTED.load(Ordering::Relaxed)
 }
 
 /// Handle one decoded text frame. Returns the reply string to send back (if
@@ -97,10 +146,47 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
     };
     match v.get("type").and_then(|t| t.as_str()) {
         Some("ping") => Some(json!({ "type": "pong" }).to_string()),
+        Some("snapshot") => {
+            // Detached: the capture and its three-legged upload must not hold up
+            // the read loop, which is also how run frames arrive. `auth` is this
+            // socket's credential — the device token on an enrolled worker — so
+            // the presign/commit legs authenticate exactly as run persistence
+            // does.
+            //
+            // Deliberately independent of any run in flight: no `run_id`, no
+            // `AgentState`, and no `ComputerState` (see
+            // `screenshots::spawn_snapshot`), so a live run's timeline and its
+            // click-coordinate scaling are both untouched.
+            crate::screenshots::spawn_snapshot(app, backend, auth);
+            Some(json!({ "type": "ack", "kind": "snapshot" }).to_string())
+        }
+        Some("mail") => {
+            // Channel doorbell: the operator appended to this machine's diary.
+            // Content-free by design — no reply, no ack, and the carried `seq`
+            // is ignored, because the cursor reconcile (the idle poll and the
+            // turn-boundary drain in channel.rs) is the truth and this frame is
+            // only latency. All it does is latch the doorbell so an idle
+            // pickup wakes now instead of at its next interval; mid-run it is
+            // deliberately inert — the boundary drain catches the mail within
+            // a turn regardless.
+            crate::channel::ring_doorbell(app);
+            None
+        }
         Some("run") => {
             let run_id = v.get("run_id").and_then(|r| r.as_str()).unwrap_or("").to_string();
             let task = v.get("task").and_then(|t| t.as_str()).unwrap_or("").to_string();
             let model = v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+            // `model_endpoint` (optional): where the operator wants this run's
+            // model calls to go. Accepted under either casing because the wire is
+            // snake_case but the account-settings field it is sourced from is
+            // camelCase, and a backend that forwards the settings value verbatim
+            // is a plausible mistake we would rather absorb than fail a fleet on.
+            // Absent → the desktop's own env var wins; see `agent::resolve_endpoint`.
+            let model_endpoint = v
+                .get("model_endpoint")
+                .or_else(|| v.get("modelEndpoint"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string());
             // `pinned_set_ids` (optional) is a JSON-encoded STRING holding a list
             // of LOCAL set UUIDs, e.g. "[\"a1b2…\"]". These are already local set
             // ids (the backend registry stores the desktop's own uuids), so when
@@ -161,6 +247,7 @@ fn handle_text(app: &AppHandle, backend: &str, auth: &str, text: &str) -> Option
                     pinned_set_ids,
                     run_id.clone(),
                     model,
+                    model_endpoint,
                     backend.to_string(),
                 ) {
                     Ok(()) => eprintln!("[remote] started run {run_id}"),
@@ -188,6 +275,13 @@ async fn run_connection(app: &AppHandle, url: &str, backend: &str, auth: &str, t
             Ok((s, _resp)) => s,
             Err(e) => {
                 eprintln!("[remote] connect failed: {e}");
+                // A refused HANDSHAKE is how a worker finds out its enrollment is
+                // dead — there is no other authenticated call it makes on its own.
+                // Surface it and keep backing off; we do not clear the token and
+                // we do NOT reopen the socket with anything else.
+                if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+                    crate::device::note_rejection(app, resp.status().as_u16(), "agent/listen");
+                }
                 return false;
             }
         },
@@ -195,6 +289,19 @@ async fn run_connection(app: &AppHandle, url: &str, backend: &str, auth: &str, t
 
     emit_status(app, true);
     eprintln!("[remote] connected");
+
+    // Announce this machine to the fleet. Fired on every successful connect
+    // rather than once at listener start, because that is the moment we know the
+    // backend is actually reachable — and it gives the retry for free: a
+    // registration lost to a server restart is re-sent by the next reconnect,
+    // with no retry loop of its own. Detached and never awaited, so a slow or
+    // dead `/devices` cannot delay serving run frames.
+    tauri::async_runtime::spawn(crate::device::register(
+        app.clone(),
+        backend.to_string(),
+        auth.to_string(),
+    ));
+
     let (mut write, mut read) = stream.split();
     let mut ping = interval(WS_PING_EVERY);
     ping.tick().await; // consume the immediate first tick
@@ -268,13 +375,26 @@ async fn listen_loop(app: AppHandle, url: String, backend: String, auth: String,
 
 /// Start (or restart) the always-on remote listener. Idempotent: cancels any
 /// prior task before spawning a fresh one, so calling twice never opens two
-/// sockets. `token` is the backend session token (WS auth + run bearer);
-/// `backend` is the HTTP(S) base (http→ws / https→wss).
+/// sockets. `token` is the session token the frontend holds, if any; `backend` is
+/// the HTTP(S) base (http→ws / https→wss).
+///
+/// `token` is OPTIONAL because an enrolled worker genuinely has none — its
+/// credential lives in the Rust store and never reaches the webview, so the
+/// frontend calls this with `backend` alone. Requiring it made Tauri reject the
+/// invocation before the command ever ran, and since the call site is
+/// best-effort the socket simply never opened: the machine sat there enrolled,
+/// idle and unreachable, with nothing anywhere saying why.
+///
+/// What actually goes on the wire is whatever `credentials::backend_credential`
+/// returns — the stored device token on an enrolled worker, the session token
+/// otherwise. The URL is fixed for the life of the task, so a machine that
+/// enrols mid-session reconnects with the new credential when the frontend
+/// restarts the listener (which it does on the credential class changing).
 #[tauri::command]
 pub fn start_remote_listener(
     app: AppHandle,
     state: tauri::State<'_, RemoteState>,
-    token: String,
+    token: Option<String>,
     backend: String,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|e| format!("remote state poisoned: {e}"))?;
@@ -286,8 +406,21 @@ pub fn start_remote_listener(
     *guard = Some(cancel.clone());
     drop(guard);
 
-    let url = ws_url(&backend, &token);
-    eprintln!("[remote] listener starting → {}", ws_url_redacted(&url));
+    // A device id we cannot read is not worth refusing to connect over: the
+    // socket still works without it, the backend just can't attribute liveness.
+    let device_id = crate::device::device_id(&app).unwrap_or_else(|e| {
+        eprintln!("[remote] no device id ({e}); connecting without one");
+        String::new()
+    });
+    // One credential choice, made here and carried through both the socket and
+    // any run this socket starts.
+    let token = crate::credentials::backend_credential(&app, &token.unwrap_or_default())
+        .unwrap_or_default();
+    let url = ws_url(&backend, &token, &device_id);
+    eprintln!(
+        "[remote] listener starting → {} (device {device_id})",
+        ws_url_redacted(&url)
+    );
     tauri::async_runtime::spawn(listen_loop(app, url, backend, token, cancel));
     Ok(())
 }
@@ -309,12 +442,22 @@ mod tests {
     #[test]
     fn derives_ws_scheme_and_path() {
         assert_eq!(
-            ws_url("https://api.example.com", "abc"),
-            "wss://api.example.com/agent/listen?token=abc"
+            ws_url("https://api.example.com", "abc", "dev-1"),
+            "wss://api.example.com/agent/listen?token=abc&device_id=dev-1"
         );
         assert_eq!(
-            ws_url("http://localhost:8000/", "a b"),
-            "ws://localhost:8000/agent/listen?token=a%20b"
+            ws_url("http://localhost:8000/", "a b", "dev 1"),
+            "ws://localhost:8000/agent/listen?token=a%20b&device_id=dev%201"
         );
+    }
+
+    /// The redaction predates the `device_id` param; this pins the fact that a
+    /// second query param did not sneak the credential back into the logs.
+    #[test]
+    fn redaction_still_hides_the_token_with_a_second_param() {
+        let url = ws_url("https://api.example.com", "s3cret", "dev-1");
+        let shown = ws_url_redacted(&url);
+        assert_eq!(shown, "wss://api.example.com/agent/listen");
+        assert!(!shown.contains("s3cret"));
     }
 }

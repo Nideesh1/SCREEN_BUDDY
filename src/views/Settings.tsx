@@ -2,8 +2,10 @@ import { useEffect, useState, useCallback } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { open } from '@tauri-apps/plugin-shell'
 import type { LayoutContext } from '../Layout'
-import { safeInvoke, IS_WINDOWS } from '../lib'
+import { safeInvoke, authHeaders, CU_BACKEND, IS_WINDOWS } from '../lib'
 import { Card, Button, Badge, Spinner } from '../ui'
+import { useMode } from '../mode'
+import { ModeCards } from '../ModePicker'
 
 const SETTINGS_DEEP_LINK = {
   screenRecording: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
@@ -30,7 +32,6 @@ type PermLoad =
 function Settings() {
   // Account info is provided by the router Layout via <Outlet context>.
   const { userEmail, onSignOut } = useOutletContext<LayoutContext>()
-  const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
 
   // The signed-in user's stable Google id (the JWT `sub`). This is the
   // `user_id` openfang / the remote API must target to drive THIS machine.
@@ -50,17 +51,6 @@ function Settings() {
     setCopied(true)
     setTimeout(() => setCopied(false), 1200)
   }, [userId])
-
-  const fetchPerms = useCallback(async () => {
-    setPerm({ state: 'loading' })
-    const res = await safeInvoke<Permissions>('check_permissions')
-    if (res.ok) setPerm({ state: 'ready', perms: res.data })
-    else setPerm({ state: 'unavailable', message: res.error })
-  }, [])
-
-  useEffect(() => {
-    fetchPerms()
-  }, [fetchPerms])
 
   return (
     <div
@@ -102,6 +92,8 @@ function Settings() {
         </div>
       </Card>
 
+      <ModeCard />
+
       <Card title="Storage">
         <Row label="Screenshots" value="Stored on this computer" />
         <div style={{ marginTop: 'var(--sp-3)' }}>
@@ -111,77 +103,253 @@ function Settings() {
         </div>
       </Card>
 
-      <Card
-        title="Permissions"
-        actions={
-          <Button variant="secondary" size="sm" onClick={fetchPerms}>
-            ↻ Re-check
-          </Button>
-        }
-      >
-        {perm.state === 'loading' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-            <Spinner size={14} /> Checking…
-          </div>
-        )}
+      <PermissionsCard />
 
-        {perm.state === 'unavailable' && (
-          <p style={{ color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
-            Permission check unavailable. <span style={{ opacity: 0.8 }}>{perm.message}</span>
-          </p>
-        )}
-
-        {/* Windows has no consent gate for screen capture or input synthesis, so
-            the two PermRows below (and their System Settings deep links) are
-            macOS-only. Showing them here would present two permanently-granted
-            rows plus relaunch instructions that do nothing. What actually limits
-            the agent on Windows is integrity level, which is not grantable — so
-            we state that instead. See src-tauri/src/permissions.rs. */}
-        {perm.state === 'ready' && IS_WINDOWS && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
-            <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)', margin: 0 }}>
-              Windows needs no permission grants — ScreenBuddy can capture the screen and
-              control the mouse and keyboard straight away.
-            </p>
-            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)', margin: 0 }}>
-              One limit: it cannot control windows that are running as administrator
-              (Task Manager, an admin terminal) or User Account Control prompts. Clicks
-              sent there are silently ignored by Windows, so keep those out of a run's
-              path. Running ScreenBuddy as administrator is not recommended.
-            </p>
-          </div>
-        )}
-
-        {perm.state === 'ready' && !IS_WINDOWS && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
-            <PermRow
-              label="Accessibility"
-              granted={perm.perms.accessibility}
-              requestCommand="request_accessibility"
-              deepLink={SETTINGS_DEEP_LINK.accessibility}
-              onAfter={fetchPerms}
-            />
-            <PermRow
-              label="Screen Recording"
-              granted={perm.perms.screenRecording}
-              requestCommand="request_screen_recording"
-              deepLink={SETTINGS_DEEP_LINK.screenRecording}
-              onAfter={fetchPerms}
-            />
-            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-1)' }}>
-              After granting, you must quit and relaunch ScreenBuddy for the change to take effect.
-            </p>
-            <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)', marginTop: -8 }}>
-              In development builds the grant can reset on rebuild; a signed release build is stable.
-            </p>
-          </div>
-        )}
-      </Card>
+      <FleetModelCard />
 
       <AnthropicKeySection />
 
       <TelegramSection />
     </div>
+  )
+}
+
+// The two macOS grants an agent cannot act without, and the controls that fix
+// them. Extracted from the Settings screen because a worker needs exactly this
+// block on its own home: the machine that is missing a grant is the one with
+// nobody sitting at it to notice the run doing nothing.
+export function PermissionsCard({ refreshKey }: { refreshKey?: number } = {}) {
+  const [perm, setPerm] = useState<PermLoad>({ state: 'loading' })
+
+  const fetchPerms = useCallback(async () => {
+    setPerm({ state: 'loading' })
+    const res = await safeInvoke<Permissions>('check_permissions')
+    if (res.ok) setPerm({ state: 'ready', perms: res.data })
+    else setPerm({ state: 'unavailable', message: res.error })
+  }, [])
+
+  // `refreshKey` is how a host screen (the worker's Machine panel) folds this
+  // card into its own Refresh without duplicating the check. Optional, because
+  // Settings has the ↻ Re-check button right here and needs no such handle.
+  useEffect(() => {
+    fetchPerms()
+  }, [fetchPerms, refreshKey])
+
+  return (
+    <Card
+      title="Permissions"
+      actions={
+        <Button variant="secondary" size="sm" onClick={fetchPerms}>
+          ↻ Re-check
+        </Button>
+      }
+    >
+      {perm.state === 'loading' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          <Spinner size={14} /> Checking…
+        </div>
+      )}
+
+      {perm.state === 'unavailable' && (
+        <p style={{ color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          Permission check unavailable. <span style={{ opacity: 0.8 }}>{perm.message}</span>
+        </p>
+      )}
+
+      {/* Windows has no consent gate for screen capture or input synthesis, so
+          the two PermRows below (and their System Settings deep links) are
+          macOS-only. Showing them here would present two permanently-granted
+          rows plus relaunch instructions that do nothing. What actually limits
+          the agent on Windows is integrity level, which is not grantable — so
+          we state that instead. See src-tauri/src/permissions.rs. */}
+      {perm.state === 'ready' && IS_WINDOWS && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+          <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)', margin: 0 }}>
+            Windows needs no permission grants — ScreenBuddy can capture the screen and
+            control the mouse and keyboard straight away.
+          </p>
+          <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)', margin: 0 }}>
+            One limit: it cannot control windows that are running as administrator
+            (Task Manager, an admin terminal) or User Account Control prompts. Clicks
+            sent there are silently ignored by Windows, so keep those out of a run's
+            path. Running ScreenBuddy as administrator is not recommended.
+          </p>
+        </div>
+      )}
+
+      {perm.state === 'ready' && !IS_WINDOWS && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+          <PermRow
+            label="Accessibility"
+            granted={perm.perms.accessibility}
+            requestCommand="request_accessibility"
+            deepLink={SETTINGS_DEEP_LINK.accessibility}
+            onAfter={fetchPerms}
+          />
+          <PermRow
+            label="Screen Recording"
+            granted={perm.perms.screenRecording}
+            requestCommand="request_screen_recording"
+            deepLink={SETTINGS_DEEP_LINK.screenRecording}
+            onAfter={fetchPerms}
+          />
+          <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-1)' }}>
+            After granting, you must quit and relaunch ScreenBuddy for the change to take effect.
+          </p>
+          <p style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)', marginTop: -8 }}>
+            In development builds the grant can reset on rebuild; a signed release build is stable.
+          </p>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+// FLEET MODEL ENDPOINT — the endpoint and default model every machine in this
+// account drives, held server-side on the account (`/settings`) and sent to a
+// worker on the dispatched `run` frame.
+//
+// This exists because the endpoint used to be per-machine, per-shell env vars:
+// invisible from here, retyped on every launch, and — the damage — when someone
+// forgot, the run still WORKED, against api.anthropic.com, and quietly billed
+// Anthropic while everyone believed it was self-hosted. Configuring it once here
+// and letting it travel with the work is the fix; `agent.rs`'s worker guard is
+// the backstop for when this is left empty.
+//
+// Worker shells do not render it: a fleet node does not configure the fleet, and
+// its device token could not authenticate `/settings` if it tried.
+//
+// Wire fields are camelCase (`modelEndpoint` / `model`), matching the
+// thresholds already on this route. Both are optional server-side — clearing a
+// field is meaningful (it means "let each machine decide"), so an empty string
+// is sent rather than being skipped.
+function FleetModelCard() {
+  const { mode } = useMode()
+  const [endpoint, setEndpoint] = useState('')
+  const [model, setModel] = useState('')
+  const [load, setLoad] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  const isWorker = mode === 'worker'
+
+  useEffect(() => {
+    if (isWorker) return
+    let active = true
+    ;(async () => {
+      try {
+        const resp = await fetch(`${CU_BACKEND}/settings`, { headers: authHeaders() })
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const body = await resp.json()
+        if (!active) return
+        // A backend that predates these fields answers 200 with neither — that
+        // is "unset", not an error, and the blank fields say so correctly.
+        setEndpoint(typeof body?.modelEndpoint === 'string' ? body.modelEndpoint : '')
+        setModel(typeof body?.model === 'string' ? body.model : '')
+        setLoad('ready')
+      } catch (e) {
+        if (!active) return
+        setError(e instanceof Error ? e.message : String(e))
+        setLoad('error')
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [isWorker])
+
+  const save = useCallback(async () => {
+    setSaving(true)
+    setError('')
+    try {
+      const resp = await fetch(`${CU_BACKEND}/settings`, {
+        method: 'PATCH',
+        headers: { ...authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify({ modelEndpoint: endpoint.trim(), model: model.trim() }),
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }, [endpoint, model])
+
+  if (isWorker) return null
+
+  return (
+    <Card title="Fleet model endpoint">
+      <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', margin: '0 0 var(--sp-4)', lineHeight: 1.5 }}>
+        Where every machine on this account sends its model calls. Set once here; it
+        travels to each worker with the work, so nobody has to set an environment
+        variable on the machine itself. Leave blank to let each machine use its own
+        CU_ANTHROPIC_BASE.
+      </p>
+
+      {load === 'loading' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', color: 'var(--sb-text-muted)', fontSize: 'var(--fs-md)' }}>
+          <Spinner size={14} /> Loading…
+        </div>
+      )}
+
+      {load !== 'loading' && (
+        <>
+          <Field label="Model endpoint">
+            <input
+              type="text"
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder="https://llm.internal.example.com"
+              autoComplete="off"
+              spellCheck={false}
+              className="agent-input"
+              style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+            />
+          </Field>
+
+          <Field label="Default model">
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="claude-opus-4-8"
+              autoComplete="off"
+              spellCheck={false}
+              className="agent-input"
+              style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
+            />
+          </Field>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)', marginTop: 'var(--sp-4)' }}>
+            <Button variant="primary" size="sm" onClick={save} disabled={saving}>
+              {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
+            </Button>
+          </div>
+
+          {/* Blank is a real, and dangerous, choice: a worker left on the default
+              drives Anthropic. It will refuse the run rather than bill silently
+              (see agent.rs::anthropic_guard_error), which is why saying so here
+              is a warning and not a failure. */}
+          {!endpoint.trim() && (
+            <p style={{ fontSize: 'var(--fs-sm)', color: 'var(--sb-text-muted)', marginTop: 'var(--sp-3)', lineHeight: 1.5 }}>
+              With this blank, a worker that has no CU_ANTHROPIC_BASE of its own would
+              fall through to Anthropic's API — so it refuses the run instead of billing
+              Anthropic without anyone choosing to.
+            </p>
+          )}
+        </>
+      )}
+
+      {error && (
+        <p style={{ fontSize: 'var(--fs-md)', color: 'var(--sb-danger-bright)', marginTop: 'var(--sp-3)' }}>
+          {load === 'error' ? 'Could not load the fleet settings. ' : 'Could not save. '}
+          {error}
+        </p>
+      )}
+    </Card>
   )
 }
 
@@ -507,6 +675,38 @@ function PermRow({
         Open Settings
       </button>
     </div>
+  )
+}
+
+// The mode switcher. One person is routinely all three roles on the same
+// machine, so the choice made after sign-in has to be reversible from inside the
+// app — otherwise picking "admin" once means reinstalling to get the launcher
+// back. Switching only changes which shell renders: it grants nothing, and the
+// backend authorizes every request the same way in all three.
+//
+// An enrolled machine is the exception and gets no switcher: it holds a worker
+// credential and nothing else, so the other two shells have no backend behind
+// them here. Saying so beats rendering cards that would only produce 403s.
+function ModeCard() {
+  const { mode, setMode, locked } = useMode()
+  return (
+    <Card title="Mode">
+      {locked ? (
+        <p style={{ margin: 0, fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+          This machine was enrolled into a fleet with an enrollment key, so it
+          runs as a worker. Sign-in and the other shells belong to the account
+          that owns the fleet, not to this machine.
+        </p>
+      ) : (
+        <>
+          <p style={{ marginBottom: 'var(--sp-4)', fontSize: 'var(--fs-md)', color: 'var(--sb-text-muted)' }}>
+            Which ScreenBuddy you see. This changes the layout only — your access is
+            the same in every mode.
+          </p>
+          <ModeCards current={mode} onPick={setMode} />
+        </>
+      )}
+    </Card>
   )
 }
 

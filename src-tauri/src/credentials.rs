@@ -41,6 +41,11 @@ const VAULT_FILE: &str = "credentials.enc";
 /// cipher + Keychain master key as the vault, in its own small file (kept out of
 /// the vault list so it never surfaces in the credentials UI).
 const ANTHROPIC_KEY_FILE: &str = "anthropic_key.enc";
+/// The worker credential: a long-lived, worker-scoped device token minted by
+/// `POST /enroll`. Same cipher and master key as the vault, its own small file
+/// so it never appears in `cred_list`. Its mere EXISTENCE is what makes this
+/// machine a worker — see `credential_class`.
+const DEVICE_TOKEN_FILE: &str = "device_token.enc";
 const NONCE_LEN: usize = 12;
 
 /// Identifiers for the master-key entry in the OS credential store (macOS
@@ -294,6 +299,54 @@ fn write_vault(app: &AppHandle, creds: &[Credential]) -> Result<(), String> {
     Ok(())
 }
 
+/// Encrypt + persist one small secret in its own file, nonce prepended — the
+/// same layout as the vault, minus the JSON list. Used for the two single-value
+/// secrets (BYOK Anthropic key, device token) so there is exactly one place that
+/// knows how a secret is written to disk.
+fn write_secret(app: &AppHandle, file: &str, plaintext: &[u8], what: &str) -> Result<(), String> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher(app)?
+        .encrypt(nonce, plaintext)
+        .map_err(|_| format!("{what} encrypt failed"))?;
+
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+
+    let path = app_data(app)?.join(file);
+    fs::write(&path, blob).map_err(|e| format!("write {what}: {e}"))?;
+    restrict_perms(&path)
+}
+
+/// Decrypt one small secret written by `write_secret`. Every failure — absent
+/// file, short blob, wrong key, non-UTF-8 — collapses to `None`: a caller here
+/// only ever wants "the secret, or nothing", and a corrupt file must not stop
+/// the app any more than a corrupt device id does.
+fn read_secret(app: &AppHandle, file: &str) -> Option<String> {
+    let path = app_data(app).ok()?.join(file);
+    if !path.exists() {
+        return None;
+    }
+    let blob = fs::read(&path).ok()?;
+    if blob.len() < NONCE_LEN {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher(app).ok()?.decrypt(nonce, ciphertext).ok()?;
+    String::from_utf8(plaintext).ok()
+}
+
+/// Whether `file` exists in the app data dir. A pure existence check: no
+/// decrypt, so it never trips the biometric gate. That matters — the credential
+/// resolver runs on every backend call and must stay silent on machines that
+/// hold no device token at all.
+fn secret_exists(app: &AppHandle, file: &str) -> bool {
+    app_data(app).map(|d| d.join(file).exists()).unwrap_or(false)
+}
+
 /// List stored credentials as metadata only — passwords are never returned here.
 #[tauri::command]
 pub fn cred_list(app: AppHandle) -> Result<Vec<CredentialMeta>, String> {
@@ -347,34 +400,18 @@ pub fn cred_delete(app: AppHandle, target: String) -> Result<(), String> {
 // The agent loop reads it via the non-command `anthropic_key` helper.
 // ---------------------------------------------------------------------------
 
-/// Encrypt + persist the user's own Anthropic API key (BYOK). Nonce is prepended
-/// to the file, matching the vault layout. The key is never logged.
+/// Encrypt + persist the user's own Anthropic API key (BYOK). The key is never
+/// logged.
 #[tauri::command]
 pub fn set_anthropic_key(app: AppHandle, key: String) -> Result<(), String> {
-    let plaintext = key.into_bytes();
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher(&app)?
-        .encrypt(nonce, plaintext.as_ref())
-        .map_err(|_| "anthropic key encrypt failed".to_string())?;
-
-    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    blob.extend_from_slice(&nonce_bytes);
-    blob.extend_from_slice(&ciphertext);
-
-    let path = app_data(&app)?.join(ANTHROPIC_KEY_FILE);
-    fs::write(&path, blob).map_err(|e| format!("write anthropic key: {e}"))?;
-    restrict_perms(&path)
+    write_secret(&app, ANTHROPIC_KEY_FILE, key.as_bytes(), "anthropic key")
 }
 
 /// Whether a BYOK Anthropic key is stored. NEVER returns the key itself; this is
 /// a pure existence check (no decrypt, so it won't trigger the biometric gate).
 #[tauri::command]
 pub fn has_anthropic_key(app: AppHandle) -> bool {
-    app_data(&app)
-        .map(|d| d.join(ANTHROPIC_KEY_FILE).exists())
-        .unwrap_or(false)
+    secret_exists(&app, ANTHROPIC_KEY_FILE)
 }
 
 /// Delete the stored BYOK Anthropic key (no-op if absent).
@@ -393,18 +430,7 @@ pub fn clear_anthropic_key(app: AppHandle) -> Result<(), String> {
 /// fails. The key is never logged.
 #[allow(dead_code)]
 pub fn anthropic_key(app: &AppHandle) -> Option<String> {
-    let path = app_data(app).ok()?.join(ANTHROPIC_KEY_FILE);
-    if !path.exists() {
-        return None;
-    }
-    let blob = fs::read(&path).ok()?;
-    if blob.len() < NONCE_LEN {
-        return None;
-    }
-    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher(app).ok()?.decrypt(nonce, ciphertext).ok()?;
-    String::from_utf8(plaintext).ok()
+    read_secret(app, ANTHROPIC_KEY_FILE)
 }
 
 /// Validate a BYOK Anthropic key by calling Anthropic DIRECTLY (never our
@@ -470,5 +496,110 @@ pub fn lookup(app: &AppHandle, target: &str, field: &str) -> Option<String> {
         "username" => Some(cred.username),
         "password" => Some(cred.password),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device token — the worker credential.
+//
+// A worker machine never signs in with Google. It redeems a one-time enrollment
+// key (see `device::enroll`) for a long-lived, worker-scoped device token, and
+// that token is the ONLY backend credential it ever holds. The two credentials
+// are alternatives, never companions: holding a device token is exactly what
+// makes a machine a worker, so `backend_credential` prefers it unconditionally
+// and any session token the frontend passes down is ignored while one is stored.
+//
+// Encryption at rest is not the security boundary here — a worker runs an
+// untrusted computer-use agent with full control of the desktop, so anything on
+// that disk is reachable by it. The boundary is the token's SCOPE, enforced
+// server-side. Storing it through the vault's machinery is about having one
+// credential store rather than two, and about the token not sitting in plain
+// text next to the device id file.
+//
+// Cost note: reading it decrypts, which on a cold cache trips the one-per-run
+// biometric gate. That is why `backend_credential` checks for the FILE before
+// decrypting — an admin machine, which has no device token, never pays it. A
+// worker does, but it already pays it for the BYOK key before any run can start.
+// ---------------------------------------------------------------------------
+
+/// Persist the device token returned by `POST /enroll`. Non-command: only the
+/// enrollment path may write it, and the plaintext never crosses the command
+/// boundary in either direction.
+pub fn set_device_token(app: &AppHandle, token: &str) -> Result<(), String> {
+    write_secret(app, DEVICE_TOKEN_FILE, token.as_bytes(), "device token")
+}
+
+/// The stored device token, or `None` on a machine that was never enrolled.
+/// Non-command, like `anthropic_key` — the frontend can learn *that* this
+/// machine is enrolled (`credential_class`) but never gets the token itself.
+pub fn device_token(app: &AppHandle) -> Option<String> {
+    read_secret(app, DEVICE_TOKEN_FILE)
+}
+
+/// Whether this machine is enrolled as a worker. Existence check only, so it is
+/// cheap and silent — no decrypt, hence no biometric prompt.
+pub fn is_enrolled(app: &AppHandle) -> bool {
+    secret_exists(app, DEVICE_TOKEN_FILE)
+}
+
+/// Forget the enrollment, returning this machine to un-enrolled. Deliberately
+/// NOT called automatically when the backend rejects the token: a 401 during a
+/// server restart would otherwise silently un-enrol a working worker, and the
+/// operator would have to carry a fresh key out to it. Rejection is surfaced to
+/// the UI (`device::EV_DEVICE_REJECTED`); erasing is a decision, not a reflex.
+#[tauri::command]
+pub fn clear_device_token(app: AppHandle) -> Result<(), String> {
+    let path = app_data(&app)?.join(DEVICE_TOKEN_FILE);
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| format!("remove device token: {e}"))?;
+    }
+    Ok(())
+}
+
+/// THE credential choice. Every outgoing backend call resolves its bearer here
+/// and nowhere else, so there is exactly one answer to "which token is this
+/// machine?": `agent.rs`'s `with_bearer`, `device::register` and `remote.rs` all
+/// route through it.
+///
+/// `session` is whatever session token the frontend passed down (empty when it
+/// has none). A stored device token always wins.
+///
+/// NO FALLBACK, and this is the point of the whole change: an enrolled machine
+/// whose device token is rejected does NOT fall back to `session`, does not
+/// prompt for Google sign-in, and does not retry with anything else — it is
+/// un-enrolled and must say so. Falling back would hand a worker, and the
+/// untrusted agent running on it, an admin credential; that is exactly the
+/// situation enrollment exists to remove. If you arrived here to "fix" a
+/// worker's 401 by letting it borrow the session token, re-read this paragraph.
+pub fn backend_credential(app: &AppHandle, session: &str) -> Option<String> {
+    if is_enrolled(app) {
+        // A device token that will not decrypt still means "this is a worker":
+        // return None rather than sliding down to the session token.
+        return device_token(app);
+    }
+    if session.is_empty() {
+        None
+    } else {
+        Some(session.to_string())
+    }
+}
+
+/// Which credential class this machine holds, for the UI shell: `"device"` (an
+/// enrolled worker), `"session"` (signed in with Google), or `"none"`.
+///
+/// Only the device half is knowable from Rust — the Google session lives in the
+/// frontend — so the caller describes its own half via `has_session`. Routing it
+/// through here anyway keeps one implementation of the precedence rule, the same
+/// one `backend_credential` applies, so the shell can never disagree with the
+/// credential the requests actually carry. Called with no argument it answers
+/// `"device"` or `"none"`, which is the correct read before sign-in.
+#[tauri::command]
+pub fn credential_class(app: AppHandle, has_session: Option<bool>) -> &'static str {
+    if is_enrolled(&app) {
+        "device"
+    } else if has_session.unwrap_or(false) {
+        "session"
+    } else {
+        "none"
     }
 }

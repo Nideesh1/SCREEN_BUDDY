@@ -235,7 +235,9 @@ function NewRun() {
       setTemplateId(t?.id ?? BLANK_TEMPLATE.id)
       if (!t) return
       setTask(t.taskScaffold)
-      setModel(t.model)
+      // A template may state no model at all — it describes what to do, not
+      // where inference runs. Fall back rather than clearing the picker.
+      setModel(t.model || DEFAULT_MODEL)
       setInputValues({})
       if (t.suggestedSetName) {
         const match = sets.find((s) => s.name === t.suggestedSetName)
@@ -252,11 +254,20 @@ function NewRun() {
     setStarting(true)
     setError(null)
     try {
-      // a) Mint the run row on the backend FIRST.
+      // a) Mint the run row on the backend FIRST — stamped with THIS machine,
+      // so a locally launched run files under the same device as a dispatched
+      // one and shows in this machine's run list. A browser (no Tauri bridge)
+      // has no machine identity and simply omits the stamp.
+      const info = await safeInvoke<{ device_id: string }>('device_info')
       const resp = await fetch(`${CU_BACKEND}/runs`, {
         method: 'POST',
         headers: { ...authHeaders(), 'content-type': 'application/json' },
-        body: JSON.stringify({ task: finalTask, model, pinned_image_refs: [] }),
+        body: JSON.stringify({
+          task: finalTask,
+          model,
+          pinned_image_refs: [],
+          ...(info.ok ? { device_id: info.data.device_id } : {}),
+        }),
       })
       if (!resp.ok) {
         setError(`Could not create run (HTTP ${resp.status}). Agent not started.`)

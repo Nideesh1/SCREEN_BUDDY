@@ -20,6 +20,7 @@ import {
   Badge,
   IconButton,
   TrashIcon,
+  ConfirmModal,
 } from '../ui'
 import RunsTabs from './RunsTabs'
 
@@ -96,6 +97,8 @@ function bodyFromForm(f: FormState): CreateTemplateBody {
 function Templates() {
   const [load, setLoad] = useState<Load>({ state: 'loading' })
   const [busyId, setBusyId] = useState<string | null>(null)
+  // The template awaiting a delete confirmation, if any.
+  const [pendingDelete, setPendingDelete] = useState<Template | null>(null)
   const [seeding, setSeeding] = useState(false)
 
   // Editor state: null = closed; 'new' = creating; otherwise the id being edited.
@@ -172,9 +175,12 @@ function Templates() {
     }
   }, [form, editing])
 
+  // Deletion is confirmed by our own dialog, not window.confirm: the Tauri
+  // webview does not reliably show the native one, which meant this deleted a
+  // template outright with no prompt at all.
   const remove = useCallback(
     async (t: Template) => {
-      if (!window.confirm(`Delete template “${t.name}”?`)) return
+      setPendingDelete(null)
       setBusyId(t.template_id)
       try {
         await deleteTemplate(t.template_id)
@@ -220,6 +226,17 @@ function Templates() {
         boxSizing: 'border-box',
       }}
     >
+      {pendingDelete && (
+        <ConfirmModal
+          title={`Delete template \u201C${pendingDelete.name}\u201D?`}
+          body={['This removes the template for good. Runs already created from it are unaffected.']}
+          confirmLabel="Delete template"
+          danger
+          busy={busyId === pendingDelete.template_id}
+          onConfirm={() => remove(pendingDelete)}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
       <RunsTabs />
 
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--sp-3)' }}>
@@ -294,7 +311,7 @@ function Templates() {
                   busy={busyId === t.template_id}
                   active={editing === t.template_id}
                   onEdit={() => openEdit(t)}
-                  onDelete={() => remove(t)}
+                  onDelete={() => setPendingDelete(t)}
                 />
               </div>
             ))}

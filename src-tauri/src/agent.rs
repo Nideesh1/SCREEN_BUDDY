@@ -17,6 +17,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -26,15 +27,19 @@ use crate::{capture, with_computer, ComputerState};
 
 // ---- configuration (env-overridable) --------------------------------------
 
-fn backend_url() -> String {
+pub(crate) fn backend_url() -> String {
     std::env::var("CU_BACKEND_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
-/// BYOK: the per-turn model call goes DIRECTLY to Anthropic with the user's own
-/// key — it never touches our backend. The backend (`backend_url`) is still used
-/// for run persistence only.
-fn anthropic_base() -> String {
-    std::env::var("CU_ANTHROPIC_BASE").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
-}
+/// BYOK: the per-turn model call goes DIRECTLY to the model endpoint with the
+/// user's own key — it never touches our backend. The backend (`backend_url`) is
+/// still used for run persistence only. This is that endpoint when nothing else
+/// names one; see `resolve_endpoint` for the precedence ladder.
+const DEFAULT_ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+
+/// Env opt-out for the worker guard (`anthropic_guard_error`). Set to `1`/`true`
+/// on a worker that is *meant* to bill Anthropic directly.
+const ALLOW_ANTHROPIC_ENV: &str = "CU_ALLOW_ANTHROPIC";
+
 /// Whether the configured model endpoint is Anthropic's own API.
 ///
 /// This is the ONLY thing that decides whether a BYOK key is required. The key
@@ -46,6 +51,10 @@ fn anthropic_base() -> String {
 /// key" toggle: a toggle can be left on after switching back to Anthropic, and
 /// the symptom is then an opaque 401 instead of a clear prompt. Host-based, so
 /// it cannot fall out of sync with where requests actually go.
+///
+/// Takes the base as an ARGUMENT rather than reading the env itself, because the
+/// endpoint is per-run now (see `ResolvedEndpoint`): every caller must answer
+/// this about the endpoint THIS run drives, never the process-wide one.
 fn endpoint_is_anthropic(base: &str) -> bool {
     let host = base
         .trim()
@@ -55,23 +64,185 @@ fn endpoint_is_anthropic(base: &str) -> bool {
     host.eq_ignore_ascii_case("api.anthropic.com") || host.is_empty()
 }
 
+/// Where the endpoint a run drives actually came from.
+///
+/// Reported to the UI because "which endpoint" and "who chose it" are different
+/// questions with different fixes: a wrong `Fleet` value is corrected once in
+/// Settings for every machine, a wrong `Env` value is one shell on one box that
+/// somebody has to walk over to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSource {
+    /// Carried on the dispatched `run` frame — the operator's fleet setting.
+    Fleet,
+    /// This machine's `CU_ANTHROPIC_BASE`.
+    Env,
+    /// Nobody said; Anthropic's own API.
+    Default,
+}
+
+/// The model endpoint ONE run drives, resolved once at run start and then passed
+/// around instead of being re-derived. Everything that used to ask the process
+/// "where do model calls go?" asks this instead — a run dispatched at a
+/// self-hosted server and a shell holding a stale `CU_ANTHROPIC_BASE` disagree,
+/// and silently answering with the shell's value is the exact class of bug this
+/// type exists to make unrepresentable.
+#[derive(Clone, Debug)]
+pub struct ResolvedEndpoint {
+    pub base: String,
+    pub model: String,
+    pub source: EndpointSource,
+}
+
+impl ResolvedEndpoint {
+    fn is_anthropic(&self) -> bool {
+        endpoint_is_anthropic(&self.base)
+    }
+    /// `{base}/v1/messages` — the only URL a turn is ever sent to.
+    fn messages_url(&self) -> String {
+        format!("{}/v1/messages", self.base.trim_end_matches('/'))
+    }
+}
+
+/// PRECEDENCE: **frame > env var > default**.
+///
+/// The frame wins because the operator configured it centrally and it travelled
+/// here with the work. The env var stays second so an older backend — or an
+/// unset fleet setting — behaves exactly as it did before any of this existed.
+/// The default is Anthropic's own API, which is the whole reason
+/// `anthropic_guard_error` has to exist. `model` walks the same ladder
+/// independently, so a fleet that sets an endpoint but no model still honours
+/// this machine's `CU_MODEL`.
+///
+/// Blank/whitespace values count as absent, so a settings field the operator
+/// cleared falls through to the env var instead of resolving to `""`.
+fn resolve_endpoint(frame_base: Option<&str>, frame_model: Option<&str>) -> ResolvedEndpoint {
+    let present = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let (base, source) = match present(frame_base) {
+        Some(b) => (b, EndpointSource::Fleet),
+        None => match env("CU_ANTHROPIC_BASE") {
+            Some(b) => (b, EndpointSource::Env),
+            None => (DEFAULT_ANTHROPIC_BASE.to_string(), EndpointSource::Default),
+        },
+    };
+    let model = present(frame_model)
+        .or_else(|| env("CU_MODEL"))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+    ResolvedEndpoint { base, model, source }
+}
+
+/// The last endpoint a dispatched `run` frame carried, remembered so the machine
+/// panel can answer "what will this box drive?" between runs.
+///
+/// A worker cannot ask the backend for the fleet setting — its device token
+/// never leaves Rust and `/settings` is session-scoped — so the only fleet value
+/// it will ever hold is the one that rode in on a frame. Without this the panel
+/// could show only the env var, which on a correctly-configured fleet is exactly
+/// the wrong answer: it would read `api.anthropic.com` on a machine that has
+/// been driving a self-hosted server all week. Empty until the first dispatched
+/// run, and the panel says so rather than guessing.
+static LAST_FLEET_ENDPOINT: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+fn note_fleet_endpoint(base: &str, model: Option<&str>) {
+    if let Ok(mut g) = LAST_FLEET_ENDPOINT.lock() {
+        *g = Some((base.to_string(), model.map(str::to_string)));
+    }
+}
+
+/// `pub(crate)`: the task-pickup loop (channel.rs) passes these raw values into
+/// `start_run_internal` exactly as a dispatched frame would have carried them,
+/// so a task run walks the same frame > env > default ladder as everything else.
+pub(crate) fn last_fleet_endpoint() -> Option<(String, Option<String>)> {
+    LAST_FLEET_ENDPOINT.lock().ok().and_then(|g| g.clone())
+}
+
+/// Resolve exactly as a run would, for the read-only UI commands — and for the
+/// readback a task-pickup posts (channel.rs), which must promise the operator
+/// the endpoint the approved run will actually drive. Shares one code path with
+/// the real thing so "what would happen" and "what happens" cannot drift.
+pub(crate) fn endpoint_for_display() -> ResolvedEndpoint {
+    let fleet = last_fleet_endpoint();
+    resolve_endpoint(
+        fleet.as_ref().map(|(b, _)| b.as_str()),
+        fleet.as_ref().and_then(|(_, m)| m.as_deref()),
+    )
+}
+
 /// What the UI needs to decide between "enter your Anthropic key" and "verify
-/// your self-hosted endpoint": the base URL to show, and which mode we're in.
+/// your self-hosted endpoint": the base URL to show, which mode we are in, and
+/// — since the fleet can now override the shell — who chose it.
 #[derive(serde::Serialize)]
 pub struct ModelEndpoint {
     pub base: String,
     pub is_anthropic: bool,
     pub model: String,
+    pub source: EndpointSource,
+    /// True when this machine holds a worker enrollment AND the resolved
+    /// endpoint is Anthropic's own API with no opt-out — i.e. the next
+    /// dispatched run will be refused. Surfaced so the panel can say so before
+    /// a run fails rather than after.
+    pub blocked: bool,
 }
 
 #[tauri::command]
-pub fn model_endpoint() -> ModelEndpoint {
-    let base = anthropic_base();
+pub fn model_endpoint(app: AppHandle) -> ModelEndpoint {
+    let ep = endpoint_for_display();
+    let blocked = anthropic_guard_error(
+        &ep.base,
+        crate::credentials::is_enrolled(&app),
+        allow_anthropic_env(),
+    )
+    .is_some();
     ModelEndpoint {
-        is_anthropic: endpoint_is_anthropic(&base),
-        base,
-        model: model(),
+        is_anthropic: ep.is_anthropic(),
+        base: ep.base,
+        model: ep.model,
+        source: ep.source,
+        blocked,
     }
+}
+
+/// Whether `CU_ALLOW_ANTHROPIC` opts this machine out of the worker guard.
+fn allow_anthropic_env() -> bool {
+    matches!(
+        std::env::var(ALLOW_ANTHROPIC_ENV).ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// The guard: an enrolled worker must not silently drive `api.anthropic.com`.
+///
+/// Returns the refusal message, or `None` to proceed. What this prevents is a
+/// failure that *succeeds*: with the fleet endpoint missing, the run still
+/// works, still produces a normal transcript, and quietly bills Anthropic —
+/// nothing in the product ever contradicts the belief that it was self-hosted.
+/// Nobody catches that. So the silent success is converted into a loud failure.
+///
+/// THE ASYMMETRY IS DELIBERATE. This applies only to an ENROLLED WORKER (a
+/// machine holding a device token), never to an operator on a session
+/// credential. An operator spending their own BYOK key on their own laptop is
+/// the normal case and always was; a fleet node doing it is an unattended
+/// machine spending someone else's money on a choice nobody made. Same endpoint,
+/// different blast radius — hence different rules. If you are here to "simplify"
+/// by applying it to everyone, you will break every personal install.
+fn anthropic_guard_error(base: &str, is_worker: bool, allowed: bool) -> Option<String> {
+    if !is_worker || allowed || !endpoint_is_anthropic(base) {
+        return None;
+    }
+    Some(format!(
+        "Refusing to run: this machine is an enrolled fleet worker and the model \
+endpoint resolved to Anthropic's own API ({base}), so the run would bill \
+Anthropic while looking self-hosted. Set the fleet model endpoint in Settings, \
+or set {ALLOW_ANTHROPIC_ENV}=1 on this machine to allow it deliberately."
+    ))
 }
 
 /// Reachability probe for a self-hosted endpoint — the counterpart to
@@ -81,10 +252,12 @@ pub fn model_endpoint() -> ModelEndpoint {
 /// through `/v1/messages` proves a run would work.
 #[tauri::command]
 pub async fn check_model_endpoint() -> Result<String, String> {
-    let base = anthropic_base();
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    // Probe the endpoint a run would ACTUALLY use — a fleet value that arrived on
+    // a frame included — so "verify" and "run" can never test different hosts.
+    let ep = endpoint_for_display();
+    let url = ep.messages_url();
     let body = json!({
-        "model": model(),
+        "model": ep.model,
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "hi" }],
     });
@@ -106,7 +279,7 @@ pub async fn check_model_endpoint() -> Result<String, String> {
         let txt: String = txt.chars().take(300).collect();
         return Err(format!("{url} returned {status}: {txt}"));
     }
-    Ok(model())
+    Ok(ep.model)
 }
 
 /// Whether to attach a fresh screenshot to the tool_result of every action that
@@ -119,11 +292,16 @@ pub async fn check_model_endpoint() -> Result<String, String> {
 /// nothing ever contradicted it. Defaults ON for any non-Anthropic endpoint.
 ///
 /// `CU_AUTO_SCREENSHOT=1/0` forces it either way.
-fn auto_screenshot_enabled() -> bool {
+///
+/// `base` is the endpoint THIS run resolved to, not the process-wide one: a run
+/// dispatched at a self-hosted server from a machine whose shell still points at
+/// Anthropic needs the auto-screenshots, and deciding off the env var would hand
+/// it the Anthropic default and leave the run flying blind.
+fn auto_screenshot_enabled(base: &str) -> bool {
     match std::env::var("CU_AUTO_SCREENSHOT").ok().as_deref() {
         Some("1") | Some("true") => true,
         Some("0") | Some("false") => false,
-        _ => !endpoint_is_anthropic(&anthropic_base()),
+        _ => !endpoint_is_anthropic(base),
     }
 }
 
@@ -161,11 +339,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header enabling the official enhanced computer-use tool
 /// (`computer_20251124`). We send this directly now (the backend used to add it).
 const ANTHROPIC_BETA: &str = "computer-use-2025-11-24";
-fn model() -> String {
-    // Default to Claude Opus 4.8 (claude-opus-4-8); we send a concrete id in the
-    // Messages body straight to Anthropic.
-    std::env::var("CU_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
-}
+/// Default model id: Claude Opus 4.8. We send a concrete id in the Messages body
+/// straight to the endpoint; `resolve_endpoint` owns the precedence ladder.
+const DEFAULT_MODEL: &str = "claude-opus-4-8";
 
 /// Default hard iteration cap. Long unattended runs routinely need more than
 /// this, so it is only a default — see `max_iters`.
@@ -223,16 +399,67 @@ fn system_prompt() -> String {
         "{}\n\nYou are operating a {os} desktop. Use {os}-native conventions: the \
 keyboard shortcut modifier is `{modifier}` (for example `{modifier}+c` to copy, \
 `{modifier}+v` to paste), and application menus, window controls and file paths follow \
-{os} conventions. Do not use shortcuts or UI affordances from another operating system.",
-        SYSTEM_PROMPT_BASE
+{os} conventions. Do not use shortcuts or UI affordances from another operating system.\
+\n\n{}",
+        SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_GROUNDING
     )
 }
 
+/// The aiming contract, kept as its own paragraph so the two halves of the
+/// prompt can be read (and edited) separately: `SYSTEM_PROMPT_BASE` says what
+/// the agent is, this says how it aims.
+///
+/// Every clause here answers an observed failure. "Prefer the list" because
+/// estimated coordinates are our dominant failure mode. "Fall back to
+/// coordinates" because the Start menu, Electron apps and canvas UIs expose
+/// nothing and a model told only about the list will stall on them. "Valid for
+/// this turn only" because older lists stay in context and look just as
+/// authoritative as the current one.
+const SYSTEM_PROMPT_GROUNDING: &str = "Aiming: after each screenshot you may also receive a \
+numbered list of UI elements read from the operating system's accessibility tree. When a target \
+appears in that list, click it with a `click_element` STEP of the `batch` tool rather than \
+estimating pixel coordinates — the list carries the control's exact rectangle, so it cannot miss, \
+while coordinates read off a downscaled screenshot regularly land on the wrong control. Copy the \
+index, control_type and name exactly as printed. The list is REGENERATED every turn and its \
+indices are valid only for the turn it was printed in: never cite an index from an earlier \
+screenshot, and if a step is rejected because the element moved, take a fresh screenshot and use \
+the new list. When no list is printed, when it is reported empty, or when your target is simply \
+not in it (the Start menu, Electron apps, browsers, games and canvas-drawn UIs commonly expose \
+nothing), fall back to the computer tool's coordinate clicks — that is expected, not a \
+malfunction. The screenshot is always how you UNDERSTAND the screen; the element list only helps \
+you AIM at it.\n\n\
+Keyboard first: prefer typing and keyboard shortcuts over clicking WHENEVER the target accepts \
+them, and click only when there is no keyboard route. Type '4815*1623' and press Return rather \
+than pressing nine keypad buttons. Press ctrl+s rather than opening the File menu and finding \
+Save. Use Tab to move between fields and Return to accept a dialog rather than aiming at its \
+buttons. This is not only faster — every click is an aim that can land on the wrong control, \
+while typed text either arrives or does not, so a keystroke has no way to quietly do the wrong \
+thing. Clicking is for what has no keyboard equivalent: toolbar icons, links, arbitrary \
+controls. Make sure the right window has focus before you type.\n\n\
+Keystrokes and element clicks exist ONLY as steps of the `batch` tool — there is no way to send \
+one on its own, and trying will be refused without doing anything. So plan ahead: put every step \
+you already know you need into ONE batch. Entering '137' then '+' is a single batch of four \
+steps, not four batches of one. Selecting all and typing replacement text is one batch of two. A \
+batch takes up to four steps and returns one screenshot of the result, which is why it is much \
+faster than acting one step at a time. Coordinate clicks, scrolling and screenshots stay on the \
+computer tool and are still sent one at a time: a guessed coordinate has to be checked before you \
+act again.";
+
 const SYSTEM_PROMPT_BASE: &str = "You are ScreenBuddy, a computer-use agent operating a desktop on the \
 user's behalf. You see the screen via screenshots and act through the `computer` tool \
-(mouse, keyboard, scroll, clipboard). Coordinates are pixels in the most recent \
+(screenshots, coordinate clicks, scroll) and the `batch` tool (keystrokes, typing, and clicks \
+aimed at listed elements). Coordinates are pixels in the most recent \
 screenshot, origin top-left. Take a screenshot before acting when you are unsure of the \
-current state. Work in small, verifiable steps: act, then screenshot to confirm. When the \
+current state. Work in verifiable steps: after any action whose RESULT YOU NEED TO SEE — a \
+click at a guessed coordinate, opening a menu, anything that might not have worked — look at \
+the screen before acting again. But when you already know what an action does and the next \
+action does not depend on seeing it, do not spend a turn looking: send them together with the \
+`batch` tool, up to four at a time, and you get one screenshot for the whole sequence. \
+Pressing 'ctrl+a' and then typing replacement text is one batch, not two turns. Several presses \
+on a keypad or toolbar already visible in the element list are one batch. Keystrokes and element \
+clicks are ONLY available as batch steps, so this is not a suggestion — it is the only way to \
+send them. Coordinate clicks are the exception and `batch` refuses them: a guessed coordinate \
+must be checked before you act again. When the \
 task is complete, stop and summarize what you did. Reference materials for this task are \
 provided at the start of the conversation; consult them as needed. To enter a saved username \
 or password, call the use_credential tool with the target label and field — never type \
@@ -331,6 +558,12 @@ target label (e.g. 'mail.google.com' or 'Amazon — desktop app') and which fiel
         }
     })
 }
+
+// The click_element SCHEMA is gone: the tool is no longer offered, and its
+// step now lives inside `batch` (same four identity fields, same meaning). The
+// aiming contract it used to carry is in SYSTEM_PROMPT_GROUNDING, and
+// `dispatch_click_element` below still performs the click for a batch step.
+// See `batch_only_refusal` for why it stopped being callable on its own.
 
 // ---- SSE parsing ----------------------------------------------------------
 
@@ -670,6 +903,332 @@ fn take_screenshot_retrying() -> Result<capture::Capture, capture::CaptureError>
     }
 }
 
+/// Append the UI Automation element list to a tool_result that carries a fresh
+/// screenshot.
+///
+/// Called at EVERY point an image enters the conversation, because the list is
+/// only meaningful next to the picture it was taken with. `uia::prompt_block`
+/// always returns something — a list, or one line saying why there is none — so
+/// the model always knows whether aiming by index is available this turn.
+/// Omitting it silently would leave the model to guess, and a model that guesses
+/// here invents indices.
+///
+/// Costs one tree walk (~180ms on Windows, nothing at all on macOS where the
+/// stub returns immediately). Deliberately taken AFTER the screenshot, so the
+/// list describes the same frame the model is looking at.
+fn push_element_list(content: &mut Vec<Value>) {
+    let dump = crate::uia::dump_now();
+    content.push(json!({"type": "text", "text": crate::uia::prompt_block(&dump)}));
+}
+
+
+// ---- batch --------------------------------------------------------------
+
+/// Actions that are no longer reachable one at a time, and the refusal that
+/// steers them into `batch`.
+///
+/// # Why a refusal and not a schema
+///
+/// `computer` is server-defined (`computer_20251124`) and carries no schema of
+/// ours, so its action vocabulary cannot be narrowed from here — `key` and
+/// `type` can only be taken away at dispatch. `click_element` we simply stopped
+/// offering, but a model with an older list still in context will name it
+/// anyway, and answering that with "unknown tool" teaches nothing.
+///
+/// # Why take them away at all
+///
+/// Three runs, three attempts, zero batches. The tool was offered, the system
+/// prompt asked for it, and the contradiction that told the model to screenshot
+/// after every action was removed — and it still pressed 1, 3, 7, +, 2, 4 as six
+/// separate turns with six screenshots. A 27B model imitates its own transcript
+/// far more readily than it follows a rule, and every turn of that transcript
+/// showed single actions working fine.
+///
+/// So the one-at-a-time path is gone rather than discouraged. Reaching for any
+/// of these now means filling in a `steps` array, and an array with one entry
+/// looks unfinished in a way a paragraph of instructions never managed to.
+/// Coordinate clicks, scrolls and screenshots are untouched: those genuinely
+/// need a look between them, which is the whole distinction `batch` encodes.
+fn batch_only_refusal(action: &str) -> Option<String> {
+    let what = match action {
+        "key" => "Pressing a key",
+        "type" => "Typing text",
+        "click_element" => "Clicking a listed element",
+        _ => return None,
+    };
+    Some(format!(
+        "{what} is not available on its own — use the `batch` tool, which takes up to \
+{MAX_BATCH_STEPS} of these steps and returns one screenshot for all of them. Put every step you \
+already know you need into ONE call: if you are entering '137' and then '+', that is one batch of \
+four steps, not four batches of one. Nothing was done; re-send this as a batch."
+    ))
+}
+
+
+/// How many steps one `batch` may carry.
+///
+/// The cap is about blame, not cost. Every step in a batch is taken without
+/// looking, so when the screen ends up wrong the model has to work out which
+/// step took it wrong from a single final screenshot. Four is short enough that
+/// the answer is usually obvious and long enough to cover the sequences that
+/// actually recur — select-all-and-retype, and a handful of keypad presses.
+const MAX_BATCH_STEPS: usize = 4;
+
+/// The batching tool: several actions, one screenshot.
+///
+/// # Why this exists
+///
+/// The loop already runs every `tool_use` block a turn emits, but the model was
+/// emitting exactly one — a measured run showed event seqs stepping by four
+/// (text, tool_use, status, screenshot) for sixteen straight actions. So every
+/// action cost a full round trip and a 600ms settle, including pairs that never
+/// needed a look between them: `ctrl+a` then `type`, or four Calculator keys.
+///
+/// # Why only these actions
+///
+/// The rule is: a step may be batched when the step AFTER it does not depend on
+/// seeing its result. Keystrokes qualify — they aim at nothing, so there is no
+/// aim to have missed. Pixel clicks never qualify: a coordinate is a guess, the
+/// only way to learn whether it landed is to look, and a batch that clicked
+/// blind twice would silently act on whatever happened to be under the second
+/// guess. They are absent from the schema for that reason, not for brevity.
+///
+/// `click_element` is allowed, and the reason is specific: `uia::resolve`
+/// verifies the control's name and type at that index before clicking, so a
+/// list that shifted under the batch produces a REJECTED step rather than a
+/// confident click on the wrong control. That is what makes it safe to send
+/// unwatched — the failure is loud.
+fn batch_tool() -> Value {
+    json!({
+        "name": "batch",
+        "description": "Perform up to 4 actions in order, then return ONE screenshot of the \
+result. Use this whenever the next action does not depend on seeing the previous one — \
+'ctrl+a' then typing replacement text, or several keys of a keypad you can already see. It is \
+the same actions you would send one at a time, so prefer it: one screenshot instead of four is \
+much faster. Steps run in order and stop at the first failure, and the result says which step \
+failed and which never ran. Pixel-coordinate clicks are deliberately not available here — a \
+guessed coordinate has to be checked before the next action, so send those one at a time with \
+the computer tool.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_STEPS,
+                    "description": "The actions to perform, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["key", "type", "click_element", "wait"],
+                                "description": "'key' presses a chord, 'type' types literal text, \
+'click_element' clicks a listed control by index, 'wait' pauses briefly for the UI to settle."
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "For 'key', the chord, e.g. 'ctrl+a' or 'return'. \
+For 'type', the literal text to type."
+                            },
+                            "index": {
+                                "type": "integer",
+                                "description": "For 'click_element': the element's index in the \
+list printed with the latest screenshot."
+                            },
+                            "control_type": {
+                                "type": "string",
+                                "description": "For 'click_element': the control type as printed."
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "For 'click_element': the name as printed, copied \
+exactly."
+                            },
+                            "button": {
+                                "type": "string",
+                                "enum": ["left", "right", "double"],
+                                "description": "For 'click_element': which click. Defaults to 'left'."
+                            }
+                        },
+                        "required": ["action"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        }
+    })
+}
+
+/// Run a batch's steps in order, stopping at the first failure.
+///
+/// The report names every step by its 1-based position and says plainly which
+/// ones never ran, because the model has one screenshot to reconcile against
+/// several actions: "step 2 failed, steps 3-4 did not run" is the difference
+/// between re-aiming one action and redoing the whole sequence.
+///
+/// A failed batch is NOT reported as a tool error. The steps before the failure
+/// really happened, so the screen has moved and the model must be shown it —
+/// `is_error` would suppress the auto-screenshot (see the dispatch loop) and
+/// leave the model reasoning about a screen it cannot see.
+fn dispatch_batch(
+    app: &AppHandle,
+    state: &ComputerState,
+    input: &Value,
+    last_sent: &mut Option<(u32, u32)>,
+) -> ActionOutcome {
+    // A lone step sent as a bare object rather than a one-element array is
+    // accepted, not refused. The first live run did exactly this — narrated "I
+    // will enter 137, plus, 246, equals in one batch", then sent
+    // `steps: {…}` — and spent a whole turn learning the container shape before
+    // re-sending the same intent correctly. Refusing a call whose meaning is
+    // unambiguous buys nothing: the model was right about what it wanted and
+    // wrong only about brackets, and a turn is the most expensive thing here.
+    let single;
+    let steps: &Vec<Value> = match input.get("steps") {
+        Some(Value::Array(v)) if !v.is_empty() => v,
+        Some(obj @ Value::Object(_)) => {
+            single = vec![obj.clone()];
+            &single
+        }
+        _ => return err_text("batch needs a non-empty `steps` array"),
+    };
+    if steps.len() > MAX_BATCH_STEPS {
+        return err_text(format!(
+            "batch takes at most {MAX_BATCH_STEPS} steps; you sent {}. Split it.",
+            steps.len()
+        ));
+    }
+
+    let mut log: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let n = i + 1;
+        let action = step.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        let outcome = match action {
+            "click_element" => dispatch_click_element(state, step),
+            // Routed through the ordinary dispatcher rather than reimplemented,
+            // so a batched keystroke cannot behave differently from the same
+            // keystroke sent alone.
+            "key" | "type" | "wait" => dispatch_action(app, state, action, step, last_sent),
+            // A coordinate click is the one thing this tool must refuse: see
+            // batch_tool's doc comment. Refused before anything runs so the
+            // model gets the whole sequence back to re-send properly.
+            "left_click" | "right_click" | "double_click" | "triple_click" | "middle_click"
+            | "left_click_drag" | "mouse_move" | "scroll" => {
+                return err_text(format!(
+                    "step {n}: '{action}' aims at a coordinate, which must be checked before the \
+next action — batch cannot take it. Send it with the computer tool on its own, or use \
+click_element if the target is in the element list."
+                ))
+            }
+            "" => return err_text(format!("step {n}: missing `action`")),
+            other => {
+                return err_text(format!(
+                    "step {n}: '{other}' is not a batchable action (use key, type, \
+click_element or wait)"
+                ))
+            }
+        };
+
+        // The step's own words, so a failure explains itself rather than being
+        // reduced to "failed".
+        let said = outcome
+            .content
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if outcome.is_error {
+            log.push(format!("step {n} ({action}) FAILED: {said}"));
+            let skipped = steps.len() - n;
+            if skipped > 0 {
+                log.push(format!(
+                    "steps {}-{} did not run.",
+                    n + 1,
+                    steps.len()
+                ));
+            }
+            log.push("The screenshot below is the screen as it stands after the steps that did run.".into());
+            // Deliberately ok_text: see the doc comment — the screen moved, so
+            // the model must be shown it.
+            return ok_text(log.join("\n"));
+        }
+        log.push(format!(
+            "step {n} ({action}) ok{}",
+            if said.is_empty() { String::new() } else { format!(": {said}") }
+        ));
+    }
+    log.push(format!("all {} steps ran.", steps.len()));
+    ok_text(log.join("\n"))
+}
+
+/// Click a control by its index in the element list, verifying at click time
+/// that the index still names the element the model was shown.
+///
+/// The two things this does that a coordinate click cannot:
+///
+/// 1. **It re-dumps.** The rect clicked is read microseconds before the click,
+///    not from the list the model read a turn or four ago. `uia::resolve` then
+///    refuses the click outright if the element at that index no longer matches
+///    the `control_type`/`name` the model echoed back — a stale index costs a
+///    turn instead of clicking whatever moved into that slot.
+/// 2. **It stays in physical screen space.** `uia::move_cursor_physical` places
+///    the pointer on the rect's centre directly and `click_at_cursor` presses
+///    without moving it, so the model-space scaling in `Computer::to_screen`
+///    (which would rescale an already-real coordinate, and clamp away the
+///    negative x of a left-hand monitor) is never applied. See
+///    `uia::imp::move_cursor_physical` for why that is safe under HiDPI.
+fn dispatch_click_element(state: &ComputerState, input: &Value) -> ActionOutcome {
+    let Some(index) = input.get("index").and_then(|i| i.as_u64()) else {
+        return err_text("click_element requires `index` (a number from the element list)");
+    };
+    let index = index as usize;
+    let Some(want_type) = input.get("control_type").and_then(|t| t.as_str()) else {
+        return err_text("click_element requires `control_type`, copied from the element list");
+    };
+    // An empty name is legitimate (the Notepad text area has none), so a MISSING
+    // name is treated as an empty one rather than rejected — it will then only
+    // match an element that genuinely has no name.
+    let want_name = input.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let (kind, times) = match input.get("button").and_then(|b| b.as_str()) {
+        Some("right") => ("right", 1),
+        Some("double") => ("left", 2),
+        _ => ("left", 1),
+    };
+    let want = if want_name.trim().is_empty() {
+        format!("{want_type} \"\"")
+    } else {
+        format!("{want_type} \"{want_name}\"")
+    };
+
+    let dump = crate::uia::dump_now();
+    if !dump.ok {
+        return err_text(format!(
+            "click_element is unavailable right now: {}. Click by pixel coordinate instead.",
+            dump.note
+        ));
+    }
+    let el = match crate::uia::resolve(&dump.elements, index, want_type, want_name) {
+        Ok(e) => e.clone(),
+        Err(e) => return err_text(crate::uia::index_error_message(&e, index, &want)),
+    };
+
+    if let Err(e) = crate::uia::move_cursor_physical(el.cx, el.cy) {
+        return err_text(e);
+    }
+    match with_computer(state, |c| c.click_at_cursor(kind, times).map_err(|e| e.to_string())) {
+        Ok(()) => ok_text(format!(
+            "{} click on element {index} ({}) at its exact rect centre ({}, {})",
+            if times == 2 { "double" } else { kind },
+            crate::uia::describe(&el),
+            el.cx,
+            el.cy
+        )),
+        Err(e) => err_text(e),
+    }
+}
+
 /// Map a single `computer` tool action onto the driver/capture and build the
 /// tool_result content. `last_sent` tracks the most recent screenshot's
 /// (sent_w, sent_h) so clicks can re-assert the coordinate contract.
@@ -708,7 +1267,9 @@ fn dispatch_action(
                         "screen_w": cap.screen_w, "screen_h": cap.screen_h
                     }),
                 );
-                ActionOutcome { content: vec![image_block(&cap.jpeg_base64)], is_error: false }
+                let mut content = vec![image_block(&cap.jpeg_base64)];
+                push_element_list(&mut content);
+                ActionOutcome { content, is_error: false }
             }
             Err(e) => err_text(e.to_string()),
         },
@@ -1130,12 +1691,21 @@ fn set_rolling_cache(messages: &mut Vec<Value>) {
 // a halt) the actual computer-use loop. All calls reuse the same Bearer session
 // token already sent to `cu-stream`.
 
-/// Attach the session bearer (if any) to an outgoing request.
-fn with_bearer(req: reqwest::RequestBuilder, auth: &str) -> reqwest::RequestBuilder {
-    if auth.is_empty() {
-        req
-    } else {
-        req.header("authorization", format!("Bearer {auth}"))
+/// Attach this machine's bearer credential (if any) to an outgoing request.
+///
+/// The single place run persistence decides what it is authenticating AS. `auth`
+/// is the session token the frontend passed down; `credentials::backend_credential`
+/// overrides it with the stored device token on an enrolled worker. Call sites
+/// stay ignorant of which — there is one credential, chosen once, and adding a
+/// second answer here is how the two classes would start to blur.
+pub(crate) fn with_bearer(
+    app: &AppHandle,
+    req: reqwest::RequestBuilder,
+    auth: &str,
+) -> reqwest::RequestBuilder {
+    match crate::credentials::backend_credential(app, auth) {
+        Some(cred) => req.header("authorization", format!("Bearer {cred}")),
+        None => req,
     }
 }
 
@@ -1166,6 +1736,7 @@ fn assistant_text(content: &[Value]) -> String {
 /// `POST /runs` before the agent task is spawned; this only stamps the status so
 /// the backend records `started_at`.
 async fn runs_patch_status(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1174,9 +1745,12 @@ async fn runs_patch_status(
 ) {
     let url = format!("{base}/runs/{run_id}");
     let body = json!({ "status": status });
-    match with_bearer(client.patch(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.patch(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
-        Ok(r) => eprintln!("[runs] status '{status}': HTTP {}", r.status()),
+        Ok(r) => {
+            eprintln!("[runs] status '{status}': HTTP {}", r.status());
+            crate::device::note_rejection(app, r.status().as_u16(), "runs");
+        }
         Err(e) => eprintln!("[runs] status '{status}': request failed: {e}"),
     }
 }
@@ -1184,6 +1758,7 @@ async fn runs_patch_status(
 /// `POST /runs/{id}/events` — best effort, logs and swallows failures.
 #[allow(clippy::too_many_arguments)]
 async fn runs_event(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1202,7 +1777,7 @@ async fn runs_event(
     if let Some(kind) = artifact_kind {
         body["artifact_kind"] = json!(kind);
     }
-    match with_bearer(client.post(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.post(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => eprintln!("[runs] event '{ev_type}': HTTP {}", r.status()),
         Err(e) => eprintln!("[runs] event '{ev_type}': request failed: {e}"),
@@ -1211,8 +1786,12 @@ async fn runs_event(
 
 /// Save a screenshot to LOCAL disk under the app data dir and return its
 /// absolute path on success (for the follow-up screenshot event), or `None`
-/// (logged) on any failure. Screenshots are the most sensitive data, so they
-/// NEVER leave the user's Mac — there is no server upload here.
+/// (logged) on any failure.
+///
+/// This is the OFFLINE record and the only copy guaranteed to exist: the same
+/// frame is also mirrored to object storage (`screenshots::enqueue_run_shot`),
+/// but that is best-effort and droppable, so the disk write stays unconditional
+/// and stays first.
 ///
 /// Path scheme: `<app_data_dir>/runs/<run_id>/<shot_seq>.jpg`. The base64 jpeg
 /// is decoded to raw bytes before writing. This is synchronous (no `.await`);
@@ -1257,6 +1836,7 @@ fn runs_save_screenshot_local(
 /// `PATCH /runs/{id}` terminal status update — best effort, logs failures.
 #[allow(clippy::too_many_arguments)]
 async fn runs_finalize(
+    app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     auth: &str,
@@ -1270,6 +1850,18 @@ async fn runs_finalize(
     result: Value,
     error_message: Option<&str>,
 ) {
+    // Every terminal path funnels through here, so this is the one place the
+    // task-pickup loop (channel.rs) can learn how a run ended — a device token
+    // cannot GET /runs/{id} back, so the worker's own record is the only copy
+    // it can consult. Recorded BEFORE the network call: the outcome must be in
+    // state before the RunLease drop cancels the token the pickup waits on.
+    crate::channel::note_run_outcome(app, run_id, status, error_message);
+    // The DURABLE twin of the note above: the outcome slot dies with the app,
+    // and the frames under runs/<id>/ say nothing about how the run ended, so
+    // this is the one moment the machine can remember that for later (the
+    // Machine screen's local run card). Best-effort like the local frame
+    // writes — a full disk loses a breadcrumb, never the run.
+    crate::runs_local::write_outcome(app, run_id, status, error_message, num_steps);
     let url = format!("{base}/runs/{run_id}");
     let body = json!({
         "status": status,
@@ -1281,7 +1873,7 @@ async fn runs_finalize(
         "result": result,
         "error_message": error_message,
     });
-    match with_bearer(client.patch(&url).json(&body), auth).send().await {
+    match with_bearer(app, client.patch(&url).json(&body), auth).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => eprintln!("[runs] finalize '{status}': HTTP {}", r.status()),
         Err(e) => eprintln!("[runs] finalize '{status}': request failed: {e}"),
@@ -1298,6 +1890,7 @@ async fn run_agent(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model_arg: Option<String>,
+    endpoint_arg: Option<String>,
     token: CancellationToken,
 ) {
     // Release the AgentState lock when this run ends, however it ends.
@@ -1305,21 +1898,51 @@ async fn run_agent(
 
     let client = reqwest::Client::new();
     let base = backend;
-    // BYOK: the per-turn model call goes DIRECTLY to Anthropic. `base` is kept
-    // for run persistence (POST /runs, events, PATCH) with the session token.
-    let url = format!("{}/v1/messages", anthropic_base());
-    // Honor the caller-selected model (launcher's picker); fall back to the
-    // env/default when none was supplied.
-    let model = model_arg.unwrap_or_else(model);
+    // Resolve the model endpoint ONCE, here, and use nothing else for the rest
+    // of the run. `endpoint_arg`/`model_arg` are what the dispatched `run` frame
+    // carried (or what the local launcher picked); everything below reads the
+    // resolution rather than the environment. PRECEDENCE: frame > env > default.
+    let ep = resolve_endpoint(endpoint_arg.as_deref(), model_arg.as_deref());
+    if ep.source == EndpointSource::Fleet {
+        note_fleet_endpoint(&ep.base, Some(&ep.model));
+    }
+    // BYOK: the per-turn model call goes DIRECTLY to that endpoint. `base` is
+    // kept for run persistence (POST /runs, events, PATCH) with the session
+    // token — two different servers, deliberately.
+    let url = ep.messages_url();
+    let model = ep.model.clone();
     let cred_tool = use_credential_tool();
+    // Launching the browser is a tool rather than a `computer` action for the
+    // same reason click_element is: `computer_20251124` is server-defined and
+    // schema-less, so its action vocabulary lives in the model and cannot be
+    // extended from here.
+    let browser_tool = crate::browser::tool_schema();
+    // Several actions, one screenshot — see `batch_tool` for which actions
+    // may be sent unwatched, and why coordinate clicks may not.
+    let batch_tool = batch_tool();
+    // The checklist this run is answerable for, handed over by the task-pickup
+    // loop and consumed here (see `channel::take_run_checklist`). Empty for a
+    // local or dispatched run, which is precisely why `claim_done_tool` returns
+    // None for those: only a run that owes typed items has typed items to claim.
+    let claim_checklist = crate::channel::take_run_checklist(&app);
+    let claim_tool = crate::channel::claim_done_tool(&claim_checklist);
+    // Its mid-run half: same gate, so the two tools and the prompt paragraph
+    // that explains them exist together or not at all.
+    let mark_tool = crate::channel::mark_evidence_tool(&claim_checklist);
+    eprintln!("[agent] model endpoint {} ({:?})", ep.base, ep.source);
 
     // --- persistence bootstrap ---
     // The run row is minted by the FRONTEND via `POST /runs` before this task is
     // spawned; we receive the pre-created `run_id`, announce it, and stamp the
     // status to "running" (the backend stamps `started_at`). All downstream
     // persistence keeps the `Option<String>` shape so it stays best-effort.
-    let _ = app.emit(EV_RUN_STARTED, json!({ "run_id": run_id }));
-    runs_patch_status(&client, &base, &auth, &run_id, "running").await;
+    // `task` rides along because a worker's UI cannot ask the backend what it is
+    // running: its device token never leaves Rust, so the machine panel is built
+    // entirely from these events. Without it that panel can only name the run's
+    // id and its last tool call — true, and useless to someone who walked up to
+    // the machine wanting to know what it is doing.
+    let _ = app.emit(EV_RUN_STARTED, json!({ "run_id": run_id, "task": prompt }));
+    runs_patch_status(&app, &client, &base, &auth, &run_id, "running").await;
     let run_id: Option<String> = Some(run_id);
     let mut seq: i64 = 0;
     // Monotonic per-run screenshot index, used for the local file name
@@ -1332,8 +1955,30 @@ async fn run_agent(
     let mut last_text = String::new();
     let mut steps: i64 = 0;
 
+    // The worker guard, BEFORE the key read: a worker that must not drive
+    // Anthropic should be told so, not asked for an Anthropic key first (which
+    // on a cold cache costs a biometric prompt on a machine nobody is at).
+    // Failing here rather than in `start_run_internal` is deliberate — this path
+    // finalizes the run row as "failed" with the reason, so the refusal shows up
+    // in the admin's run list instead of only in the worker's stderr.
+    if let Some(msg) = anthropic_guard_error(
+        &ep.base,
+        crate::credentials::is_enrolled(&app),
+        allow_anthropic_env(),
+    ) {
+        let _ = app.emit(EV_ERROR, json!({ "error": msg }));
+        if let Some(rid) = &run_id {
+            runs_finalize(
+                &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                total_cache_create, total_cache_read, Value::Null, Some(&msg),
+            )
+            .await;
+        }
+        return;
+    }
+
     // BYOK is mandatory: read the user's own Anthropic key once, up front. The
-    // per-turn model call goes DIRECTLY to Anthropic with this key — it never
+    // per-turn model call goes DIRECTLY to the endpoint with this key — it never
     // touches our backend. If no key is stored, fail fast with a clear,
     // user-facing error (not a raw 401 from a later request).
     let api_key = match crate::credentials::anthropic_key(&app) {
@@ -1341,15 +1986,17 @@ async fn run_agent(
         // A self-hosted endpoint has no Anthropic credential to supply, so a
         // missing key is not an error there — send an empty `x-api-key` and let
         // the endpoint decide. Only the real Anthropic API can actually be
-        // blocked by this, so only it refuses up front. See
-        // `endpoint_is_anthropic`.
-        None if !endpoint_is_anthropic(&anthropic_base()) => String::new(),
+        // blocked by this, so only it refuses up front. Keyed off THIS run's
+        // resolved endpoint, not the env var: a run dispatched at a self-hosted
+        // server from a shell with no `CU_ANTHROPIC_BASE` would otherwise be
+        // refused for want of a key it does not need. See `endpoint_is_anthropic`.
+        None if !ep.is_anthropic() => String::new(),
         None => {
             let msg = "No Anthropic API key set — add one in Settings";
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                    &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
                     total_cache_create, total_cache_read, Value::Null, Some(msg),
                 )
                 .await;
@@ -1411,13 +2058,51 @@ async fn run_agent(
         }
     };
     let tool = computer_tool(disp_w, disp_h);
+    // Built once: the set is fixed for the run, and it serializes byte-identically
+    // every turn, which the prompt-cache prefix depends on.
+    let tools: Vec<Value> = [
+        Some(tool),
+        Some(cred_tool),
+        // click_element is deliberately absent: its step lives inside `batch`
+        // now, which is what makes several presses one turn. See
+        // `batch_only_refusal`.
+        Some(browser_tool),
+        Some(batch_tool),
+        mark_tool.clone(),
+        claim_tool.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    // Screenshot event seqs posted so far, in order — the numbers a `claim_done`
+    // entry's `frame_seq` may cite. Kept only because the model cannot otherwise
+    // know them: the seq is allocated by the persistence block AFTER the turn
+    // that produced the frame, so it is fed back in `frame_seq_note` and checked
+    // against this list here.
+    let mut frame_seqs: Vec<i64> = Vec::new();
+
+    // The mid-run `mark_evidence` calls, in the order the model made them.
+    // Run-local like `frame_seqs` and for the same reason: they are only ever
+    // read by this run's `claim_done` (which prefills from them) and then ride
+    // into the diary inside the claim, so parking them in ChannelState would
+    // buy nothing but a second run-id match to get wrong.
+    let mut evidence_marks: Vec<crate::channel::EvidenceMark> = Vec::new();
 
     // Consecutive empty assistant turns; reset by any turn that carries content.
     let mut empty_turns: usize = 0;
 
+    // The diary drain. On an enrolled worker EVERY run drains — local,
+    // dispatched or task-picked alike — because a nudge should reach whatever
+    // run is actually in flight; on an un-enrolled machine `TurnDrain` disables
+    // itself (there is no device credential to read the channel with). Cheap by
+    // construction: one GET per turn boundary, and a drain failure never fails
+    // the turn.
+    let mut drain = crate::channel::TurnDrain::new(&app);
+
     // Resolved once per run so a mid-run env change can't make some turns carry
     // an auto-screenshot and others not.
-    let auto_screenshot = auto_screenshot_enabled();
+    let auto_screenshot = auto_screenshot_enabled(&ep.base);
     eprintln!("[agent] auto-screenshot after actions: {auto_screenshot}");
 
     // Give the model the starting screen BEFORE its first move. Auto-screenshots
@@ -1432,13 +2117,12 @@ async fn run_agent(
     // run. Here it retires normally once newer screenshots arrive.
     if auto_screenshot {
         if let Some(shot) = initial_shot.take() {
-            messages.push(json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Here is the current screen before you begin."},
-                    image_block(&shot),
-                ],
-            }));
+            let mut content = vec![
+                json!({"type": "text", "text": "Here is the current screen before you begin."}),
+                image_block(&shot),
+            ];
+            push_element_list(&mut content);
+            messages.push(json!({"role": "user", "content": content}));
         }
     }
 
@@ -1456,7 +2140,7 @@ async fn run_agent(
             let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                     Value::Null, Some("cancelled by user"),
                 )
                 .await;
@@ -1470,10 +2154,40 @@ async fn run_agent(
         if let Some(rid) = &run_id {
             let s = bump(&mut seq);
             runs_event(
-                &client, &base, &auth, rid, s, "status",
+                &app, &client, &base, &auth, rid, s, "status",
                 json!({"turn": turn, "state": "running"}), None, None,
             )
             .await;
+        }
+
+        // Turn-boundary drain: pick up anything the operator appended to the
+        // diary since the last boundary. Each nudge becomes its OWN user
+        // message — never a mutation of messages[0], which owns the static
+        // cache breakpoint and must stay byte-identical for the pinned prefix
+        // to keep hitting. Other admin types are receipted inside the drain
+        // without touching the conversation. The server cursor is advanced by
+        // `turn_completed` below, only after this turn's response has fully
+        // landed — a crash mid-turn must redeliver the batch, and the
+        // deterministic receipt msg_ids make that redelivery harmless.
+        //
+        // The drain hands back texts already wrapped and already ordered — a
+        // redirect (`payload.override`) leads, and the additive nudges it
+        // supersedes never appear at all. That decision belongs to the drain,
+        // not here: it is the same decision as how a redirect is phrased.
+        let drained = drain.at_boundary(&app, &client, &base).await;
+        if drained.overridden {
+            // Worth a line in the log, because from here the transcript stops
+            // agreeing with the run's earlier turns and that is confusing to
+            // read back. A redirect corrects the approach only — the run, the
+            // task and the context all continue; stopping a worker is a
+            // separate operator action.
+            eprintln!("[agent] drain: redirect applied; the run's earlier approach is superseded");
+        }
+        for text in drained.texts {
+            messages.push(json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": text }],
+            }));
         }
 
         let body = json!({
@@ -1484,7 +2198,7 @@ async fn run_agent(
             // still hits.
             "system": system_prompt(),
             "messages": messages,
-            "tools": [tool, cred_tool],
+            "tools": tools,
             "max_tokens": MAX_TOKENS,
             // The backend used to force streaming when it relayed; talking to
             // Anthropic directly, we must set it ourselves so the SSE parser has
@@ -1533,7 +2247,7 @@ async fn run_agent(
                 let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
                 if let Some(rid) = &run_id {
                     runs_finalize(
-                        &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                        &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                         Value::Null, Some("cancelled by user"),
                     )
                     .await;
@@ -1550,7 +2264,7 @@ async fn run_agent(
                     .show();
                 if let Some(rid) = &run_id {
                     runs_finalize(
-                        &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
+                        &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
                         Value::Null, Some(&e),
                     )
                     .await;
@@ -1580,7 +2294,7 @@ async fn run_agent(
             if !turn_text.is_empty() {
                 let s = bump(&mut seq);
                 runs_event(
-                    &client, &base, &auth, rid, s, "text",
+                    &app, &client, &base, &auth, rid, s, "text",
                     json!({"text": turn_text}), None, None,
                 )
                 .await;
@@ -1609,7 +2323,7 @@ async fn run_agent(
             let _ = app.emit(EV_ERROR, json!({ "error": msg }));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "failed", steps, total_in, total_out,
+                    &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out,
                     total_cache_create, total_cache_read, Value::Null, Some(msg),
                 )
                 .await;
@@ -1619,6 +2333,14 @@ async fn run_agent(
         empty_turns = 0;
 
         messages.push(json!({"role": "assistant", "content": content.clone()}));
+
+        // The turn that consumed this boundary's drained batch has completed —
+        // the model's full response is in hand — so acknowledge consumption to
+        // the server NOW, before the end_turn check: waiting for the next
+        // boundary would leave the final turn's batch unacknowledged on every
+        // clean run end. The empty-turn retry above deliberately does not reach
+        // here: a dropped turn did not consume anything.
+        drain.turn_completed(&app, &client, &base).await;
 
         let tool_uses: Vec<&Value> = content
             .iter()
@@ -1637,7 +2359,7 @@ async fn run_agent(
                 .show();
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "completed", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "completed", steps, total_in, total_out, total_cache_create, total_cache_read,
                     json!({"summary": last_text}), None,
                 )
                 .await;
@@ -1650,7 +2372,7 @@ async fn run_agent(
         // `State` never crosses an await point — keeping the future `Send`.
         // We collect what to persist and PUT it after the state scope ends.
         let mut cancelled = false;
-        let (results, persisted): (Vec<Value>, Vec<(String, Value, Vec<String>)>) = {
+        let (mut results, persisted): (Vec<Value>, Vec<(String, Value, Vec<String>)>) = {
             let comp_state = app.state::<ComputerState>();
             let mut results: Vec<Value> = Vec::with_capacity(tool_uses.len());
             let mut persisted: Vec<(String, Value, Vec<String>)> = Vec::new();
@@ -1661,11 +2383,38 @@ async fn run_agent(
                 }
                 let id = tu.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 let name = tu.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name == "computer" {
+                // `click_element` rides the computer tool's dispatch path
+                // deliberately: it is a click like any other, and it needs the
+                // same auto-screenshot afterwards. Only the mapping from tool
+                // input to outcome differs.
+                // `batch` joins this arm rather than getting its own: the point
+                // of batching is ONE screenshot for several actions, and the
+                // single screenshot is exactly what this arm already attaches.
+                if name == "computer" || name == "click_element" || name == "batch" {
                     let action =
                         tu["input"].get("action").and_then(|a| a.as_str()).unwrap_or("");
-                    let mut outcome =
-                        dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent);
+                    let is_batch = name == "batch";
+                    // What the model NAMED, so a bare `click_element` call is
+                    // refused by the same rule as a bare `key`: the tool is no
+                    // longer offered, but an older list stays in context and
+                    // looks just as callable as the current one.
+                    let named = if name == "click_element" { "click_element" } else { action };
+                    let mut outcome = if is_batch {
+                        dispatch_batch(&app, &comp_state, &tu["input"], &mut last_sent)
+                    } else if let Some(msg) = batch_only_refusal(named) {
+                        err_text(msg)
+                    } else {
+                        dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent)
+                    };
+                    // A batch always ends somewhere new — every action it can
+                    // carry changes the screen — and a PARTIAL batch has moved
+                    // the screen too, which is why dispatch_batch reports a
+                    // failed step without setting `is_error`.
+                    // A refusal did nothing, so the screen has not moved and
+                    // there is no new frame worth attaching — `is_error` on the
+                    // outcome already suppresses the capture below, and this
+                    // keeps the two from disagreeing.
+                    let changes_screen = is_batch || action_changes_screen(action);
 
                     // Show the model what its action did. Without this, a model
                     // that never calls `screenshot` acts on a stale view for the
@@ -1673,7 +2422,7 @@ async fn run_agent(
                     // `auto_screenshot_enabled`. Skipped when the outcome already
                     // carries an image (`screenshot`/`zoom`) so we never send two,
                     // and skipped on failure so an error keeps its own message.
-                    if auto_screenshot && !outcome.is_error && action_changes_screen(action) {
+                    if auto_screenshot && !outcome.is_error && changes_screen {
                         let has_image = outcome.content.iter().any(|b| {
                             b.get("type").and_then(|t| t.as_str()) == Some("image")
                         });
@@ -1699,6 +2448,7 @@ async fn run_agent(
                                         }),
                                     );
                                     outcome.content.push(image_block(&cap.jpeg_base64));
+                                    push_element_list(&mut outcome.content);
                                 }
                                 // A failed auto-capture must not fail the action
                                 // the model actually asked for; it just means this
@@ -1755,6 +2505,94 @@ async fn run_agent(
                         Vec::new(),
                     ));
                     results.push(tool_result(id, outcome));
+                } else if name == "launch_browser" {
+                    // Opens a browser with the renderer accessibility tree
+                    // forced on, which is what makes page content addressable
+                    // by element instead of by estimated pixel. Chrome removed
+                    // the machine-wide policy in 152, so the launch flag is the
+                    // only route — and it only applies to a genuinely new
+                    // instance, hence browser.rs's isolated profile.
+                    let outcome = match crate::browser::tool_result_text(&app, &tu["input"]) {
+                        Ok(text) => ok_text(text),
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
+                    results.push(tool_result(id, outcome));
+                } else if name == "mark_evidence" && mark_tool.is_some() {
+                    // The mid-run half of the claim: "item X just became true,
+                    // here are the frames". It APPROVES NOTHING and does not end
+                    // anything — it accumulates locally and rides into the diary
+                    // inside the final claim. Same availability rule as
+                    // claim_done: a run that was not given the tool treats the
+                    // call as the hallucination it is.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let outcome = match crate::channel::parse_evidence_mark(
+                        &tu["input"],
+                        &claim_checklist,
+                        &frame_seqs,
+                        evidence_marks.len(),
+                        steps,
+                        now_ms,
+                    ) {
+                        Ok(mark) => {
+                            // Append, never replace: an item can become true,
+                            // break, and become true again, and each of those
+                            // moments is evidence the operator asked for by
+                            // name. Dropping the earlier mark would delete the
+                            // first proof at exactly the moment the second one
+                            // is in dispute.
+                            let ack = crate::channel::mark_ack_text(
+                                &mark,
+                                evidence_marks.len() + 1,
+                            );
+                            evidence_marks.push(mark);
+                            ok_text(ack)
+                        }
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
+                    results.push(tool_result(id, outcome));
+                } else if name == "claim_done" && claim_tool.is_some() {
+                    // The model's per-item assertion about the task's checklist.
+                    // It APPROVES NOTHING — it is stashed and posted to the diary
+                    // as a `status` when the run ends (channel::handle_task), so
+                    // the operator's verdict screen shows which item the worker
+                    // says it satisfied and which frame it cites. Validation is
+                    // strict about identity and its rejections are addressed to
+                    // the model, which can simply call again.
+                    //
+                    // The `claim_tool.is_some()` guard keeps ONE rule about
+                    // availability: a run that was not given the tool treats the
+                    // call as the hallucination it is, via the `unknown tool` arm
+                    // below.
+                    //
+                    // `evidence_marks` makes this a CONFIRMATION rather than the
+                    // first telling: anything the model already reported mid-run
+                    // is prefilled, so the end of the run is not where it has to
+                    // remember frame numbers. On a run with no marks it is empty
+                    // and this is the original flow exactly.
+                    let outcome = match crate::channel::parse_done_claim(
+                        &tu["input"],
+                        &claim_checklist,
+                        &frame_seqs,
+                        &evidence_marks,
+                    ) {
+                        Ok(claim) => {
+                            let ack = crate::channel::claim_ack_text(&claim);
+                            crate::channel::note_run_claim(
+                                &app,
+                                run_id.as_deref().unwrap_or(""),
+                                claim,
+                            );
+                            ok_text(ack)
+                        }
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
+                    results.push(tool_result(id, outcome));
                 } else {
                     results.push(tool_result(id, err_text(format!("unknown tool: {name}"))));
                 }
@@ -1766,7 +2604,7 @@ async fn run_agent(
             let _ = app.emit(EV_DONE, json!({"reason": "cancelled"}));
             if let Some(rid) = &run_id {
                 runs_finalize(
-                    &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
+                    &app, &client, &base, &auth, rid, "cancelled", steps, total_in, total_out, total_cache_create, total_cache_read,
                     Value::Null, Some("cancelled by user"),
                 )
                 .await;
@@ -1776,30 +2614,84 @@ async fn run_agent(
 
         // Persist dispatched actions (tool_use events) + their screenshots now
         // that the Computer state guard is dropped.
+        let frames_before = frame_seqs.len();
         if let Some(rid) = &run_id {
             for (name, input, shots) in &persisted {
                 let s = bump(&mut seq);
                 runs_event(
-                    &client, &base, &auth, rid, s, "tool_use",
+                    &app, &client, &base, &auth, rid, s, "tool_use",
                     json!({"name": name, "input": input}), None, None,
                 )
                 .await;
                 for shot in shots {
-                    // Save the jpeg to LOCAL disk (never uploaded) and record the
-                    // absolute file path in the screenshot event so the UI can load
-                    // it back off the user's Mac.
+                    // Save the jpeg to LOCAL disk and record the absolute file
+                    // path in the screenshot event so the UI can load it back
+                    // off this machine.
                     let fseq = bump(&mut shot_seq);
+                    // The event's seq is allocated HERE, before the upload is
+                    // enqueued, so both destinations describe the frame with the
+                    // SAME number. They used to disagree: the local event took
+                    // the loop's `seq` while the upload carried `shot_seq`, a
+                    // separate counter. That produced two rows per frame, and
+                    // the uploaded one landed at a seq the console's since_seq
+                    // cursor had already passed — so the frames the operator
+                    // came to see were the one thing an incremental poll could
+                    // never deliver. `shot_seq` still names the local FILE,
+                    // where a dense 0,1,2… is what makes a run's directory
+                    // readable by hand.
+                    let s = bump(&mut seq);
+                    // The number this frame is filed under everywhere — the
+                    // console's screenshot row, and (on a checklisted run) the
+                    // `frame_seq` a done claim may cite as its evidence.
+                    frame_seqs.push(s);
+                    // ...and mirror the SAME bytes off-machine so the admin
+                    // console can watch this run without a remote desktop. This
+                    // is `shot` — the image block the model was actually sent,
+                    // already downscaled to the vision budget — not a fresh
+                    // capture, so the console shows the evidence rather than a
+                    // re-enactment, at a fraction of the bytes.
+                    //
+                    // Fire-and-forget by construction: `enqueue_run_shot` spawns
+                    // and returns, so the turn never waits on storage, and it
+                    // drops the frame outright when its in-flight ceiling is
+                    // reached rather than growing a backlog behind the loop.
+                    // Not gated on the local write: the two destinations fail
+                    // independently.
+                    crate::screenshots::enqueue_run_shot(
+                        &app, &client, &base, &auth, rid, s, shot,
+                    );
                     if let Some(local_path) =
                         runs_save_screenshot_local(&app, rid, fseq, shot)
                     {
-                        let s = bump(&mut seq);
                         runs_event(
-                            &client, &base, &auth, rid, s, "screenshot",
+                            &app, &client, &base, &auth, rid, s, "screenshot",
                             json!({}), Some(&local_path), Some("screenshot_local"),
                         )
                         .await;
                     }
                 }
+            }
+        }
+
+        // Tell the model what this turn's screenshots were filed as, so a later
+        // `claim_done` can point at one. Only on runs where claiming applies —
+        // every other run would pay context for a number nothing reads. A text
+        // block AFTER the tool_results, which is where the API permits one.
+        //
+        // The checklist and the marks so far ride in because the note also
+        // carries what is STILL UNMARKED: the frame numbers and the debt they
+        // could settle belong in one string, in the one position the model reads
+        // while the picture is in front of it (see `frame_seq_note`). Passing
+        // `evidence_marks` — mutated by this turn's `mark_evidence` calls a few
+        // lines above — is what makes an item drop out of the reminder in the
+        // very turn it is marked, rather than one turn late.
+        if claim_tool.is_some() && !results.is_empty() {
+            if let Some(note) = crate::channel::frame_seq_note(
+                &frame_seqs[frames_before..],
+                &claim_checklist,
+                &evidence_marks,
+            ) {
+                results.push(json!({"type": "text", "text": note}));
             }
         }
 
@@ -1825,7 +2717,7 @@ async fn run_agent(
         .show();
     if let Some(rid) = &run_id {
         runs_finalize(
-            &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
+            &app, &client, &base, &auth, rid, "failed", steps, total_in, total_out, total_cache_create, total_cache_read,
             Value::Null, Some(&msg),
         )
         .await;
@@ -1841,6 +2733,11 @@ async fn run_agent(
 /// a remotely-started run is indistinguishable from a normal one — same lock,
 /// same RunLease, same persistence. Returns "an agent task is already running"
 /// (verbatim) when busy, so callers can detect contention.
+///
+/// `endpoint` is the model endpoint the caller was told to use — the dispatched
+/// `run` frame's value for a remote run, `None` for a local launch that has no
+/// opinion. It is passed through untouched; `run_agent` resolves it against the
+/// env var and the default (frame > env var > default).
 pub(crate) fn start_run_internal(
     app: &AppHandle,
     state: &AgentState,
@@ -1849,6 +2746,7 @@ pub(crate) fn start_run_internal(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model: Option<String>,
+    endpoint: Option<String>,
     backend: String,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|e| format!("agent state poisoned: {e}"))?;
@@ -1869,6 +2767,7 @@ pub(crate) fn start_run_internal(
         pinned_set_ids,
         run_id,
         model,
+        endpoint,
         token,
     ));
     Ok(())
@@ -1886,6 +2785,7 @@ pub fn start_agent_task(
     pinned_set_ids: Vec<String>,
     run_id: String,
     model: Option<String>,
+    model_endpoint: Option<String>,
     backend: Option<String>,
 ) -> Result<(), String> {
     // Run-persistence base comes from the frontend (its VITE_CU_BACKEND_URL, which
@@ -1901,6 +2801,7 @@ pub fn start_agent_task(
         pinned_set_ids,
         run_id,
         model,
+        model_endpoint,
         backend,
     )
 }
@@ -1920,6 +2821,169 @@ pub fn stop_agent_task(state: tauri::State<'_, AgentState>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- model endpoint resolution + the worker guard ---------------------
+
+    /// `resolve_endpoint` and `auto_screenshot_enabled` read process env, which
+    /// is shared by every test thread. Serialize the ones that set it and put it
+    /// back afterwards, so a test can neither see another test's value nor leave
+    /// one behind for the rest of the suite.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                    (*k, prev)
+                })
+                .collect();
+            EnvGuard(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, prev) in &self.0 {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The whole point of the change: a dispatched run drives the endpoint it was
+    /// told to, even on a machine whose shell says something else. Before this,
+    /// the env var won and the frame was not carried at all.
+    #[test]
+    fn frame_endpoint_beats_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://stale-shell:9999")),
+            ("CU_MODEL", Some("shell-model")),
+        ]);
+        let ep = resolve_endpoint(Some("http://fleet-llm:8080"), Some("fleet-model"));
+        assert_eq!(ep.base, "http://fleet-llm:8080");
+        assert_eq!(ep.model, "fleet-model");
+        assert_eq!(ep.source, EndpointSource::Fleet);
+    }
+
+    /// An older backend omits the field entirely; that machine must behave
+    /// exactly as it did before, which means the env var.
+    #[test]
+    fn env_var_used_when_the_frame_omits_the_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://self-hosted:8080")),
+            ("CU_MODEL", None),
+        ]);
+        let ep = resolve_endpoint(None, None);
+        assert_eq!(ep.base, "http://self-hosted:8080");
+        assert_eq!(ep.model, DEFAULT_MODEL);
+        assert_eq!(ep.source, EndpointSource::Env);
+    }
+
+    #[test]
+    fn default_endpoint_when_nothing_says_otherwise() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_ANTHROPIC_BASE", None), ("CU_MODEL", None)]);
+        let ep = resolve_endpoint(None, None);
+        assert_eq!(ep.base, DEFAULT_ANTHROPIC_BASE);
+        assert_eq!(ep.source, EndpointSource::Default);
+        assert!(ep.is_anthropic());
+    }
+
+    /// An operator who clears the settings field sends `""`, not nothing. That
+    /// must fall through the ladder rather than resolve to an empty base — an
+    /// empty base builds the URL "/v1/messages" and fails with a transport error
+    /// that names nothing.
+    #[test]
+    fn blank_frame_endpoint_falls_through_to_the_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_ANTHROPIC_BASE", Some("http://self-hosted:8080"))]);
+        let ep = resolve_endpoint(Some("   "), None);
+        assert_eq!(ep.base, "http://self-hosted:8080");
+        assert_eq!(ep.source, EndpointSource::Env);
+    }
+
+    /// Endpoint and model walk the ladder independently: a fleet that sets one
+    /// and not the other must not drag the machine's value for the other along.
+    #[test]
+    fn model_resolves_independently_of_the_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("CU_ANTHROPIC_BASE", Some("http://stale-shell:9999")),
+            ("CU_MODEL", Some("shell-model")),
+        ]);
+        let ep = resolve_endpoint(Some("http://fleet-llm:8080"), None);
+        assert_eq!(ep.base, "http://fleet-llm:8080");
+        assert_eq!(ep.model, "shell-model");
+        assert_eq!(ep.source, EndpointSource::Fleet);
+    }
+
+    #[test]
+    fn messages_url_does_not_double_the_slash() {
+        let ep = ResolvedEndpoint {
+            base: "http://self-hosted:8080/".into(),
+            model: DEFAULT_MODEL.into(),
+            source: EndpointSource::Fleet,
+        };
+        assert_eq!(ep.messages_url(), "http://self-hosted:8080/v1/messages");
+    }
+
+    /// Auto-screenshot follows THIS run's endpoint. A fleet run at a self-hosted
+    /// server from a shell with no override used to get the Anthropic default
+    /// (off) and fly blind.
+    #[test]
+    fn auto_screenshot_follows_the_runs_endpoint_not_the_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[("CU_AUTO_SCREENSHOT", None), ("CU_ANTHROPIC_BASE", None)]);
+        assert!(!auto_screenshot_enabled(DEFAULT_ANTHROPIC_BASE));
+        assert!(auto_screenshot_enabled("http://self-hosted:8080"));
+    }
+
+    /// The failure this whole change exists to stop: a fleet worker pointed at
+    /// Anthropic. It must refuse, not succeed quietly.
+    #[test]
+    fn worker_pointed_at_anthropic_is_refused() {
+        let err = anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, true, false)
+            .expect("an enrolled worker on api.anthropic.com must be refused");
+        assert!(err.contains("api.anthropic.com"), "names the endpoint: {err}");
+        assert!(err.contains(ALLOW_ANTHROPIC_ENV), "names the opt-out: {err}");
+    }
+
+    /// The asymmetry. Same endpoint, operator machine (session credential): this
+    /// is BYOK on your own laptop and has always been the normal case.
+    #[test]
+    fn operator_on_anthropic_is_unaffected() {
+        assert!(anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, false, false).is_none());
+    }
+
+    #[test]
+    fn worker_on_a_self_hosted_endpoint_runs() {
+        assert!(anthropic_guard_error("http://self-hosted:8080", true, false).is_none());
+    }
+
+    #[test]
+    fn worker_may_opt_in_to_anthropic_explicitly() {
+        assert!(anthropic_guard_error(DEFAULT_ANTHROPIC_BASE, true, true).is_none());
+    }
+
+    /// An empty base is treated as Anthropic by `endpoint_is_anthropic` (it is
+    /// what the default resolves to), so the guard must catch that too rather
+    /// than waving through a misconfiguration that lands on the default host.
+    #[test]
+    fn worker_with_an_empty_base_is_refused_too() {
+        assert!(anthropic_guard_error("", true, false).is_some());
+    }
 
     fn feed(blob: &str) -> SseAccumulator {
         let mut acc = SseAccumulator::new();
@@ -2227,5 +3291,142 @@ data: {\"type\":\"message_stop\"}
             .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
             .any(|b| b.get("cache_control").is_some());
         assert!(!any_cc, "no breakpoint when nothing is settled yet");
+    }
+
+    // ---- UIA grounding: tool contract and prompt wiring ----
+
+    /// The tool's whole safety story rests on the model echoing the identity
+    /// back, so `control_type` and `name` are as required as `index` is.
+    /// The batch schema must not offer a coordinate click. That is the whole
+    /// safety rule of the tool — a guessed coordinate can only be checked by
+    /// looking, so it can never be one of several actions sent unwatched —
+    /// and the enum is where it is enforced for a well-behaved model.
+    #[test]
+    fn batch_refuses_coordinate_actions_in_its_schema() {
+        let t = batch_tool();
+        let actions = &t["input_schema"]["properties"]["steps"]["items"]["properties"]["action"]
+            ["enum"];
+        let listed: Vec<&str> = actions
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        for allowed in ["key", "type", "click_element", "wait"] {
+            assert!(listed.contains(&allowed), "{allowed} should be batchable");
+        }
+        for banned in ["left_click", "right_click", "double_click", "scroll", "mouse_move"] {
+            assert!(!listed.contains(&banned), "{banned} must not be batchable");
+        }
+    }
+
+    /// The cap is what keeps a failure diagnosable: every step runs unwatched,
+    /// so one final screenshot has to explain all of them.
+    #[test]
+    fn batch_caps_its_step_count() {
+        let t = batch_tool();
+        assert_eq!(
+            t["input_schema"]["properties"]["steps"]["maxItems"]
+                .as_u64()
+                .expect("maxItems"),
+            MAX_BATCH_STEPS as u64
+        );
+    }
+
+    /// The identity fields are what turn a stale index into a rejected step
+    /// rather than a confident click on the wrong control, so they must stay
+    /// required now that the click lives inside a batch step. The standalone
+    /// click_element tool is gone (see `batch_only_refusal`), and this is where
+    /// that invariant moved to.
+    #[test]
+    fn a_batch_click_step_still_carries_the_element_identity() {
+        let t = batch_tool();
+        let props = &t["input_schema"]["properties"]["steps"]["items"]["properties"];
+        for field in ["index", "control_type", "name"] {
+            assert!(
+                props.get(field).is_some(),
+                "a batch step must be able to carry {field}"
+            );
+        }
+    }
+
+    /// The one-at-a-time paths must refuse rather than work, and must say what
+    /// to do instead — three live runs showed that a model with a working
+    /// single-action path never reaches for the batching one.
+    #[test]
+    fn single_step_actions_are_refused_into_batch() {
+        for action in ["key", "type", "click_element"] {
+            let msg = batch_only_refusal(action)
+                .unwrap_or_else(|| panic!("{action} should be refused on its own"));
+            assert!(msg.contains("batch"), "the refusal must name the tool to use");
+            assert!(
+                msg.contains("Nothing was done"),
+                "the refusal must say the action did not happen"
+            );
+        }
+    }
+
+    /// Coordinate clicks, scrolling and screenshots genuinely need a look
+    /// between them, which is the distinction batch encodes — refusing them
+    /// would leave no way to act on a UI the accessibility tree cannot see.
+    #[test]
+    fn coordinate_actions_are_still_sent_one_at_a_time() {
+        for action in ["left_click", "right_click", "scroll", "screenshot", "mouse_move", "wait"] {
+            assert!(
+                batch_only_refusal(action).is_none(),
+                "{action} must stay available on the computer tool"
+            );
+        }
+    }
+
+    /// A malformed call is refused before anything is clicked. These are the
+    /// parse-level rejections; `uia::resolve` owns the stale-index ones.
+    #[test]
+    fn click_element_rejects_calls_missing_an_identity() {
+        let state = ComputerState(std::sync::Mutex::new(None));
+        let no_index =
+            dispatch_click_element(&state, &json!({"control_type": "Button", "name": "OK"}));
+        assert!(no_index.is_error);
+        let no_type = dispatch_click_element(&state, &json!({"index": 0, "name": "OK"}));
+        assert!(no_type.is_error);
+    }
+
+    /// Off Windows there is no element list, so a call must fail LOUDLY — never
+    /// silently fall through to a coordinate click at some other position.
+    #[cfg(not(windows))]
+    #[test]
+    fn click_element_fails_explicitly_where_uia_does_not_exist() {
+        let state = ComputerState(std::sync::Mutex::new(None));
+        let out = dispatch_click_element(
+            &state,
+            &json!({"index": 0, "control_type": "Button", "name": "OK"}),
+        );
+        assert!(out.is_error);
+        let text = out.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("Windows-only"), "{text}");
+    }
+
+    /// Every screenshot must be accompanied by a statement about aiming — a
+    /// list, or one line saying there is none. Silence is the failure mode: a
+    /// model that cannot tell whether indices exist will invent them.
+    #[test]
+    fn element_list_always_accompanies_a_screenshot() {
+        let mut content = vec![image_block("x")];
+        push_element_list(&mut content);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "text");
+        let text = content[1]["text"].as_str().unwrap();
+        assert!(text.contains("UI element"), "{text}");
+    }
+
+    /// The prompt must teach both halves of the rule: prefer the list, and fall
+    /// back to coordinates when there is none.
+    #[test]
+    fn system_prompt_teaches_index_first_coordinates_fallback() {
+        let p = system_prompt();
+        assert!(p.contains("click_element"));
+        assert!(p.contains("REGENERATED every turn"));
+        assert!(p.contains("fall back"));
+        assert!(p.contains("Start menu"));
     }
 }
