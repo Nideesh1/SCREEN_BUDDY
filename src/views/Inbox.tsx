@@ -169,6 +169,20 @@ export async function postVerdict(
   }
 }
 
+// Is this question the pre-flight readback, rather than something the worker
+// stopped to ask mid-run? Told from the msg_id, which channel.rs mints
+// deterministically as `readback-{task_id}` (plus a `-g{n}` suffix on a
+// re-confirm after a send-back).
+//
+// It matters because the two moments deserve different verbs. Answering a
+// readback STARTS work that has not begun; approving a verdict accepts work
+// that is finished. Both were labelled "Approve", which left the operator to
+// infer from the surrounding prose which one they were about to do — and the
+// consequences are opposite.
+export function isReadbackQuestion(msgId: string): boolean {
+  return msgId.startsWith('readback-')
+}
+
 // Inline answer controls for one unanswered question: Approve, Reject, and one
 // optional directive box that rides along with EITHER — the worker reads the
 // decision from the payload marker, the text is instruction, not the verdict.
@@ -184,6 +198,12 @@ export function VerdictControls({
   taskId: string | null
   onAnswered: () => void
 }) {
+  // Same two payload decisions either way — the worker reads `approved` /
+  // `rejected` and knows nothing of these labels. Only the words change, to
+  // whichever describes what the click is about to cause.
+  const readback = isReadbackQuestion(questionMsgId)
+  const yesLabel = readback ? '▶ Start' : '✓ Approve'
+  const noLabel = readback ? '✕ Don’t start' : '✕ Reject'
   const [text, setText] = useState('')
   const [busy, setBusy] = useState<'approved' | 'rejected' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -228,11 +248,31 @@ export function VerdictControls({
           onChange={(e) => setText(e.target.value)}
           disabled={busy !== null}
         />
-        <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => send('approved')}>
-          {busy === 'approved' ? 'Sending…' : '✓ Approve'}
+        <Button
+          variant="primary"
+          size="sm"
+          disabled={busy !== null}
+          onClick={() => send('approved')}
+          title={
+            readback
+              ? 'Start this task — the machine begins work as soon as this lands'
+              : 'Answer this question with an approval'
+          }
+        >
+          {busy === 'approved' ? 'Sending…' : yesLabel}
         </Button>
-        <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => send('rejected')}>
-          {busy === 'rejected' ? 'Sending…' : '✕ Reject'}
+        <Button
+          variant="danger"
+          size="sm"
+          disabled={busy !== null}
+          onClick={() => send('rejected')}
+          title={
+            readback
+              ? 'Do not start — the task stays where it is for you to fix or kill'
+              : 'Answer this question with a rejection'
+          }
+        >
+          {busy === 'rejected' ? 'Sending…' : noLabel}
         </Button>
       </div>
       {notice && <div className="error-message">{notice}</div>}
