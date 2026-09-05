@@ -4,6 +4,10 @@ use tauri::{Manager, State};
 
 mod agent;
 mod artifacts;
+// Launching a browser with `--force-renderer-accessibility` so UIA can see page
+// content. Same shape on every platform (macOS/Linux launch for real; the pure
+// lookup/argument logic compiles and is tested everywhere), so no cfg here.
+mod browser;
 mod capture;
 mod channel;
 mod computer;
@@ -266,6 +270,12 @@ pub fn run() {
         // in Rust or the frontend. Read-only; it cannot touch the agent loop.
         uia::uia_dump,
         uia::uia_dump_all,
+        // Browser launch with renderer accessibility forced on — the only way
+        // UIA can see page content (see browser.rs). Commands so the frontend
+        // and a devtools paste can drive it; the agent loop reaches it through
+        // `browser::tool_schema` / `tool_result_text`, not through here.
+        browser::launch_browser,
+        browser::browser_status,
         window::bring_to_front
     ])
     .setup(|app| {

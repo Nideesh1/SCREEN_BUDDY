@@ -399,10 +399,35 @@ fn system_prompt() -> String {
         "{}\n\nYou are operating a {os} desktop. Use {os}-native conventions: the \
 keyboard shortcut modifier is `{modifier}` (for example `{modifier}+c` to copy, \
 `{modifier}+v` to paste), and application menus, window controls and file paths follow \
-{os} conventions. Do not use shortcuts or UI affordances from another operating system.",
-        SYSTEM_PROMPT_BASE
+{os} conventions. Do not use shortcuts or UI affordances from another operating system.\
+\n\n{}",
+        SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_GROUNDING
     )
 }
+
+/// The aiming contract, kept as its own paragraph so the two halves of the
+/// prompt can be read (and edited) separately: `SYSTEM_PROMPT_BASE` says what
+/// the agent is, this says how it aims.
+///
+/// Every clause here answers an observed failure. "Prefer the list" because
+/// estimated coordinates are our dominant failure mode. "Fall back to
+/// coordinates" because the Start menu, Electron apps and canvas UIs expose
+/// nothing and a model told only about the list will stall on them. "Valid for
+/// this turn only" because older lists stay in context and look just as
+/// authoritative as the current one.
+const SYSTEM_PROMPT_GROUNDING: &str = "Aiming: after each screenshot you may also receive a \
+numbered list of UI elements read from the operating system's accessibility tree. When a target \
+appears in that list, click it with the `click_element` tool rather than estimating pixel \
+coordinates — the list carries the control's exact rectangle, so it cannot miss, while \
+coordinates read off a downscaled screenshot regularly land on the wrong control. Copy the \
+index, control_type and name exactly as printed. The list is REGENERATED every turn and its \
+indices are valid only for the turn it was printed in: never cite an index from an earlier \
+screenshot, and if a click_element call is rejected because the element moved, take a fresh \
+screenshot and use the new list. When no list is printed, when it is reported empty, or when \
+your target is simply not in it (the Start menu, Electron apps, browsers, games and canvas-drawn \
+UIs commonly expose nothing), fall back to the computer tool's coordinate clicks — that is \
+expected, not a malfunction. The screenshot is always how you UNDERSTAND the screen; the element \
+list only helps you AIM at it.";
 
 const SYSTEM_PROMPT_BASE: &str = "You are ScreenBuddy, a computer-use agent operating a desktop on the \
 user's behalf. You see the screen via screenshots and act through the `computer` tool \
@@ -504,6 +529,63 @@ target label (e.g. 'mail.google.com' or 'Amazon — desktop app') and which fiel
                 "field": {"type": "string", "enum": ["username", "password"]}
             },
             "required": ["target", "field"]
+        }
+    })
+}
+
+/// The `click_element` tool schema — clicking by UI Automation element instead
+/// of by estimated pixel.
+///
+/// # Why a separate tool and not a `computer` action
+///
+/// It cannot be a `computer` action. `computer_20251124` is the server-defined,
+/// schema-LESS tool: we send no `input_schema` and the action vocabulary lives
+/// inside the model. There is no field in which to declare an extra action, and
+/// a model that has never been trained on `uia_click` will not emit it. A custom
+/// tool alongside it is the only mechanism the API offers, and `use_credential`
+/// already establishes the pattern (and the dispatch site) for exactly this: a
+/// local capability the model calls by name, dispatched next to the computer
+/// tool rather than inside it.
+///
+/// # Why the model must echo the identity back
+///
+/// `index` alone is not a safe handle — see `uia::resolve`. The list is rebuilt
+/// every turn and older lists stay in the model's context, so `control_type` and
+/// `name` are required: they turn a stale index into a tool error instead of a
+/// confident click on the wrong control.
+fn click_element_tool() -> Value {
+    json!({
+        "name": "click_element",
+        "description": "Click a UI control by its index in the element list printed with the most \
+recent screenshot. This aims EXACTLY — it clicks the control's real rectangle instead of a \
+coordinate estimated from the image — so prefer it over computer clicks whenever the target \
+appears in that list. You must copy `control_type` and `name` exactly as printed for the index \
+you cite: the list is regenerated every turn, and this call is rejected (nothing is clicked) if \
+the element at that index is no longer the one you named. When no list is printed, or the target \
+is not in it, use the computer tool's click actions with pixel coordinates instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "The element's index in the list printed with the latest screenshot."
+                },
+                "control_type": {
+                    "type": "string",
+                    "description": "The element's control type as printed, e.g. 'Button', 'MenuItem', 'Pane'."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "The element's name as printed, copied exactly (including any \
+keyboard hint such as '(Ctrl+B)'). Use an empty string for an element printed with an empty name."
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "double"],
+                    "description": "Which click to perform. Defaults to 'left'."
+                }
+            },
+            "required": ["index", "control_type", "name"]
         }
     })
 }
@@ -846,6 +928,90 @@ fn take_screenshot_retrying() -> Result<capture::Capture, capture::CaptureError>
     }
 }
 
+/// Append the UI Automation element list to a tool_result that carries a fresh
+/// screenshot.
+///
+/// Called at EVERY point an image enters the conversation, because the list is
+/// only meaningful next to the picture it was taken with. `uia::prompt_block`
+/// always returns something — a list, or one line saying why there is none — so
+/// the model always knows whether aiming by index is available this turn.
+/// Omitting it silently would leave the model to guess, and a model that guesses
+/// here invents indices.
+///
+/// Costs one tree walk (~180ms on Windows, nothing at all on macOS where the
+/// stub returns immediately). Deliberately taken AFTER the screenshot, so the
+/// list describes the same frame the model is looking at.
+fn push_element_list(content: &mut Vec<Value>) {
+    let dump = crate::uia::dump_now();
+    content.push(json!({"type": "text", "text": crate::uia::prompt_block(&dump)}));
+}
+
+/// Click a control by its index in the element list, verifying at click time
+/// that the index still names the element the model was shown.
+///
+/// The two things this does that a coordinate click cannot:
+///
+/// 1. **It re-dumps.** The rect clicked is read microseconds before the click,
+///    not from the list the model read a turn or four ago. `uia::resolve` then
+///    refuses the click outright if the element at that index no longer matches
+///    the `control_type`/`name` the model echoed back — a stale index costs a
+///    turn instead of clicking whatever moved into that slot.
+/// 2. **It stays in physical screen space.** `uia::move_cursor_physical` places
+///    the pointer on the rect's centre directly and `click_at_cursor` presses
+///    without moving it, so the model-space scaling in `Computer::to_screen`
+///    (which would rescale an already-real coordinate, and clamp away the
+///    negative x of a left-hand monitor) is never applied. See
+///    `uia::imp::move_cursor_physical` for why that is safe under HiDPI.
+fn dispatch_click_element(state: &ComputerState, input: &Value) -> ActionOutcome {
+    let Some(index) = input.get("index").and_then(|i| i.as_u64()) else {
+        return err_text("click_element requires `index` (a number from the element list)");
+    };
+    let index = index as usize;
+    let Some(want_type) = input.get("control_type").and_then(|t| t.as_str()) else {
+        return err_text("click_element requires `control_type`, copied from the element list");
+    };
+    // An empty name is legitimate (the Notepad text area has none), so a MISSING
+    // name is treated as an empty one rather than rejected — it will then only
+    // match an element that genuinely has no name.
+    let want_name = input.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let (kind, times) = match input.get("button").and_then(|b| b.as_str()) {
+        Some("right") => ("right", 1),
+        Some("double") => ("left", 2),
+        _ => ("left", 1),
+    };
+    let want = if want_name.trim().is_empty() {
+        format!("{want_type} \"\"")
+    } else {
+        format!("{want_type} \"{want_name}\"")
+    };
+
+    let dump = crate::uia::dump_now();
+    if !dump.ok {
+        return err_text(format!(
+            "click_element is unavailable right now: {}. Click by pixel coordinate instead.",
+            dump.note
+        ));
+    }
+    let el = match crate::uia::resolve(&dump.elements, index, want_type, want_name) {
+        Ok(e) => e.clone(),
+        Err(e) => return err_text(crate::uia::index_error_message(&e, index, &want)),
+    };
+
+    if let Err(e) = crate::uia::move_cursor_physical(el.cx, el.cy) {
+        return err_text(e);
+    }
+    match with_computer(state, |c| c.click_at_cursor(kind, times).map_err(|e| e.to_string())) {
+        Ok(()) => ok_text(format!(
+            "{} click on element {index} ({}) at its exact rect centre ({}, {})",
+            if times == 2 { "double" } else { kind },
+            crate::uia::describe(&el),
+            el.cx,
+            el.cy
+        )),
+        Err(e) => err_text(e),
+    }
+}
+
 /// Map a single `computer` tool action onto the driver/capture and build the
 /// tool_result content. `last_sent` tracks the most recent screenshot's
 /// (sent_w, sent_h) so clicks can re-assert the coordinate contract.
@@ -884,7 +1050,9 @@ fn dispatch_action(
                         "screen_w": cap.screen_w, "screen_h": cap.screen_h
                     }),
                 );
-                ActionOutcome { content: vec![image_block(&cap.jpeg_base64)], is_error: false }
+                let mut content = vec![image_block(&cap.jpeg_base64)];
+                push_element_list(&mut content);
+                ActionOutcome { content, is_error: false }
             }
             Err(e) => err_text(e.to_string()),
         },
@@ -1527,6 +1695,12 @@ async fn run_agent(
     let url = ep.messages_url();
     let model = ep.model.clone();
     let cred_tool = use_credential_tool();
+    // Launching the browser is a tool rather than a `computer` action for the
+    // same reason click_element is: `computer_20251124` is server-defined and
+    // schema-less, so its action vocabulary lives in the model and cannot be
+    // extended from here.
+    let browser_tool = crate::browser::tool_schema();
+    let element_tool = click_element_tool();
     eprintln!("[agent] model endpoint {} ({:?})", ep.base, ep.source);
 
     // --- persistence bootstrap ---
@@ -1685,13 +1859,12 @@ async fn run_agent(
     // run. Here it retires normally once newer screenshots arrive.
     if auto_screenshot {
         if let Some(shot) = initial_shot.take() {
-            messages.push(json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Here is the current screen before you begin."},
-                    image_block(&shot),
-                ],
-            }));
+            let mut content = vec![
+                json!({"type": "text", "text": "Here is the current screen before you begin."}),
+                image_block(&shot),
+            ];
+            push_element_list(&mut content);
+            messages.push(json!({"role": "user", "content": content}));
         }
     }
 
@@ -1756,7 +1929,7 @@ async fn run_agent(
             // still hits.
             "system": system_prompt(),
             "messages": messages,
-            "tools": [tool, cred_tool],
+            "tools": [tool, cred_tool, element_tool, browser_tool],
             "max_tokens": MAX_TOKENS,
             // The backend used to force streaming when it relayed; talking to
             // Anthropic directly, we must set it ourselves so the SSE parser has
@@ -1941,11 +2114,20 @@ async fn run_agent(
                 }
                 let id = tu.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 let name = tu.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name == "computer" {
+                // `click_element` rides the computer tool's dispatch path
+                // deliberately: it is a click like any other, and it needs the
+                // same auto-screenshot afterwards. Only the mapping from tool
+                // input to outcome differs.
+                if name == "computer" || name == "click_element" {
                     let action =
                         tu["input"].get("action").and_then(|a| a.as_str()).unwrap_or("");
-                    let mut outcome =
-                        dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent);
+                    let is_click_element = name == "click_element";
+                    let mut outcome = if is_click_element {
+                        dispatch_click_element(&comp_state, &tu["input"])
+                    } else {
+                        dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent)
+                    };
+                    let changes_screen = is_click_element || action_changes_screen(action);
 
                     // Show the model what its action did. Without this, a model
                     // that never calls `screenshot` acts on a stale view for the
@@ -1953,7 +2135,7 @@ async fn run_agent(
                     // `auto_screenshot_enabled`. Skipped when the outcome already
                     // carries an image (`screenshot`/`zoom`) so we never send two,
                     // and skipped on failure so an error keeps its own message.
-                    if auto_screenshot && !outcome.is_error && action_changes_screen(action) {
+                    if auto_screenshot && !outcome.is_error && changes_screen {
                         let has_image = outcome.content.iter().any(|b| {
                             b.get("type").and_then(|t| t.as_str()) == Some("image")
                         });
@@ -1979,6 +2161,7 @@ async fn run_agent(
                                         }),
                                     );
                                     outcome.content.push(image_block(&cap.jpeg_base64));
+                                    push_element_list(&mut outcome.content);
                                 }
                                 // A failed auto-capture must not fail the action
                                 // the model actually asked for; it just means this
@@ -2034,6 +2217,19 @@ async fn run_agent(
                         json!({"target": target, "field": field}),
                         Vec::new(),
                     ));
+                    results.push(tool_result(id, outcome));
+                } else if name == "launch_browser" {
+                    // Opens a browser with the renderer accessibility tree
+                    // forced on, which is what makes page content addressable
+                    // by element instead of by estimated pixel. Chrome removed
+                    // the machine-wide policy in 152, so the launch flag is the
+                    // only route — and it only applies to a genuinely new
+                    // instance, hence browser.rs's isolated profile.
+                    let outcome = match crate::browser::tool_result_text(&app, &tu["input"]) {
+                        Ok(text) => ok_text(text),
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
                     results.push(tool_result(id, outcome));
                 } else {
                     results.push(tool_result(id, err_text(format!("unknown tool: {name}"))));
@@ -2706,5 +2902,79 @@ data: {\"type\":\"message_stop\"}
             .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
             .any(|b| b.get("cache_control").is_some());
         assert!(!any_cc, "no breakpoint when nothing is settled yet");
+    }
+
+    // ---- UIA grounding: tool contract and prompt wiring ----
+
+    /// The tool's whole safety story rests on the model echoing the identity
+    /// back, so `control_type` and `name` are as required as `index` is.
+    #[test]
+    fn click_element_tool_requires_the_identity_fields() {
+        let t = click_element_tool();
+        assert_eq!(t["name"], "click_element");
+        let req: Vec<&str> = t["input_schema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for k in ["index", "control_type", "name"] {
+            assert!(req.contains(&k), "{k} must be required");
+        }
+        // A client-side tool with a schema, NOT a server-defined computer tool:
+        // the schema-less `computer_20251124` has no room for an extra action.
+        assert!(t.get("type").is_none(), "must not claim a server tool type");
+        assert!(t["input_schema"]["properties"]["button"]["enum"].is_array());
+    }
+
+    /// A malformed call is refused before anything is clicked. These are the
+    /// parse-level rejections; `uia::resolve` owns the stale-index ones.
+    #[test]
+    fn click_element_rejects_calls_missing_an_identity() {
+        let state = ComputerState(std::sync::Mutex::new(None));
+        let no_index =
+            dispatch_click_element(&state, &json!({"control_type": "Button", "name": "OK"}));
+        assert!(no_index.is_error);
+        let no_type = dispatch_click_element(&state, &json!({"index": 0, "name": "OK"}));
+        assert!(no_type.is_error);
+    }
+
+    /// Off Windows there is no element list, so a call must fail LOUDLY — never
+    /// silently fall through to a coordinate click at some other position.
+    #[cfg(not(windows))]
+    #[test]
+    fn click_element_fails_explicitly_where_uia_does_not_exist() {
+        let state = ComputerState(std::sync::Mutex::new(None));
+        let out = dispatch_click_element(
+            &state,
+            &json!({"index": 0, "control_type": "Button", "name": "OK"}),
+        );
+        assert!(out.is_error);
+        let text = out.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("Windows-only"), "{text}");
+    }
+
+    /// Every screenshot must be accompanied by a statement about aiming — a
+    /// list, or one line saying there is none. Silence is the failure mode: a
+    /// model that cannot tell whether indices exist will invent them.
+    #[test]
+    fn element_list_always_accompanies_a_screenshot() {
+        let mut content = vec![image_block("x")];
+        push_element_list(&mut content);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "text");
+        let text = content[1]["text"].as_str().unwrap();
+        assert!(text.contains("UI element"), "{text}");
+    }
+
+    /// The prompt must teach both halves of the rule: prefer the list, and fall
+    /// back to coordinates when there is none.
+    #[test]
+    fn system_prompt_teaches_index_first_coordinates_fallback() {
+        let p = system_prompt();
+        assert!(p.contains("click_element"));
+        assert!(p.contains("REGENERATED every turn"));
+        assert!(p.contains("fall back"));
+        assert!(p.contains("Start menu"));
     }
 }

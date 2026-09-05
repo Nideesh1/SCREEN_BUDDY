@@ -156,14 +156,48 @@ impl Computer {
     fn click_n(&mut self, x: i32, y: i32, button: Button, times: u32, mods: &[&str]) -> R<()> {
         self.mouse_move(x, y)?;
         let held = self.press_mods(mods)?;
+        let r = self.click_here(button, times);
+        self.release_mods(held)?;
+        r?;
+        self.settle();
+        Ok(())
+    }
+
+    /// Click at WHEREVER THE POINTER ALREADY IS, without moving it.
+    ///
+    /// Every other click here takes model-space coordinates and scales them
+    /// (`to_screen`). The UIA grounding path has no model-space coordinate to
+    /// scale: it has an exact physical screen rect, positions the pointer in
+    /// that space itself (`uia::move_cursor_physical`) and then needs only the
+    /// button events. Splitting the move from the click is what lets the two
+    /// coordinate systems stay apart instead of one being silently reinterpreted
+    /// as the other. `click_n` delegates here so the button/timing behaviour is
+    /// shared rather than duplicated.
+    ///
+    /// `kind` is a string rather than an `enigo::Button` so callers do not have
+    /// to depend on enigo's types; unknown values fall back to left, matching how
+    /// the rest of the driver treats an unrecognised optional argument.
+    pub fn click_at_cursor(&mut self, kind: &str, times: u32) -> R<()> {
+        let button = match kind {
+            "right" => Button::Right,
+            "middle" => Button::Middle,
+            _ => Button::Left,
+        };
+        self.click_here(button, times)?;
+        self.settle();
+        Ok(())
+    }
+
+    fn click_here(&mut self, button: Button, times: u32) -> R<()> {
         for _ in 0..times {
             self.enigo
                 .button(button, Click)
                 .map_err(|e| InputError::Exec(e.to_string()))?;
+            // Between the two clicks of a double-click this gap must stay well
+            // under the system double-click time (500ms by default), or the
+            // pair is delivered as two single clicks.
             std::thread::sleep(Duration::from_millis(20));
         }
-        self.release_mods(held)?;
-        self.settle();
         Ok(())
     }
 

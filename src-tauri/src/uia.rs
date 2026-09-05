@@ -1,4 +1,5 @@
-//! UIA grounding PROTOTYPE — read-only probe of the Windows UI Automation tree.
+//! UIA grounding — reading the Windows UI Automation tree so the model can aim
+//! by element instead of by estimated pixel.
 //!
 //! # Why this exists
 //!
@@ -9,16 +10,18 @@
 //!
 //! Windows already publishes the answer. Every control in the UI Automation
 //! tree (the same tree screen readers consume) reports a name, a control type,
-//! and an EXACT screen rectangle. The intended end state is "screenshot for
-//! understanding, element list for aiming": the model says `click element 7`
-//! and Rust looks up rect 7 and clicks its centre. No estimation anywhere.
+//! and an EXACT screen rectangle. So: "screenshot for understanding, element
+//! list for aiming". The model is shown a numbered list after every screenshot,
+//! says `click_element 7`, and this file looks up rect 7 and clicks its centre.
+//! No estimation anywhere on that path.
 //!
-//! **This file is not that.** This is the prototype that answers the only
-//! question worth answering first: *what does the tree actually report on the
-//! apps our workers touch?* Nothing here is wired into the agent loop, the
-//! system prompt, or the tool schema. It is two Tauri commands that dump JSON
-//! for a human to read. Deliberately so — we want data before we want a
-//! feature.
+//! This started as a read-only probe (`uia_dump` / `uia_dump_all`, still here,
+//! still the way an operator answers "what does this app actually expose?").
+//! Those dumps came back from a real Windows worker and settled the design:
+//! Notepad reports 22 named controls with exact rects in 179ms, Chrome launched
+//! with `--force-renderer-accessibility` reports page content too, and the Start
+//! menu reports nothing at all. Hence UIA-FIRST, PIXELS-FALLBACK — never a
+//! replacement for the vision path.
 //!
 //! # Honest limits (read these before believing a dump)
 //!
@@ -45,14 +48,14 @@
 //!   sessions** report nothing usable at all.
 //! - **Rects are physical desktop pixels**, in the virtual-screen coordinate
 //!   space (so negative x/y on a left-hand secondary monitor is normal and
-//!   correct). Our click path takes MODEL-space coordinates scaled against
-//!   `sent_w`/`sent_h`. Bridging the two is a later task, and it also requires
-//!   the process to be per-monitor DPI aware — if it is not, Windows lies to us
-//!   about rects on scaled displays. Nothing here clicks anything, so this
-//!   prototype is unaffected; the integration is not.
+//!   correct — the operator's Chrome window really did report `x: -11`). This
+//!   is NOT the model-space coordinate system `computer.rs` scales against, and
+//!   the two must never be mixed. See `move_cursor_physical` for how the click
+//!   path stays inside the physical space end to end.
 //! - **The tree is a snapshot of a moving target.** Between the walk and any
 //!   later click the UI may have re-laid-out. Grounding buys precision, not
-//!   freshness.
+//!   freshness — which is why `resolve` re-dumps at click time and verifies the
+//!   element's identity rather than trusting an index the model read a turn ago.
 //!
 //! # Scope
 //!
@@ -244,6 +247,62 @@ pub fn is_interactable(control_type: &str) -> bool {
     INTERACTABLE.contains(&control_type)
 }
 
+/// Container-ish control types that are allowed back in when their CLASS NAME
+/// identifies them as an editable text surface.
+///
+/// Kept deliberately short. These are the types a text control actually shows up
+/// as when its provider does not report `Edit`: Notepad's document area is a
+/// `Pane`, XAML/WinUI editors and web editing hosts turn up as `Custom`,
+/// `Document` or `Group`. Everything else (`Window`, `ToolBar`, `List`, …) stays
+/// out — no class name makes a toolbar typeable.
+const TEXT_SURFACE_TYPES: &[&str] = &["Pane", "Custom", "Document", "Group"];
+
+/// Class-name fragments that identify an editable text surface, matched
+/// case-insensitively as substrings.
+///
+/// Substring rather than exact match because these appear as one component of a
+/// longer app-specific class: `NotepadTextBox`, `RichEditD2DPT`,
+/// `Scintilla`, `_WwG` — well, not that last one, Word remains beyond us. The
+/// list is the union of what Win32/WinUI/WPF/Electron-ish editors actually name
+/// their surfaces, not a guess at what they might.
+const EDITABLE_CLASS_HINTS: &[&str] =
+    &["textbox", "edit", "richedit", "document", "scintilla"];
+
+/// Does this class name identify an editable text surface?
+pub fn class_looks_editable(class_name: &str) -> bool {
+    let c = class_name.trim().to_ascii_lowercase();
+    if c.is_empty() {
+        return false;
+    }
+    EDITABLE_CLASS_HINTS.iter().any(|h| c.contains(h))
+}
+
+/// Is this a text surface the model must be able to click into?
+///
+/// # Why this rule exists
+///
+/// The first real Notepad dump exposed the hole: 22 named controls came back
+/// with exact rects, and the ONE surface every Notepad task needs — the text
+/// area — was missing. It reports as a `Pane` with class `NotepadTextBox` and NO
+/// accessible name, so it failed both the control-type filter and the identity
+/// filter. Offering a model a perfect list of menu items and no place to type is
+/// worse than offering it nothing, because it looks complete.
+///
+/// When the name is empty the CLASS NAME is the identity — it is provider-
+/// authored, stable across runs, and specific enough to cite. So a `Pane` whose
+/// class says "TextBox" is admitted, while an unnamed `Pane` in general is not:
+/// blanket-accepting unnamed panes would flood the list with the layout
+/// containers the type filter exists to remove.
+///
+/// This does NOT bypass the backdrop rule, and it must not. Notepad's text area
+/// is 1423x560 inside a 1441x729 window — 76% of it, comfortably under
+/// `MAX_AREA_FRACTION` — because the title bar, menu, tab strip and status bar
+/// all take their cut. A `Pane` that really does span the whole window is a
+/// backdrop no matter what its class is called, and is still dropped.
+pub fn is_text_surface(e: &RawElement) -> bool {
+    TEXT_SURFACE_TYPES.contains(&e.control_type.as_str()) && class_looks_editable(&e.class_name)
+}
+
 /// Rect centre. Integer division truncates toward zero, which for negative
 /// coordinates (a left-hand secondary monitor) would bias the point right/down
 /// by one pixel — irrelevant for clicking, but the arithmetic is written as
@@ -256,12 +315,15 @@ pub fn center(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
 /// Does the element carry enough identity for a model to pick it by name?
 ///
 /// An unnamed control with no automation id is un-citable — the model has
-/// nothing to match against what it sees in the screenshot. The one exception
-/// is `Edit`: text fields are routinely unnamed, and "the text box" is usually
-/// unambiguous from the screenshot anyway, so an unnamed `Edit` still earns a
-/// slot.
+/// nothing to match against what it sees in the screenshot. The exceptions are
+/// text surfaces: `Edit` fields and the class-named panes `is_text_surface`
+/// recognises are routinely unnamed, and "the text box" is usually unambiguous
+/// from the screenshot anyway, so they still earn a slot.
 fn has_identity(e: &RawElement) -> bool {
-    !e.name.trim().is_empty() || !e.automation_id.trim().is_empty() || e.control_type == "Edit"
+    !e.name.trim().is_empty()
+        || !e.automation_id.trim().is_empty()
+        || e.control_type == "Edit"
+        || is_text_surface(e)
 }
 
 /// Should this node appear in the filtered (model-facing) list?
@@ -286,7 +348,9 @@ pub fn keep_filtered(e: &RawElement, window_area: i64) -> bool {
     if !e.enabled {
         return false;
     }
-    if !is_interactable(&e.control_type) {
+    // Clickable by type, or a text surface identified by class name (an unnamed
+    // `Pane` called `NotepadTextBox` is where every Notepad task types).
+    if !is_interactable(&e.control_type) && !is_text_surface(e) {
         return false;
     }
     if !has_identity(e) {
@@ -437,6 +501,204 @@ pub fn build_dump(
 }
 
 // ---------------------------------------------------------------------------
+// Pure logic: index resolution (the stale-index guard) and prompt rendering
+// ---------------------------------------------------------------------------
+
+/// Why a `click_element` request could not be turned into a rect.
+///
+/// Every variant is a REFUSAL, never a fallback click. A wrong click is far more
+/// expensive than a lost turn: it dismisses a dialog, activates the wrong tab,
+/// or sends a form — states the model then has to notice and undo, usually
+/// without realising it needs to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexError {
+    /// The fresh dump has no elements at all (Start menu, Electron, elevated
+    /// window, browser with accessibility asleep).
+    Empty,
+    /// The index is past the end of the fresh list.
+    OutOfRange { count: usize },
+    /// There IS an element at that index, but it is not the one the model was
+    /// shown. `moved_to` carries the element's new index when exactly one
+    /// element in the fresh dump still matches the requested identity — the
+    /// common "the list shifted by one" case, worth handing back.
+    Mismatch { found: String, moved_to: Option<usize> },
+}
+
+/// Compare accessible names forgivingly enough to survive a round trip through
+/// the model, strictly enough to still be an identity check.
+///
+/// Case is folded and internal whitespace collapsed because names legitimately
+/// carry line breaks and runs of spaces (Notepad's status bar reports
+/// `"Line 1,\nColumn 14"`) and a model retyping that into a tool call will not
+/// reproduce the whitespace byte for byte. Nothing else is normalised: keyboard
+/// hints, punctuation and ellipses ("Bold (Ctrl+B)", "Save As…") stay
+/// significant, because they are frequently the ONLY thing separating two
+/// neighbouring controls.
+pub fn normalize_name(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// How an element prints in the model-facing list and in error messages.
+pub fn describe(e: &UiaElement) -> String {
+    match (e.name.trim().is_empty(), e.class_name.as_deref()) {
+        // An unnamed element needs SOMETHING for the model to cite back, and
+        // the class name is what identifies it (a `Pane` called
+        // `NotepadTextBox`). Only shown when the name is empty: when there is a
+        // name it is the better handle and the class is noise.
+        (true, Some(class)) => format!("{} \"\" (class {class})", e.control_type),
+        (true, None) => format!("{} \"\"", e.control_type),
+        (false, _) => format!("{} \"{}\"", e.control_type, e.name),
+    }
+}
+
+/// Resolve `index` against a FRESH dump, verifying it is still the element the
+/// model was shown.
+///
+/// # The stale-index problem
+///
+/// Indices are positions in a list rebuilt from scratch every dump. The UI moves
+/// between turns — a menu opens, a row loads, a toast appears — and index 7 then
+/// names a different control, or none. A model that reads a list on turn 4 and
+/// cites index 7 on turn 6 (or re-reads a list still sitting in its context from
+/// three turns ago) would otherwise click something arbitrary, succeed, and
+/// report success.
+///
+/// So the tool takes the identity the model was SHOWN (`want_type`, `want_name`)
+/// alongside the index, and this function re-dumps at click time and checks that
+/// the element at that position still matches. A stale index becomes a tool
+/// ERROR the model can see and recover from, instead of a wrong click it cannot.
+/// The check is cheap — one filtered dump, ~180ms on the operator's Notepad —
+/// and it is the whole reason clicking by index is safer than clicking by
+/// estimated pixel rather than merely more precise.
+///
+/// `want_name` is compared with `normalize_name`; the control type must match
+/// exactly, since those strings come from our own fixed table (see
+/// `control_type_name`) and are never localized or re-worded.
+pub fn resolve<'a>(
+    elements: &'a [UiaElement],
+    index: usize,
+    want_type: &str,
+    want_name: &str,
+) -> Result<&'a UiaElement, IndexError> {
+    if elements.is_empty() {
+        return Err(IndexError::Empty);
+    }
+    let matches_identity = |e: &UiaElement| {
+        e.control_type == want_type && normalize_name(&e.name) == normalize_name(want_name)
+    };
+    let Some(e) = elements.get(index) else {
+        return Err(IndexError::OutOfRange { count: elements.len() });
+    };
+    if matches_identity(e) {
+        return Ok(e);
+    }
+    // Exactly one element still matching is a moved target; two or more is an
+    // ambiguity we must not resolve on the model's behalf (two "Close" buttons
+    // do different things), so it reports as a plain mismatch.
+    let mut hits = elements.iter().filter(|c| matches_identity(c));
+    let moved_to = match (hits.next(), hits.next()) {
+        (Some(only), None) => Some(only.index),
+        _ => None,
+    };
+    Err(IndexError::Mismatch { found: describe(e), moved_to })
+}
+
+/// Render an `IndexError` as the tool_result text the model reads.
+///
+/// Phrased as instructions, not diagnostics: a model that gets "index 7 is now
+/// X" without being told what to do next tends to retry the same index.
+pub fn index_error_message(err: &IndexError, index: usize, want: &str) -> String {
+    match err {
+        IndexError::Empty => format!(
+            "No UI element list is available for the foreground window right now, so element \
+             {index} cannot be resolved. Take a screenshot and click by pixel coordinate instead."
+        ),
+        IndexError::OutOfRange { count } => format!(
+            "Element {index} does not exist: the current window exposes {count} element(s) \
+             (0..{last}). The list is rebuilt every turn — take a screenshot to get the current \
+             one, then click again.",
+            last = count.saturating_sub(1)
+        ),
+        IndexError::Mismatch { found, moved_to } => {
+            let mut m = format!(
+                "Element {index} is now {found}, not {want} — the UI changed since that list was \
+                 printed, so nothing was clicked."
+            );
+            if let Some(i) = moved_to {
+                m.push_str(&format!(" {want} is now element {i}; click that instead."));
+            } else {
+                m.push_str(" Take a screenshot to get the current list, then click again.");
+            }
+            m
+        }
+    }
+}
+
+/// The element list as it goes into the model's context after a screenshot.
+///
+/// Always returns exactly one line when there is nothing to aim at. That is
+/// deliberate: silence is indistinguishable from "the list was omitted this
+/// turn", and a model that cannot tell whether aiming-by-index is available will
+/// invent indices. One line saying "not available, use coordinates" costs a few
+/// tokens and removes the guess.
+///
+/// Only `index`, control type and name are printed (plus the class name for
+/// unnamed elements, which is their only handle). Rects are deliberately NOT
+/// printed: the model cannot improve on them and would start doing arithmetic
+/// with them, which is the estimation habit this whole path exists to remove.
+pub fn prompt_block(dump: &UiaDump) -> String {
+    if !dump.ok {
+        return format!(
+            "UI element list: not available this turn ({}). Aim by pixel coordinates from the \
+             screenshot.",
+            first_line(&dump.note)
+        );
+    }
+    if dump.elements.is_empty() {
+        return format!(
+            "UI element list: empty for the foreground window \"{}\" — it exposes no automatable \
+             controls (Start menu, Electron/canvas apps and browsers without accessibility do \
+             this). Aim by pixel coordinates from the screenshot.",
+            dump.window_title
+        );
+    }
+    let mut out = format!(
+        "UI elements in the foreground window \"{}\" ({} of them). The screenshot is for \
+         UNDERSTANDING what is on screen; this list is for AIMING. To click one, call \
+         click_element with its index plus its control_type and name copied exactly as printed. \
+         This list is regenerated every turn — the indices below are valid for THIS turn only.\n",
+        dump.window_title,
+        dump.elements.len()
+    );
+    for e in &dump.elements {
+        out.push_str(&format!("{}: {}\n", e.index, describe(e)));
+    }
+    if dump.truncated {
+        out.push_str(&format!(
+            "(list truncated to {} of {} elements; anything missing is still clickable by pixel \
+             coordinate)\n",
+            dump.elements.len(),
+            dump.matched
+        ));
+    }
+    out
+}
+
+/// First line of a note, bounded — dump notes are prose paragraphs written for a
+/// human reading JSON, and the prompt only has room for the headline.
+fn first_line(note: &str) -> String {
+    let line = note.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 160 {
+        format!("{}…", line.chars().take(159).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Windows implementation
 // ---------------------------------------------------------------------------
 
@@ -495,9 +757,64 @@ mod imp {
     // which is a pointer-sized handle — `isize` is its exact ABI shape, and
     // `uiautomation::types::Handle` has `From<isize>`, so we never need the
     // `HWND` newtype at all.
+    //
+    // `SetCursorPos` comes from the same library for the same reason. It takes
+    // screen coordinates directly — the exact space `get_bounding_rectangle`
+    // reports in — and returns `BOOL` (a plain `i32`, non-zero on success).
     #[link(name = "user32")]
     extern "system" {
         fn GetForegroundWindow() -> isize;
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+    }
+
+    /// Put the pointer on a PHYSICAL virtual-desktop coordinate, bypassing the
+    /// model-space scaling in `computer.rs` entirely.
+    ///
+    /// # Why not go through `Computer::mouse_move`
+    ///
+    /// `mouse_move` takes MODEL-space coordinates and runs them through
+    /// `to_screen`, which multiplies by `screen/sent` and clamps to
+    /// `0..=screen-1`. A UIA rect is already a real screen coordinate, so
+    /// scaling it is simply wrong arithmetic — and the clamp would silently
+    /// destroy the negative coordinates a monitor left of the primary produces
+    /// (the operator's Chrome window reported `x: -11`), snapping the click to
+    /// the screen edge. Worse, `enigo`'s Windows `move_mouse` normalises
+    /// absolute coordinates against `SM_CXSCREEN`/`SM_CYSCREEN` — the PRIMARY
+    /// monitor — and does not pass `MOUSEEVENTF_VIRTUALDESK`, so it cannot
+    /// address a second monitor at all. Neither limitation matters for the
+    /// vision path (the screenshot only ever shows the primary monitor), and
+    /// both are fatal for a path whose input is a virtual-desktop rect.
+    ///
+    /// # Why clicking the physical coordinate directly is safe
+    ///
+    /// Both halves of this operation live in ONE coordinate space and it is the
+    /// same space: UIA's `BoundingRectangle` and `SetCursorPos` are both user32
+    /// screen coordinates, both subject to the *same* per-process DPI treatment.
+    /// If the process is per-monitor DPI aware, both are true physical pixels;
+    /// if it were not, Windows would virtualize both consistently. So the pair
+    /// agrees whatever the awareness level, and no scale factor is ever applied
+    /// by us. That is the property that makes this safe on a HiDPI display,
+    /// where a stray scale factor would put every click ~40% off.
+    ///
+    /// For the record, this process IS per-monitor DPI aware: Tauri's window
+    /// layer (`tao`) calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`
+    /// at event-loop creation. That is what makes the rects genuinely physical
+    /// and comparable with `capture.rs`'s physical grab — but the safety
+    /// argument above does not depend on it, which is the point.
+    ///
+    /// Windows clamps the position to the nearest visible monitor, so an
+    /// off-desktop rect lands somewhere harmless rather than nowhere.
+    pub fn move_cursor_physical(x: i32, y: i32) -> Result<(), String> {
+        if unsafe { SetCursorPos(x, y) } == 0 {
+            // The documented failure is a blocked input desktop (a UAC prompt
+            // or the lock screen owns input). Our SendInput path is equally
+            // blocked there, so this is the same boundary, reported honestly.
+            return Err(format!(
+                "could not move the pointer to ({x}, {y}) — the input desktop is blocked \
+                 (a UAC prompt or the lock screen)"
+            ));
+        }
+        Ok(())
     }
 
     /// Mutable state threaded through the recursive walk.
@@ -751,6 +1068,44 @@ mod imp {
             "UI Automation is Windows-only; this build has the stub path compiled in",
         )
     }
+
+    /// Off-platform twin of the Windows pointer move. It fails rather than
+    /// falling back to the model-space click path: there is no element list on
+    /// this platform, so nothing can legitimately reach here, and a silent
+    /// fallback would turn a logic error into a mystery click.
+    pub fn move_cursor_physical(x: i32, y: i32) -> Result<(), String> {
+        Err(format!(
+            "cannot move the pointer to physical ({x}, {y}): UI Automation grounding is \
+             Windows-only"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-loop entry points
+// ---------------------------------------------------------------------------
+
+/// Take a filtered dump SYNCHRONOUSLY, for callers already on a blocking thread.
+///
+/// The agent loop's `dispatch_action` is synchronous (it holds the `Computer`
+/// mutex and must not `.await`), so it cannot use the `spawn_blocking` wrapper
+/// the Tauri commands use. Calling straight through is correct there for the
+/// reason `dump_blocking` documents: the requirement is only that this never
+/// runs on the STA UI thread, and the agent loop runs on a tokio worker, which
+/// is exactly the MTA-suitable thread the COM notes describe.
+///
+/// Costs one tree walk per screenshot — 179ms on the operator's Notepad, bounded
+/// by `WALK_BUDGET_MS` in the worst case. That is small against the 600ms this
+/// loop already spends letting the UI settle before an auto-screenshot, and it
+/// buys the aiming list the whole feature is about.
+pub fn dump_now() -> UiaDump {
+    imp::dump_blocking(true)
+}
+
+/// Move the pointer to a physical virtual-desktop coordinate. See
+/// `imp::move_cursor_physical` for why this bypasses model-space scaling.
+pub fn move_cursor_physical(x: i32, y: i32) -> Result<(), String> {
+    imp::move_cursor_physical(x, y)
 }
 
 // ---------------------------------------------------------------------------
@@ -760,9 +1115,10 @@ mod imp {
 /// Filtered dump of the FOREGROUND window: the elements a model would plausibly
 /// be offered as click targets, in reading order, capped at 60.
 ///
-/// This is the shape the eventual grounding feature would use. It is exposed
-/// now only so a human can eyeball it against a screenshot and decide whether
-/// the idea survives contact with real apps. Nothing calls it from Rust.
+/// Exactly what the agent loop puts in front of the model (`dump_now` calls the
+/// same code with the same filter), exposed as a command so an operator can
+/// eyeball the list against a screenshot — the fastest way to answer "why did it
+/// not click element 7?" on a machine we cannot attach a debugger to.
 #[tauri::command]
 pub async fn uia_dump() -> Result<UiaDump, String> {
     tauri::async_runtime::spawn_blocking(|| imp::dump_blocking(true))
@@ -1081,6 +1437,263 @@ mod tests {
         }
         // empty strings become null rather than ""
         assert!(e["automation_id"].is_null());
+    }
+
+    // ---- text surfaces (the Notepad hole) ----
+    //
+    // The rects below are the REAL ones from the operator's Windows worker:
+    // Notepad's document area is a `Pane` with class `NotepadTextBox`, no
+    // accessible name, 1423x560 at (66,169), inside a 1441x729 window at
+    // (57,57).
+
+    const NOTEPAD_WINDOW_AREA: i64 = 1441 * 729;
+
+    fn notepad_text_box() -> RawElement {
+        let mut e = el("Pane", "", 66, 169, 1423, 560);
+        e.class_name = "NotepadTextBox".into();
+        e
+    }
+
+    #[test]
+    fn class_name_identifies_editable_surfaces() {
+        for c in ["NotepadTextBox", "RICHEDIT50W", "Scintilla", "Chrome_RenderWidgetHostHWND_Document", "TextBoxView"] {
+            assert!(class_looks_editable(c), "{c} should read as editable");
+        }
+        for c in ["", "   ", "Button", "Shell_TrayWnd", "CabinetWClass", "Static"] {
+            assert!(!class_looks_editable(c), "{c} should not read as editable");
+        }
+    }
+
+    #[test]
+    fn unnamed_notepad_text_box_survives_the_filter() {
+        let e = notepad_text_box();
+        assert!(
+            keep_filtered(&e, NOTEPAD_WINDOW_AREA),
+            "the one surface every Notepad task needs must be in the list"
+        );
+    }
+
+    #[test]
+    fn text_surface_rule_does_not_admit_unnamed_panes_in_general() {
+        // Same shape, ordinary layout-container class: still dropped.
+        let mut plain = el("Pane", "", 66, 169, 1423, 560);
+        plain.class_name = "LayoutHostPane".into();
+        assert!(!keep_filtered(&plain, NOTEPAD_WINDOW_AREA));
+        // An editable-looking class on a type that can never be typed into
+        // stays out too — the class name is identity, not a licence.
+        let mut toolbar = el("ToolBar", "", 0, 0, 400, 40);
+        toolbar.class_name = "EditToolBar".into();
+        assert!(!keep_filtered(&toolbar, NOTEPAD_WINDOW_AREA));
+    }
+
+    #[test]
+    fn backdrop_rule_still_bites_on_a_text_classed_pane() {
+        // The text surface is 76% of the window, so 0.95 never had to move for
+        // it. A pane that really does span the window is still a backdrop.
+        let area = (1423i64 * 560) as f64 / NOTEPAD_WINDOW_AREA as f64;
+        assert!(area > 0.7 && area < MAX_AREA_FRACTION, "real text area is {area}");
+
+        let mut full = el("Pane", "", 57, 57, 1441, 729);
+        full.class_name = "NotepadTextBox".into();
+        assert!(
+            !keep_filtered(&full, NOTEPAD_WINDOW_AREA),
+            "a window-sized pane is a backdrop whatever its class is called"
+        );
+    }
+
+    #[test]
+    fn text_surface_still_obeys_the_cheap_rejections() {
+        let mut off = notepad_text_box();
+        off.offscreen = true;
+        assert!(!keep_filtered(&off, NOTEPAD_WINDOW_AREA));
+        let mut dis = notepad_text_box();
+        dis.enabled = false;
+        assert!(!keep_filtered(&dis, NOTEPAD_WINDOW_AREA));
+    }
+
+    #[test]
+    fn text_surface_is_indexed_and_click_point_is_its_center() {
+        let raw = seqd(vec![
+            el("MenuItem", "File", 71, 133, 64, 20),
+            notepad_text_box(),
+        ]);
+        let d = build_dump(true, 1, "Untitled - Notepad".into(), [57, 57, 1441, 729], &raw, true, 2, false, 179, "ok");
+        assert_eq!(d.elements.len(), 2);
+        let text = &d.elements[1];
+        assert_eq!(text.control_type, "Pane");
+        assert_eq!(text.class_name.as_deref(), Some("NotepadTextBox"));
+        assert_eq!((text.cx, text.cy), (66 + 1423 / 2, 169 + 560 / 2));
+    }
+
+    // ---- index resolution (the stale-index guard) ----
+
+    /// Build a real dump (so `resolve` is tested against indices assigned by
+    /// the same code path the model is shown), from a window big enough that
+    /// the backdrop rule never interferes.
+    fn dump_of(raw: Vec<RawElement>) -> UiaDump {
+        let n = raw.len();
+        build_dump(true, 1, "Untitled - Notepad".into(), [57, 57, 1441, 729], &seqd(raw), true, n, false, 1, "ok")
+    }
+
+    #[test]
+    fn resolve_returns_the_element_when_identity_still_matches() {
+        let d = dump_of(vec![
+            el("MenuItem", "File", 71, 133, 64, 20),
+            el("Button", "Bold (Ctrl+B)", 300, 133, 32, 32),
+        ]);
+        let e = resolve(&d.elements, 1, "Button", "Bold (Ctrl+B)").unwrap();
+        assert_eq!(e.index, 1);
+        assert_eq!((e.cx, e.cy), (316, 149));
+    }
+
+    #[test]
+    fn resolve_tolerates_whitespace_and_case_but_not_different_text() {
+        // Notepad's status bar really does report "Line 1,\nColumn 14".
+        let d = dump_of(vec![el("Button", "Line 1,\nColumn 14", 0, 0, 100, 20)]);
+        assert!(resolve(&d.elements, 0, "Button", "line 1,  column 14").is_ok());
+        // Keyboard hints and punctuation stay significant.
+        let d2 = dump_of(vec![el("Button", "Bold (Ctrl+B)", 0, 0, 32, 32)]);
+        assert!(resolve(&d2.elements, 0, "Button", "Bold").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_a_stale_index_pointing_at_something_else() {
+        // The model was shown "Save" at 1; a toast pushed the list around and 1
+        // is now "Delete". This is the wrong click we exist to prevent.
+        let d = dump_of(vec![
+            el("Button", "Cancel", 10, 10, 60, 24),
+            el("Button", "Delete", 80, 10, 60, 24),
+        ]);
+        let err = resolve(&d.elements, 1, "Button", "Save").unwrap_err();
+        match &err {
+            IndexError::Mismatch { found, moved_to } => {
+                assert!(found.contains("Delete"), "{found}");
+                assert_eq!(*moved_to, None);
+            }
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+        let msg = index_error_message(&err, 1, "Button \"Save\"");
+        assert!(msg.contains("nothing was clicked"), "{msg}");
+        assert!(msg.contains("screenshot"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_reports_where_a_moved_element_went() {
+        let d = dump_of(vec![
+            el("Button", "New", 10, 10, 60, 24),
+            el("Button", "Cancel", 80, 10, 60, 24),
+            el("Button", "Save", 150, 10, 60, 24),
+        ]);
+        let err = resolve(&d.elements, 1, "Button", "Save").unwrap_err();
+        assert_eq!(
+            err,
+            IndexError::Mismatch { found: "Button \"Cancel\"".into(), moved_to: Some(2) }
+        );
+        let msg = index_error_message(&err, 1, "Button \"Save\"");
+        assert!(msg.contains("element 2"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_will_not_disambiguate_two_identical_candidates() {
+        // Two "Close" buttons do different things; guessing is worse than
+        // refusing, so `moved_to` stays None.
+        let d = dump_of(vec![
+            el("Button", "Open", 10, 10, 60, 24),
+            el("Button", "Close", 80, 10, 60, 24),
+            el("Button", "Close", 150, 10, 60, 24),
+        ]);
+        let err = resolve(&d.elements, 0, "Button", "Close").unwrap_err();
+        match err {
+            IndexError::Mismatch { moved_to, .. } => assert_eq!(moved_to, None),
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_an_index_past_the_end_and_an_empty_list() {
+        let d = dump_of(vec![el("Button", "OK", 10, 10, 60, 24)]);
+        assert_eq!(
+            resolve(&d.elements, 7, "Button", "OK").unwrap_err(),
+            IndexError::OutOfRange { count: 1 }
+        );
+        assert_eq!(resolve(&[], 0, "Button", "OK").unwrap_err(), IndexError::Empty);
+        let msg = index_error_message(&IndexError::OutOfRange { count: 1 }, 7, "Button \"OK\"");
+        assert!(msg.contains("0..0"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_matches_an_unnamed_text_surface_on_its_type() {
+        // The model echoes back an empty name for the Notepad text area; the
+        // control type is the whole identity it has.
+        let d = dump_of(vec![notepad_text_box()]);
+        assert!(resolve(&d.elements, 0, "Pane", "").is_ok());
+        assert!(resolve(&d.elements, 0, "Edit", "").is_err(), "type must still match");
+    }
+
+    #[test]
+    fn resolved_click_point_survives_a_negative_origin() {
+        // The operator's Chrome window really was at x:-11 on a monitor left of
+        // the primary. The click point must stay negative, not clamp to 0.
+        let d = dump_of(vec![el("Button", "Reload", -1900, -80, 40, 40)]);
+        let e = resolve(&d.elements, 0, "Button", "Reload").unwrap();
+        assert_eq!((e.cx, e.cy), (-1880, -60));
+        assert!(e.cx >= e.x && e.cx < e.x + e.w, "click point inside the rect");
+        assert!(e.cy >= e.y && e.cy < e.y + e.h, "click point inside the rect");
+    }
+
+    // ---- prompt rendering ----
+
+    #[test]
+    fn prompt_block_lists_index_type_and_name() {
+        let d = dump_of(vec![
+            el("MenuItem", "File", 71, 133, 64, 20),
+            notepad_text_box(),
+        ]);
+        let s = prompt_block(&d);
+        assert!(s.contains("0: MenuItem \"File\""), "{s}");
+        // The unnamed surface is citable only via its class, so it is shown.
+        assert!(s.contains("1: Pane \"\" (class NotepadTextBox)"), "{s}");
+        // No rects: the model must not do arithmetic with them.
+        assert!(!s.contains("1423"), "{s}");
+        assert!(s.contains("THIS turn only"), "the turn-scope warning is load-bearing");
+    }
+
+    #[test]
+    fn prompt_block_says_so_in_one_line_when_there_is_nothing_to_aim_at() {
+        let empty_tree = build_dump(
+            true, 1, "Start".into(), [0, 0, 800, 600], &[], true, 2, false, 5,
+            "tree is effectively empty: the provider exposes nothing below the window root.",
+        );
+        let s = prompt_block(&empty_tree);
+        assert_eq!(s.lines().count(), 1, "must be one line: {s}");
+        assert!(s.contains("pixel coordinates"), "{s}");
+
+        let not_windows = imp_stub_shape();
+        let s2 = prompt_block(&not_windows);
+        assert_eq!(s2.lines().count(), 1, "must be one line: {s2}");
+        assert!(s2.contains("not available"), "{s2}");
+    }
+
+    /// A not-ok dump shaped like the off-platform stub, without depending on
+    /// which platform the test runs on.
+    fn imp_stub_shape() -> UiaDump {
+        build_dump(
+            false, 0, String::new(), [0, 0, 0, 0], &[], true, 0, false, 0,
+            "UI Automation is Windows-only; this build has the stub path compiled in",
+        )
+    }
+
+    #[test]
+    fn prompt_block_reports_truncation() {
+        let raw = seqd(
+            (0..100)
+                .map(|i| el("Button", &format!("b{i}"), 0, i * 40, 40, 20))
+                .collect(),
+        );
+        let d = build_dump(true, 1, "w".into(), [0, 0, 4000, 4000], &raw, true, 100, false, 1, "ok");
+        let s = prompt_block(&d);
+        assert!(s.contains("truncated"), "{s}");
+        assert!(s.contains("pixel coordinate"), "the fallback must be stated: {s}");
     }
 
     /// The off-platform stub must still answer with the full shape (this test
