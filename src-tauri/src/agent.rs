@@ -428,6 +428,14 @@ not in it (the Start menu, Electron apps, browsers, games and canvas-drawn UIs c
 nothing), fall back to the computer tool's coordinate clicks — that is expected, not a \
 malfunction. The screenshot is always how you UNDERSTAND the screen; the element list only helps \
 you AIM at it.\n\n\
+Keyboard first: prefer typing and keyboard shortcuts over clicking WHENEVER the target accepts \
+them, and click only when there is no keyboard route. Type '4815*1623' and press Return rather \
+than pressing nine keypad buttons. Press ctrl+s rather than opening the File menu and finding \
+Save. Use Tab to move between fields and Return to accept a dialog rather than aiming at its \
+buttons. This is not only faster — every click is an aim that can land on the wrong control, \
+while typed text either arrives or does not, so a keystroke has no way to quietly do the wrong \
+thing. Clicking is for what has no keyboard equivalent: toolbar icons, links, arbitrary \
+controls. Make sure the right window has focus before you type.\n\n\
 Keystrokes and element clicks exist ONLY as steps of the `batch` tool — there is no way to send \
 one on its own, and trying will be refused without doing anything. So plan ahead: put every step \
 you already know you need into ONE batch. Entering '137' then '+' is a single batch of four \
