@@ -427,7 +427,14 @@ screenshot and use the new list. When no list is printed, when it is reported em
 your target is simply not in it (the Start menu, Electron apps, browsers, games and canvas-drawn \
 UIs commonly expose nothing), fall back to the computer tool's coordinate clicks — that is \
 expected, not a malfunction. The screenshot is always how you UNDERSTAND the screen; the element \
-list only helps you AIM at it.";
+list only helps you AIM at it.\n\n\
+Batching: when the next action does not depend on seeing the result of the previous one, send \
+them together with the `batch` tool instead of one at a time. Pressing 'ctrl+a' and then typing \
+replacement text is one batch, not two turns — you already know what 'ctrl+a' does and do not \
+need to look. Several presses on a keypad or toolbar you can already see in the element list are \
+one batch. Batching is much faster because you get one screenshot for the whole sequence instead \
+of one per action. Do NOT batch a coordinate click: a guessed coordinate has to be checked \
+before you act again, and `batch` will refuse it.";
 
 const SYSTEM_PROMPT_BASE: &str = "You are ScreenBuddy, a computer-use agent operating a desktop on the \
 user's behalf. You see the screen via screenshots and act through the `computer` tool \
@@ -944,6 +951,195 @@ fn take_screenshot_retrying() -> Result<capture::Capture, capture::CaptureError>
 fn push_element_list(content: &mut Vec<Value>) {
     let dump = crate::uia::dump_now();
     content.push(json!({"type": "text", "text": crate::uia::prompt_block(&dump)}));
+}
+
+
+// ---- batch --------------------------------------------------------------
+
+/// How many steps one `batch` may carry.
+///
+/// The cap is about blame, not cost. Every step in a batch is taken without
+/// looking, so when the screen ends up wrong the model has to work out which
+/// step took it wrong from a single final screenshot. Four is short enough that
+/// the answer is usually obvious and long enough to cover the sequences that
+/// actually recur — select-all-and-retype, and a handful of keypad presses.
+const MAX_BATCH_STEPS: usize = 4;
+
+/// The batching tool: several actions, one screenshot.
+///
+/// # Why this exists
+///
+/// The loop already runs every `tool_use` block a turn emits, but the model was
+/// emitting exactly one — a measured run showed event seqs stepping by four
+/// (text, tool_use, status, screenshot) for sixteen straight actions. So every
+/// action cost a full round trip and a 600ms settle, including pairs that never
+/// needed a look between them: `ctrl+a` then `type`, or four Calculator keys.
+///
+/// # Why only these actions
+///
+/// The rule is: a step may be batched when the step AFTER it does not depend on
+/// seeing its result. Keystrokes qualify — they aim at nothing, so there is no
+/// aim to have missed. Pixel clicks never qualify: a coordinate is a guess, the
+/// only way to learn whether it landed is to look, and a batch that clicked
+/// blind twice would silently act on whatever happened to be under the second
+/// guess. They are absent from the schema for that reason, not for brevity.
+///
+/// `click_element` is allowed, and the reason is specific: `uia::resolve`
+/// verifies the control's name and type at that index before clicking, so a
+/// list that shifted under the batch produces a REJECTED step rather than a
+/// confident click on the wrong control. That is what makes it safe to send
+/// unwatched — the failure is loud.
+fn batch_tool() -> Value {
+    json!({
+        "name": "batch",
+        "description": "Perform up to 4 actions in order, then return ONE screenshot of the \
+result. Use this whenever the next action does not depend on seeing the previous one — \
+'ctrl+a' then typing replacement text, or several keys of a keypad you can already see. It is \
+the same actions you would send one at a time, so prefer it: one screenshot instead of four is \
+much faster. Steps run in order and stop at the first failure, and the result says which step \
+failed and which never ran. Pixel-coordinate clicks are deliberately not available here — a \
+guessed coordinate has to be checked before the next action, so send those one at a time with \
+the computer tool.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_STEPS,
+                    "description": "The actions to perform, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["key", "type", "click_element", "wait"],
+                                "description": "'key' presses a chord, 'type' types literal text, \
+'click_element' clicks a listed control by index, 'wait' pauses briefly for the UI to settle."
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "For 'key', the chord, e.g. 'ctrl+a' or 'return'. \
+For 'type', the literal text to type."
+                            },
+                            "index": {
+                                "type": "integer",
+                                "description": "For 'click_element': the element's index in the \
+list printed with the latest screenshot."
+                            },
+                            "control_type": {
+                                "type": "string",
+                                "description": "For 'click_element': the control type as printed."
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "For 'click_element': the name as printed, copied \
+exactly."
+                            },
+                            "button": {
+                                "type": "string",
+                                "enum": ["left", "right", "double"],
+                                "description": "For 'click_element': which click. Defaults to 'left'."
+                            }
+                        },
+                        "required": ["action"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        }
+    })
+}
+
+/// Run a batch's steps in order, stopping at the first failure.
+///
+/// The report names every step by its 1-based position and says plainly which
+/// ones never ran, because the model has one screenshot to reconcile against
+/// several actions: "step 2 failed, steps 3-4 did not run" is the difference
+/// between re-aiming one action and redoing the whole sequence.
+///
+/// A failed batch is NOT reported as a tool error. The steps before the failure
+/// really happened, so the screen has moved and the model must be shown it —
+/// `is_error` would suppress the auto-screenshot (see the dispatch loop) and
+/// leave the model reasoning about a screen it cannot see.
+fn dispatch_batch(
+    app: &AppHandle,
+    state: &ComputerState,
+    input: &Value,
+    last_sent: &mut Option<(u32, u32)>,
+) -> ActionOutcome {
+    let steps: &Vec<Value> = match input.get("steps").and_then(|s| s.as_array()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return err_text("batch needs a non-empty `steps` array"),
+    };
+    if steps.len() > MAX_BATCH_STEPS {
+        return err_text(format!(
+            "batch takes at most {MAX_BATCH_STEPS} steps; you sent {}. Split it.",
+            steps.len()
+        ));
+    }
+
+    let mut log: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let n = i + 1;
+        let action = step.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        let outcome = match action {
+            "click_element" => dispatch_click_element(state, step),
+            // Routed through the ordinary dispatcher rather than reimplemented,
+            // so a batched keystroke cannot behave differently from the same
+            // keystroke sent alone.
+            "key" | "type" | "wait" => dispatch_action(app, state, action, step, last_sent),
+            // A coordinate click is the one thing this tool must refuse: see
+            // batch_tool's doc comment. Refused before anything runs so the
+            // model gets the whole sequence back to re-send properly.
+            "left_click" | "right_click" | "double_click" | "triple_click" | "middle_click"
+            | "left_click_drag" | "mouse_move" | "scroll" => {
+                return err_text(format!(
+                    "step {n}: '{action}' aims at a coordinate, which must be checked before the \
+next action — batch cannot take it. Send it with the computer tool on its own, or use \
+click_element if the target is in the element list."
+                ))
+            }
+            "" => return err_text(format!("step {n}: missing `action`")),
+            other => {
+                return err_text(format!(
+                    "step {n}: '{other}' is not a batchable action (use key, type, \
+click_element or wait)"
+                ))
+            }
+        };
+
+        // The step's own words, so a failure explains itself rather than being
+        // reduced to "failed".
+        let said = outcome
+            .content
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if outcome.is_error {
+            log.push(format!("step {n} ({action}) FAILED: {said}"));
+            let skipped = steps.len() - n;
+            if skipped > 0 {
+                log.push(format!(
+                    "steps {}-{} did not run.",
+                    n + 1,
+                    steps.len()
+                ));
+            }
+            log.push("The screenshot below is the screen as it stands after the steps that did run.".into());
+            // Deliberately ok_text: see the doc comment — the screen moved, so
+            // the model must be shown it.
+            return ok_text(log.join("\n"));
+        }
+        log.push(format!(
+            "step {n} ({action}) ok{}",
+            if said.is_empty() { String::new() } else { format!(": {said}") }
+        ));
+    }
+    log.push(format!("all {} steps ran.", steps.len()));
+    ok_text(log.join("\n"))
 }
 
 /// Click a control by its index in the element list, verifying at click time
@@ -1701,6 +1897,9 @@ async fn run_agent(
     // extended from here.
     let browser_tool = crate::browser::tool_schema();
     let element_tool = click_element_tool();
+    // Several actions, one screenshot — see `batch_tool` for which actions
+    // may be sent unwatched, and why coordinate clicks may not.
+    let batch_tool = batch_tool();
     // The checklist this run is answerable for, handed over by the task-pickup
     // loop and consumed here (see `channel::take_run_checklist`). Empty for a
     // local or dispatched run, which is precisely why `claim_done_tool` returns
@@ -1846,6 +2045,7 @@ async fn run_agent(
         Some(cred_tool),
         Some(element_tool),
         Some(browser_tool),
+        Some(batch_tool),
         mark_tool.clone(),
         claim_tool.clone(),
     ]
@@ -2154,16 +2354,27 @@ async fn run_agent(
                 // deliberately: it is a click like any other, and it needs the
                 // same auto-screenshot afterwards. Only the mapping from tool
                 // input to outcome differs.
-                if name == "computer" || name == "click_element" {
+                // `batch` joins this arm rather than getting its own: the point
+                // of batching is ONE screenshot for several actions, and the
+                // single screenshot is exactly what this arm already attaches.
+                if name == "computer" || name == "click_element" || name == "batch" {
                     let action =
                         tu["input"].get("action").and_then(|a| a.as_str()).unwrap_or("");
                     let is_click_element = name == "click_element";
-                    let mut outcome = if is_click_element {
+                    let is_batch = name == "batch";
+                    let mut outcome = if is_batch {
+                        dispatch_batch(&app, &comp_state, &tu["input"], &mut last_sent)
+                    } else if is_click_element {
                         dispatch_click_element(&comp_state, &tu["input"])
                     } else {
                         dispatch_action(&app, &comp_state, action, &tu["input"], &mut last_sent)
                     };
-                    let changes_screen = is_click_element || action_changes_screen(action);
+                    // A batch always ends somewhere new — every action it can
+                    // carry changes the screen — and a PARTIAL batch has moved
+                    // the screen too, which is why dispatch_batch reports a
+                    // failed step without setting `is_error`.
+                    let changes_screen =
+                        is_batch || is_click_element || action_changes_screen(action);
 
                     // Show the model what its action did. Without this, a model
                     // that never calls `screenshot` acts on a stale view for the
@@ -3046,6 +3257,42 @@ data: {\"type\":\"message_stop\"}
 
     /// The tool's whole safety story rests on the model echoing the identity
     /// back, so `control_type` and `name` are as required as `index` is.
+    /// The batch schema must not offer a coordinate click. That is the whole
+    /// safety rule of the tool — a guessed coordinate can only be checked by
+    /// looking, so it can never be one of several actions sent unwatched —
+    /// and the enum is where it is enforced for a well-behaved model.
+    #[test]
+    fn batch_refuses_coordinate_actions_in_its_schema() {
+        let t = batch_tool();
+        let actions = &t["input_schema"]["properties"]["steps"]["items"]["properties"]["action"]
+            ["enum"];
+        let listed: Vec<&str> = actions
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        for allowed in ["key", "type", "click_element", "wait"] {
+            assert!(listed.contains(&allowed), "{allowed} should be batchable");
+        }
+        for banned in ["left_click", "right_click", "double_click", "scroll", "mouse_move"] {
+            assert!(!listed.contains(&banned), "{banned} must not be batchable");
+        }
+    }
+
+    /// The cap is what keeps a failure diagnosable: every step runs unwatched,
+    /// so one final screenshot has to explain all of them.
+    #[test]
+    fn batch_caps_its_step_count() {
+        let t = batch_tool();
+        assert_eq!(
+            t["input_schema"]["properties"]["steps"]["maxItems"]
+                .as_u64()
+                .expect("maxItems"),
+            MAX_BATCH_STEPS as u64
+        );
+    }
+
     #[test]
     fn click_element_tool_requires_the_identity_fields() {
         let t = click_element_tool();

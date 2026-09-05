@@ -1612,12 +1612,15 @@ pub fn readback_text(
     model: &str,
     endpoint_base: &str,
 ) -> String {
-    let mut text = format!(
-        "Readback — confirm before this machine starts.\n\
-         Task: {title}\n\
-         Spec: {}",
-        truncate_chars(spec, READBACK_SPEC_CHARS)
-    );
+    // The spec alone, unlabelled. Three lines went before it and all three
+    // said something the console already says better: the card is headed with
+    // the task's title, the button now reads "Start", and "Readback — confirm
+    // before this machine starts" was explaining that button in prose.
+    //
+    // `title` stays in the signature: it is the console's heading, and a
+    // consumer reading only the text blob still gets it from the task record.
+    let _ = title;
+    let mut text = truncate_chars(spec, READBACK_SPEC_CHARS).to_string();
     if let Some(ws) = workspace {
         text.push_str(&format!("\nWorkspace: {ws}"));
     }
@@ -1632,10 +1635,17 @@ pub fn readback_text(
             truncate_chars(d.trim(), READBACK_DIRECTIVE_CHARS)
         ));
     }
-    text.push_str(&format!(
-        "\nThis machine will drive {model} at {endpoint_base}.\n\
-         Reply with a verdict: anything without an explicit rejection approves."
-    ));
+    // The endpoint stays, and it is the one line here that earns its place: a
+    // readback promising api.anthropic.com is how a self-hosted fleet quietly
+    // billing Anthropic gets caught, and it did get caught that way once.
+    // Trimmed to the fact — the console styles it as metadata rather than
+    // reading it as a sentence.
+    //
+    // What followed it is gone: "anything without an explicit rejection
+    // approves" describes the VERDICT PAYLOAD, which is a wire convention
+    // between this worker and the backend. The operator has two buttons and
+    // never types a verdict, so it was protocol leaking into a human's screen.
+    text.push_str(&format!("\nDriving {model} at {endpoint_base}"));
     text
 }
 
@@ -2628,7 +2638,7 @@ mod tests {
     // ---- readback assembly -------------------------------------------------
 
     #[test]
-    fn readback_echoes_task_and_endpoint() {
+    fn readback_echoes_spec_workspace_and_endpoint() {
         let text = readback_text(
             "Migrate CI to uv",
             "Move the pipeline off pip.",
@@ -2638,11 +2648,40 @@ mod tests {
             "qwen-vl",
             "http://self-hosted:8080",
         );
-        assert!(text.contains("Migrate CI to uv"));
         assert!(text.contains("Move the pipeline off pip."));
         assert!(text.contains("github.com/x/y (scratch, branch main)"));
+        // The endpoint is the load-bearing half of a readback: a run that
+        // promised api.anthropic.com on a self-hosted fleet was caught here.
         assert!(text.contains("qwen-vl"));
         assert!(text.contains("http://self-hosted:8080"));
+    }
+
+    /// The title is deliberately NOT echoed. The console heads the card with it
+    /// already, so repeating it made the operator read the same words twice
+    /// before reaching the spec.
+    #[test]
+    fn readback_leaves_the_title_to_the_console() {
+        let text = readback_text(
+            "Migrate CI to uv",
+            "Move the pipeline off pip.",
+            None,
+            None,
+            None,
+            "m",
+            "http://e",
+        );
+        assert!(!text.contains("Migrate CI to uv"));
+    }
+
+    /// The verdict-payload convention ("anything without an explicit rejection
+    /// approves") is a wire detail between this worker and the backend. The
+    /// operator answers with buttons and never types a verdict, so it has no
+    /// business on their screen.
+    #[test]
+    fn readback_does_not_explain_the_verdict_payload() {
+        let text = readback_text("t", "s", None, None, None, "m", "http://e");
+        assert!(!text.contains("rejection"));
+        assert!(!text.contains("verdict"));
     }
 
     /// The spec is truncated on a CHAR boundary (byte slicing panics mid-UTF-8)
