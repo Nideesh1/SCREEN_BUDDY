@@ -92,6 +92,17 @@ const READBACK_CHECKLIST_CHARS: usize = 1200;
 const READBACK_CHECKLIST_ITEM_CHARS: usize = 200;
 const READBACK_DIRECTIVE_CHARS: usize = 500;
 
+/// Bounds for the done-claim status message, same 16KB payload cap. The claim
+/// is the ONE message the operator reads before judging, so it is bounded per
+/// field rather than truncated as a blob: a claim whose last item vanished into
+/// an ellipsis is worse than one whose notes are clipped. Worst case at the
+/// item ceiling is 25 × (160 + 200 + ~120) ≈ 12KB plus the summary — inside the
+/// cap with room for the envelope.
+const CLAIM_MAX_ITEMS: usize = 25;
+const CLAIM_ITEM_TEXT_CHARS: usize = 160;
+const CLAIM_NOTE_CHARS: usize = 200;
+const CLAIM_SUMMARY_CHARS: usize = 600;
+
 // ---- managed state ---------------------------------------------------------
 
 /// A latching wake-up: `ring` from the WS read loop, `wait` from the idle
@@ -162,6 +173,20 @@ pub struct ChannelState {
     /// — can receipt them honestly as "answered our question" rather than as
     /// strays.
     handled_verdicts: Mutex<HashSet<String>>,
+    /// The checklist the run ABOUT TO START is answerable for, parked here by
+    /// `handle_task` and CONSUMED by `run_agent` (`take_run_checklist`). A
+    /// hand-off slot rather than a live field on purpose: taking it means a
+    /// local or dispatched run that starts later can never inherit a previous
+    /// task's items and offer the model a `claim_done` about work it was never
+    /// given. Empty for every run that is not a checklisted task's run.
+    pending_checklist: Mutex<Option<Vec<ChecklistItem>>>,
+    /// The done-claim the model made during the current run, recorded by
+    /// agent.rs's dispatch (which cannot reach the network from inside the
+    /// Computer-state scope) and drained by `handle_task` when the run ends.
+    /// One slot for the same reason `outcome` is one slot; a second
+    /// `claim_done` call in the same run overwrites — the last claim the model
+    /// stood behind is the one the operator should judge.
+    claim: Mutex<Option<(String, DoneClaim)>>,
 }
 
 impl Default for ChannelState {
@@ -171,6 +196,8 @@ impl Default for ChannelState {
             shutdown: CancellationToken::new(),
             outcome: Mutex::new(None),
             handled_verdicts: Mutex::new(HashSet::new()),
+            pending_checklist: Mutex::new(None),
+            claim: Mutex::new(None),
         }
     }
 }
@@ -198,6 +225,53 @@ pub(crate) fn note_run_outcome(app: &AppHandle, run_id: &str, status: &str, erro
                 error: error.map(str::to_string),
             });
         }
+    }
+}
+
+/// Park the checklist the run about to start is answerable for. Called by
+/// `handle_task` immediately before `start_run_internal`; see
+/// `ChannelState::pending_checklist` for why it is a hand-off and not a field.
+fn set_pending_checklist(app: &AppHandle, items: Vec<ChecklistItem>) {
+    if let Some(state) = app.try_state::<ChannelState>() {
+        if let Ok(mut g) = state.pending_checklist.lock() {
+            *g = Some(items);
+        }
+    }
+}
+
+/// Take the parked checklist, if any. `run_agent` calls this ONCE at run start:
+/// a non-empty result means this run belongs to a checklisted task and the
+/// `claim_done` tool applies to it; an empty one means the model gets no such
+/// tool and nothing in its prompt about claiming (a local run, a dispatched
+/// run, or a task whose every item the operator already accepted).
+pub(crate) fn take_run_checklist(app: &AppHandle) -> Vec<ChecklistItem> {
+    app.try_state::<ChannelState>()
+        .and_then(|s| s.pending_checklist.lock().ok().and_then(|mut g| g.take()))
+        .unwrap_or_default()
+}
+
+/// Record the model's done-claim for `run_id`. Called from agent.rs's tool
+/// dispatch, which is synchronous by construction (it holds the Computer state
+/// mutex and may not await), so the claim is stashed here and posted to the
+/// diary later by `handle_task` — in the same breath as the move to
+/// `awaiting_verdict`, which is the moment the operator starts judging.
+pub(crate) fn note_run_claim(app: &AppHandle, run_id: &str, claim: DoneClaim) {
+    if let Some(state) = app.try_state::<ChannelState>() {
+        if let Ok(mut g) = state.claim.lock() {
+            *g = Some((run_id.to_string(), claim));
+        }
+    }
+}
+
+/// The claim made during `run_id`, or None. Run-id-matched for the same reason
+/// `take_outcome_for` is: a claim left behind by an earlier run must never be
+/// attributed to this one.
+fn take_claim_for(app: &AppHandle, run_id: &str) -> Option<DoneClaim> {
+    let state = app.try_state::<ChannelState>()?;
+    let mut g = state.claim.lock().ok()?;
+    match g.as_ref() {
+        Some((id, _)) if id == run_id => g.take().map(|(_, c)| c),
+        _ => None,
     }
 }
 
@@ -463,7 +537,7 @@ fn workspace_summary(workspace: &Value) -> Option<String> {
 /// `[{item_id, text, approved, added_at}]`; only these three fields matter
 /// here — the worker READS the checklist and never writes it (add/delete/
 /// approve are operator-only moves).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChecklistItem {
     pub item_id: String,
     pub text: String,
@@ -509,6 +583,408 @@ pub fn checklist_readback_lines(checklist: &Value) -> Option<String> {
         })
         .collect();
     Some(truncate_chars(&lines.join("\n"), READBACK_CHECKLIST_CHARS))
+}
+
+// ---- the done claim --------------------------------------------------------
+//
+// The gap this closes, observed on the first real two-item run: the model
+// finished by narrating "Both windows are now visible side by side: Notepad
+// shows … and Calculator shows 42" — one prose blob, for a task that carried
+// two SEPARATE, typed checklist items and fourteen uploaded frames. Nothing in
+// that sentence said which item the model believed it had satisfied, or which
+// frame proved it, so the operator had to read every thumbnail and re-derive
+// the mapping by hand. Having a structured checklist and then throwing the
+// structure away at the one moment it is worth something is the whole bug.
+//
+// What follows is deliberately an ASSERTION channel, not an approval one. The
+// backend already 403s a device on `done` and on item approval; nothing here
+// tries to route around that, and the wording — in the tool description, in the
+// run prompt, and in the posted payload's own `text` — keeps saying "claims"
+// so a false claim reads as a false claim rather than as a fact.
+
+/// One item's claim as the worker records it: the model's assertion about one
+/// checklist item, plus the checklist text it refers to (denormalized so the
+/// operator's console can render the claim without joining back to the task)
+/// and the frame the model says proves it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimedItem {
+    pub item_id: String,
+    pub text: String,
+    pub satisfied: bool,
+    pub evidence_note: String,
+    /// The `seq` of a screenshot event in THIS run, or None. Optional on
+    /// purpose: "the file is on disk in the folder I opened" is a legitimate
+    /// item with no single frame behind it, and forcing a number would only
+    /// teach the model to invent one.
+    pub frame_seq: Option<i64>,
+}
+
+/// A whole `claim_done` call, validated against the task's real checklist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DoneClaim {
+    pub items: Vec<ClaimedItem>,
+    pub summary: String,
+}
+
+impl DoneClaim {
+    fn satisfied_count(&self) -> usize {
+        self.items.iter().filter(|c| c.satisfied).count()
+    }
+}
+
+/// Items the run still owes — the ones a claim is actually about. Approvals
+/// persist across send-backs, so an item the operator already accepted is not
+/// this run's to claim (and redoing it is explicitly discouraged elsewhere in
+/// the run spec).
+fn owed_items(items: &[ChecklistItem]) -> Vec<&ChecklistItem> {
+    items.iter().filter(|it| !it.approved).collect()
+}
+
+/// Whether a run with this checklist gets the `claim_done` tool at all: only
+/// when something is still owed. One predicate, used by BOTH the tool
+/// declaration and the run-prompt contract, so the model can never be told to
+/// call a tool it was not given (or given one nothing in its prompt explains).
+pub fn claim_applies(items: &[ChecklistItem]) -> bool {
+    items.iter().any(|it| !it.approved)
+}
+
+/// Resolve a model-supplied `item_id` against the task's real checklist.
+///
+/// Exact match first. Failing that, a case-insensitive PREFIX of at least 8
+/// characters that matches exactly one item — because the real ids are UUIDs
+/// (`e4777019-5f63-4776-a800-577c965bb88c`), and asking a 8B-class self-hosted
+/// model to transcribe 36 characters without a slip is asking for a rejected
+/// claim at the one moment in the run where a rejection costs the most. A
+/// prefix that matches two items is NOT resolved: guessing between them would
+/// attach the model's evidence to the wrong criterion, which is worse than the
+/// error message.
+fn resolve_item_id<'a>(raw: &str, items: &'a [ChecklistItem]) -> Option<&'a ChecklistItem> {
+    let raw = raw.trim();
+    if let Some(hit) = items.iter().find(|it| it.item_id == raw) {
+        return Some(hit);
+    }
+    if raw.len() < 8 {
+        return None;
+    }
+    let lower = raw.to_lowercase();
+    let mut matches = items
+        .iter()
+        .filter(|it| it.item_id.to_lowercase().starts_with(&lower));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+/// The valid item ids, for an error message that tells the model what to do
+/// next instead of only what it did wrong.
+fn valid_ids(items: &[ChecklistItem]) -> String {
+    items
+        .iter()
+        .map(|it| it.item_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse and validate one `claim_done` tool input against the task's checklist
+/// and the screenshot seqs this run has actually posted.
+///
+/// Every rejection returns text meant to be READ BY THE MODEL and acted on: it
+/// names what was wrong and what the legal values are, because the model can
+/// call `claim_done` again and a claim that is merely re-asked is worth far
+/// more than one silently coerced into shape. Nothing here is lenient about
+/// identity — an unknown `item_id` or a `frame_seq` from no frame we posted is
+/// refused outright, since the entire value of the claim to the operator is
+/// that its references resolve.
+pub fn parse_done_claim(
+    input: &Value,
+    checklist: &[ChecklistItem],
+    frame_seqs: &[i64],
+) -> Result<DoneClaim, String> {
+    if checklist.is_empty() {
+        return Err("claim_done does not apply to this task: it carries no checklist.".to_string());
+    }
+    let Some(arr) = input.get("items").and_then(|i| i.as_array()) else {
+        return Err(format!(
+            "claim_done requires `items`: an array with one entry per checklist item. \
+             Valid item_id values: {}",
+            valid_ids(checklist)
+        ));
+    };
+    if arr.is_empty() {
+        return Err(format!(
+            "claim_done requires at least one entry in `items`. Valid item_id values: {}",
+            valid_ids(checklist)
+        ));
+    }
+    if arr.len() > CLAIM_MAX_ITEMS {
+        return Err(format!(
+            "claim_done accepts at most {CLAIM_MAX_ITEMS} entries; you sent {}. \
+             Send one entry per checklist item and no duplicates.",
+            arr.len()
+        ));
+    }
+
+    let mut items: Vec<ClaimedItem> = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let raw_id = entry.get("item_id").and_then(|i| i.as_str()).unwrap_or("");
+        if raw_id.trim().is_empty() {
+            return Err(format!(
+                "every entry in claim_done needs an `item_id`. Valid item_id values: {}",
+                valid_ids(checklist)
+            ));
+        }
+        let Some(item) = resolve_item_id(raw_id, checklist) else {
+            return Err(format!(
+                "claim_done: '{raw_id}' is not an item_id on this task. \
+                 Call claim_done again using only these item_id values: {}",
+                valid_ids(checklist)
+            ));
+        };
+        // No default. `satisfied` is the single bit the operator's eye goes to,
+        // and a missing one silently read as `false` would report a finished
+        // item as unfinished (or, read as `true`, invent a claim the model
+        // never made). Both are worse than one more turn.
+        let Some(satisfied) = entry.get("satisfied").and_then(|s| s.as_bool()) else {
+            return Err(format!(
+                "claim_done: entry for item_id '{}' is missing `satisfied` (must be true or false).",
+                item.item_id
+            ));
+        };
+        let note = entry
+            .get("evidence_note")
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if note.is_empty() {
+            return Err(format!(
+                "claim_done: entry for item_id '{}' is missing `evidence_note` — say what on \
+                 screen shows this item is or is not satisfied.",
+                item.item_id
+            ));
+        }
+        let frame_seq = match entry.get("frame_seq") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let Some(n) = v.as_i64() else {
+                    return Err(format!(
+                        "claim_done: `frame_seq` for item_id '{}' must be a number \
+                         (or omitted if you have no single frame for it).",
+                        item.item_id
+                    ));
+                };
+                if !frame_seqs.contains(&n) {
+                    return Err(format!(
+                        "claim_done: frame_seq {n} is not a screenshot from this run. {} \
+                         Omit frame_seq if you have no single frame for this item.",
+                        available_frames_sentence(frame_seqs)
+                    ));
+                }
+                Some(n)
+            }
+        };
+        if items.iter().any(|c| c.item_id == item.item_id) {
+            return Err(format!(
+                "claim_done: item_id '{}' appears twice. Send one entry per checklist item.",
+                item.item_id
+            ));
+        }
+        items.push(ClaimedItem {
+            item_id: item.item_id.clone(),
+            text: truncate_chars(&item.text, CLAIM_ITEM_TEXT_CHARS),
+            satisfied,
+            evidence_note: truncate_chars(note, CLAIM_NOTE_CHARS),
+            frame_seq,
+        });
+    }
+
+    let summary = input
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if summary.is_empty() {
+        return Err(
+            "claim_done requires a one-line `summary` of what you did in this run.".to_string()
+        );
+    }
+    Ok(DoneClaim { items, summary: truncate_chars(summary, CLAIM_SUMMARY_CHARS) })
+}
+
+/// The tail of the "bad frame_seq" error: which numbers WOULD have worked. The
+/// last few only — a long run posts dozens of frames and the model's evidence
+/// is almost always recent, so the full list would spend context to make the
+/// correction harder to read.
+fn available_frames_sentence(frame_seqs: &[i64]) -> String {
+    if frame_seqs.is_empty() {
+        return "This run has posted no screenshots yet.".to_string();
+    }
+    let tail: Vec<String> = frame_seqs
+        .iter()
+        .rev()
+        .take(10)
+        .rev()
+        .map(|s| s.to_string())
+        .collect();
+    format!("Most recent frame_seq values: {}.", tail.join(", "))
+}
+
+/// The one-line note appended to a turn's tool results naming the frame numbers
+/// that turn's screenshots were filed under.
+///
+/// Without it `frame_seq` is unusable: the seqs are allocated by the run loop
+/// AFTER a turn's actions are dispatched, so the model has no way to learn the
+/// number of the picture it is looking at, and a claim could only ever cite
+/// frames by guess. Emitted only on runs where `claim_done` applies — every
+/// other run would be paying context for a number nothing consumes.
+pub fn frame_seq_note(seqs: &[i64]) -> Option<String> {
+    if seqs.is_empty() {
+        return None;
+    }
+    let list = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "[worker] The screenshot(s) above were filed as frame_seq {list}. \
+         Cite these numbers as `frame_seq` in claim_done."
+    ))
+}
+
+/// The `claim_done` tool schema, or None when this run's task has nothing left
+/// to claim (see `claim_applies`) — which is also how a run with NO checklist
+/// gets no tool: `items` is empty, so nothing is owed. A model that invents the
+/// call anyway lands in agent.rs's `unknown tool` arm, exactly like any other
+/// hallucinated name.
+///
+/// # Why a separate tool
+///
+/// Same reason as `click_element` and `launch_browser`: `computer_20251124` is
+/// the server-defined, schema-LESS tool, so there is no `input_schema` in which
+/// to declare an extra action and no chance a model emits one it was never
+/// trained on. A custom tool beside it is the only mechanism the API offers.
+///
+/// # Why the ids are inlined into the description and the enum
+///
+/// The valid ids are the single thing the model cannot get wrong and still be
+/// useful, and a small self-hosted model does far better copying from an
+/// adjacent list than from a prompt section several thousand tokens back. The
+/// `enum` also constrains decoding on endpoints that use the schema for that.
+pub fn claim_done_tool(items: &[ChecklistItem]) -> Option<Value> {
+    if !claim_applies(items) {
+        return None;
+    }
+    let owed = owed_items(items);
+    let ids: Vec<&str> = items.iter().map(|it| it.item_id.as_str()).collect();
+    let owed_list = owed
+        .iter()
+        .map(|it| format!("{} = {}", it.item_id, it.text))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(json!({
+        "name": "claim_done",
+        "description": format!(
+            "Report, item by item, which of this task's checklist items you believe you \
+satisfied. Call this ONCE, as the last thing you do, before you stop. Send one entry for every \
+item still owed: {owed_list}. This does NOT mark anything done — a human reads your claim and \
+decides; you cannot approve your own work. Say satisfied:false for anything you did not finish. \
+A false is free; a claim that turns out to be wrong wastes the operator's review and the run."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "One entry per checklist item still owed.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {
+                                "type": "string",
+                                "enum": ids,
+                                "description": "The checklist item's id, copied exactly."
+                            },
+                            "satisfied": {
+                                "type": "boolean",
+                                "description": "True only if you believe this item is now satisfied."
+                            },
+                            "evidence_note": {
+                                "type": "string",
+                                "description": "What on screen shows it — the window, the text, \
+the value you read. One sentence."
+                            },
+                            "frame_seq": {
+                                "type": "integer",
+                                "description": "The frame_seq of the screenshot that shows it, as \
+printed under the screenshot. Omit if no single frame shows this item."
+                            }
+                        },
+                        "required": ["item_id", "satisfied", "evidence_note"]
+                    }
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One line: what you did in this run."
+                }
+            },
+            "required": ["items", "summary"]
+        }
+    }))
+}
+
+/// What the model is told after a claim is accepted. Reads back the counts so a
+/// model that mangled an entry can see it, and repeats the invariant — a model
+/// that believes `claim_done` finished the task will happily go on to claim
+/// authority it does not have.
+pub fn claim_ack_text(claim: &DoneClaim) -> String {
+    format!(
+        "Claim recorded: {} of {} items claimed satisfied. This is a claim, not an approval — \
+         the operator decides. Nothing further is needed; stop now.",
+        claim.satisfied_count(),
+        claim.items.len()
+    )
+}
+
+/// The diary payload for a done claim. A `status` message, because that is what
+/// the worker→admin types allow (`goal`/`nudge`/`verdict` are the admin's,
+/// `question` would block a run that has already ended, and `receipt` answers a
+/// specific inbound message) — the console dispatches on `kind`, which costs
+/// the backend nothing and needs no new message type.
+///
+/// `text` carries the whole thing in prose as well, and says "claims" in its
+/// first clause. That redundancy is the point: this row is read by consumers we
+/// do not control (a phone notification, a future model summarizing the log),
+/// and every one of them must land on "the worker asserts" rather than "done".
+pub fn claim_status_payload(run_id: &str, claim: &DoneClaim) -> Value {
+    let sat = claim.satisfied_count();
+    let total = claim.items.len();
+    let mut text = format!(
+        "The worker CLAIMS {sat} of {total} checklist item(s) satisfied — an assertion by the \
+         agent, NOT an approval. Verify each one before you accept it.\nSummary: {}",
+        claim.summary
+    );
+    for c in &claim.items {
+        let mark = if c.satisfied { "claims YES" } else { "claims NO" };
+        let frame = match c.frame_seq {
+            Some(s) => format!(" (frame {s})"),
+            None => " (no frame cited)".to_string(),
+        };
+        text.push_str(&format!("\n- {} — {}{}: {}", c.text, mark, frame, c.evidence_note));
+    }
+    json!({
+        "kind": "done_claim",
+        "run_id": run_id,
+        "text": text,
+        "summary": claim.summary,
+        "claimed_satisfied": sat,
+        "claimed_total": total,
+        "claims": claim
+            .items
+            .iter()
+            .map(|c| json!({
+                "item_id": c.item_id,
+                "text": c.text,
+                "satisfied": c.satisfied,
+                "evidence_note": c.evidence_note,
+                "frame_seq": c.frame_seq,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The `-g{n}` msg_id suffix for a task's readback question (empty on a first
@@ -620,8 +1096,13 @@ pub fn task_run_spec(spec: &str, checklist: &Value, last_directive: Option<&str>
         if owed.is_empty() {
             out.push_str("\n(none — every checklist item is already accepted)");
         } else {
-            for it in owed {
-                out.push_str(&format!("\n- {}", it.text));
+            // Each item is printed as its own two-line block with the id on the
+            // first line. The ids are UUIDs and the model has to reproduce one
+            // per `claim_done` entry; a prose bullet with the id buried in it is
+            // measurably harder for a small model to copy than a labelled line
+            // it can read straight off.
+            for it in &owed {
+                out.push_str(&format!("\n- item_id: {}\n  {}", it.item_id, it.text));
             }
         }
         if !done.is_empty() {
@@ -632,9 +1113,33 @@ pub fn task_run_spec(spec: &str, checklist: &Value, last_directive: Option<&str>
                 out.push_str(&format!("\n- [done] {}", it.text));
             }
         }
+        if !owed.is_empty() {
+            out.push_str(CLAIM_CONTRACT);
+        }
     }
     out
 }
+
+/// The last paragraph of a checklisted run's prompt: the per-item reporting
+/// contract, appended verbatim whenever `claim_done` is offered (the two are
+/// gated on the same predicate, so the model is never told about a tool it does
+/// not have).
+///
+/// Written for the weakest model in the fleet — a qwen3-8B or a 27B — which is
+/// why it is short, gives ONE literal call shape rather than describing a
+/// schema, and states the honest-false incentive in a single clause. The
+/// closing sentence is not decoration: the failure this whole feature exists to
+/// avoid is a confident final narration, and a model that thinks `claim_done`
+/// settles the matter produces exactly that in a different wrapper.
+const CLAIM_CONTRACT: &str = "\n\nBefore you stop you MUST call the `claim_done` tool, once, \
+with one entry for EVERY item_id listed above:\n\
+{\"items\": [{\"item_id\": \"<the id above>\", \"satisfied\": true, \"evidence_note\": \"what on \
+screen shows this\", \"frame_seq\": <the number printed under the screenshot that shows it>}], \
+\"summary\": \"<one line on what you did>\"}\n\
+Set satisfied to false for anything you did not finish — a false is free, and a claim that turns \
+out to be wrong wastes the run. Omit frame_seq when no single screenshot shows the item. \
+claim_done does NOT complete the task: you are telling a human what you believe, and the human \
+decides. Do not claim an item is satisfied because it should be — claim it because you saw it.";
 
 /// The user message a nudge becomes inside a live run. Its own message, NOT
 /// appended to messages[0]: that message owns the static cache breakpoint, and
@@ -1277,6 +1782,12 @@ async fn handle_task(
     // The spec the model runs on carries the definition of done and the
     // send-back note — the readback promised them, the run must honor them.
     let run_spec = task_run_spec(&spec, &checklist, last_directive.as_deref());
+    // Park the checklist for the run we are about to start: the run prompt just
+    // told the model to call `claim_done`, and this is what makes the tool exist
+    // and gives its validation the only list of ids that counts. `run_agent`
+    // TAKES it, so the failure path below has to put it back down (see
+    // `set_pending_checklist`) or the next local run would inherit it.
+    set_pending_checklist(app, checklist_items(&checklist));
     let agent_state = app.state::<crate::agent::AgentState>();
     let started = crate::agent::start_run_internal(
         app,
@@ -1301,6 +1812,9 @@ async fn handle_task(
             // check and here. The task stays `running` with no run attached;
             // say so rather than fight over the machine.
             eprintln!("[tasks] {task_id}: start_run_internal refused: {e}");
+            // No run will take the parked checklist; drop it here so it cannot
+            // leak into whatever run does start next.
+            let _ = take_run_checklist(app);
             post_status(
                 app, client, base, device_id,
                 &format!("runfail-{task_id}"),
@@ -1331,6 +1845,23 @@ async fn handle_task(
         Some(o) => (o.status.as_str(), o.error.clone()),
         None => ("failed", Some("run ended without reporting an outcome".to_string())),
     };
+
+    // The done claim, if the model made one, BEFORE the outcome row and before
+    // the move to `awaiting_verdict` — so by the time the task shows up on the
+    // verdict screen the operator already has, in the same log, which item the
+    // worker thinks it satisfied and which frame it says proves it. Posted on
+    // the failure path too: a claim made at minute 40 of a run that died at
+    // minute 41 is still the best account of what got done.
+    if let Some(claim) = take_claim_for(app, &run_id) {
+        post_status(
+            app, client, base, device_id,
+            &format!("claim-{run_id}"),
+            &task_id,
+            claim_status_payload(&run_id, &claim),
+            cancel,
+        )
+        .await;
+    }
 
     if status == "completed" {
         // running -> awaiting_verdict: the device's last legal move. `done` is
@@ -1528,8 +2059,12 @@ mod tests {
         assert!(out.contains("==== OPERATOR CONTEXT"));
         assert!(out.contains("send-back note — the PRIORITY instruction"));
         assert!(out.contains("focus on the docs"));
-        assert!(out.contains("items still owed:\n- docs updated"));
+        // Owed items carry their item_id on a labelled line of its own — the
+        // model has to reproduce it verbatim in `claim_done`.
+        assert!(out.contains("items still owed:\n- item_id: b\n  docs updated"));
         assert!(out.contains("do NOT redo or rework these:\n- [done] tests pass"));
+        // Approved items are NOT claimable, so their ids stay out of the prompt.
+        assert!(!out.contains("item_id: a"));
     }
 
     /// All items approved: say so explicitly rather than print an empty owed
@@ -1541,6 +2076,277 @@ mod tests {
         assert!(out.contains("(none — every checklist item is already accepted)"));
         assert!(out.contains("- [done] tests pass"));
         assert!(!out.contains("PRIORITY"), "no note, no note section");
+    }
+
+    // ---- the done claim ----------------------------------------------------
+
+    /// Two owed items, the shape a real task has.
+    fn two_items() -> Vec<ChecklistItem> {
+        checklist_items(&json!([
+            {"item_id": "e4777019-5f63-4776-a800-577c965bb88c",
+             "text": "Notepad contains the text \"checklist item one\"", "approved": false},
+            {"item_id": "d6d7e296-e8b2-4535-92cc-d74ec0b3fba0",
+             "text": "Calculator displays the result 42", "approved": false},
+        ]))
+    }
+
+    fn full_claim() -> Value {
+        json!({
+            "items": [
+                {"item_id": "e4777019-5f63-4776-a800-577c965bb88c", "satisfied": true,
+                 "evidence_note": "Notepad shows the line", "frame_seq": 12},
+                {"item_id": "d6d7e296-e8b2-4535-92cc-d74ec0b3fba0", "satisfied": false,
+                 "evidence_note": "Calculator still shows 0"},
+            ],
+            "summary": "typed the line, calculator not done",
+        })
+    }
+
+    /// The run prompt asks for the claim only when the tool exists — the two are
+    /// gated on the same predicate, so the model is never told to call something
+    /// it was not given, nor given a tool nothing explains.
+    #[test]
+    fn claim_contract_and_tool_appear_together() {
+        let owed = json!([{"item_id": "b", "text": "docs updated", "approved": false}]);
+        let all_done = json!([{"item_id": "a", "text": "tests pass", "approved": true}]);
+
+        let out = task_run_spec("s", &owed, None);
+        assert!(out.contains("call the `claim_done` tool"));
+        assert!(out.contains("\"frame_seq\""), "one literal call shape, not a schema");
+        assert!(out.contains("does NOT complete the task"), "the claim is never an approval");
+        assert!(claim_done_tool(&checklist_items(&owed)).is_some());
+
+        let out = task_run_spec("s", &all_done, None);
+        assert!(!out.contains("claim_done"), "nothing owed, nothing to claim");
+        assert!(claim_done_tool(&checklist_items(&all_done)).is_none());
+
+        // No checklist at all: unchanged from before this layer existed.
+        assert_eq!(task_run_spec("s", &Value::Null, None), "s");
+        assert!(claim_done_tool(&[]).is_none());
+    }
+
+    /// The tool contract: every valid id is in the `item_id` enum (constrained
+    /// decoding leans on it), the owed items are spelled out in the description
+    /// where a small model reads them, and nothing in it promises approval.
+    #[test]
+    fn claim_tool_schema_carries_the_ids_and_the_invariant() {
+        let items = two_items();
+        let schema = claim_done_tool(&items).expect("items are owed");
+        assert_eq!(schema["name"], "claim_done");
+
+        let entry = &schema["input_schema"]["properties"]["items"]["items"];
+        let ids: Vec<&str> =
+            entry["properties"]["item_id"]["enum"].as_array().unwrap()
+                .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec![items[0].item_id.as_str(), items[1].item_id.as_str()]);
+        assert_eq!(
+            entry["required"].as_array().unwrap().len(), 3,
+            "frame_seq is the only optional field"
+        );
+        assert_eq!(
+            schema["input_schema"]["required"],
+            json!(["items", "summary"])
+        );
+
+        let desc = schema["description"].as_str().unwrap();
+        assert!(desc.contains(&items[0].item_id), "ids inlined next to the call");
+        assert!(desc.contains("Calculator displays the result 42"));
+        assert!(desc.contains("does NOT mark anything done"));
+    }
+
+    /// The happy path: ids resolve, the checklist text is denormalized onto each
+    /// claim so the console needs no join, and an omitted frame_seq stays None.
+    #[test]
+    fn claim_parses_and_denormalizes_the_item_text() {
+        let claim = parse_done_claim(&full_claim(), &two_items(), &[9, 12]).unwrap();
+        assert_eq!(claim.items.len(), 2);
+        assert!(claim.items[0].satisfied);
+        assert_eq!(claim.items[0].frame_seq, Some(12));
+        assert_eq!(claim.items[0].text, "Notepad contains the text \"checklist item one\"");
+        assert!(!claim.items[1].satisfied);
+        assert_eq!(claim.items[1].frame_seq, None, "no frame is legitimate");
+        assert_eq!(claim.summary, "typed the line, calculator not done");
+    }
+
+    /// An id the task does not carry is refused, and the refusal NAMES the legal
+    /// ids — the model can call again, which is the only reason to reject rather
+    /// than coerce.
+    #[test]
+    fn claim_rejects_an_unknown_item_id() {
+        let mut input = full_claim();
+        input["items"][0]["item_id"] = json!("made-up-id");
+        let err = parse_done_claim(&input, &two_items(), &[12]).unwrap_err();
+        assert!(err.contains("'made-up-id' is not an item_id on this task"));
+        assert!(err.contains("e4777019-5f63-4776-a800-577c965bb88c"));
+        assert!(err.contains("d6d7e296-e8b2-4535-92cc-d74ec0b3fba0"));
+    }
+
+    /// A UUID is 36 characters for a model to transcribe; an unambiguous prefix
+    /// resolves to the real id (and is STORED as the real id), while a prefix
+    /// that could mean either item is refused rather than guessed.
+    #[test]
+    fn claim_resolves_a_unique_id_prefix_but_never_an_ambiguous_one() {
+        let items = checklist_items(&json!([
+            {"item_id": "aaaa1111-2222", "text": "one", "approved": false},
+            {"item_id": "aaaa1111-3333", "text": "two", "approved": false},
+        ]));
+        let ok = json!({
+            "items": [{"item_id": "aaaa1111-2", "satisfied": true, "evidence_note": "n"}],
+            "summary": "s",
+        });
+        let claim = parse_done_claim(&ok, &items, &[]).unwrap();
+        assert_eq!(claim.items[0].item_id, "aaaa1111-2222", "stored canonical");
+
+        let ambiguous = json!({
+            "items": [{"item_id": "aaaa1111", "satisfied": true, "evidence_note": "n"}],
+            "summary": "s",
+        });
+        assert!(parse_done_claim(&ambiguous, &items, &[]).is_err());
+        // Too short to be a prefix at all — an id that happens to head both.
+        let short = json!({
+            "items": [{"item_id": "aaaa", "satisfied": true, "evidence_note": "n"}],
+            "summary": "s",
+        });
+        assert!(parse_done_claim(&short, &items, &[]).is_err());
+    }
+
+    /// The fields with no safe default. `satisfied` read as false would report
+    /// finished work as unfinished; read as true would invent a claim. An empty
+    /// `evidence_note` or `summary` is the prose blob this feature exists to
+    /// replace.
+    #[test]
+    fn claim_rejects_missing_fields() {
+        let items = two_items();
+        let strip = |key: &str| {
+            let mut input = full_claim();
+            input["items"][0].as_object_mut().unwrap().remove(key);
+            parse_done_claim(&input, &items, &[12]).unwrap_err()
+        };
+        assert!(strip("satisfied").contains("missing `satisfied`"));
+        assert!(strip("evidence_note").contains("missing `evidence_note`"));
+        assert!(strip("item_id").contains("needs an `item_id`"));
+
+        let mut no_summary = full_claim();
+        no_summary.as_object_mut().unwrap().remove("summary");
+        assert!(parse_done_claim(&no_summary, &items, &[12])
+            .unwrap_err()
+            .contains("one-line `summary`"));
+
+        assert!(parse_done_claim(&json!({"summary": "s"}), &items, &[]).is_err());
+        assert!(parse_done_claim(&json!({"items": [], "summary": "s"}), &items, &[]).is_err());
+        // Whitespace is not evidence.
+        let mut blank = full_claim();
+        blank["items"][0]["evidence_note"] = json!("   ");
+        assert!(parse_done_claim(&blank, &items, &[12]).is_err());
+    }
+
+    /// A frame_seq must name a screenshot THIS run actually posted — the whole
+    /// value of the citation to the operator is that it resolves to a thumbnail.
+    #[test]
+    fn claim_rejects_a_frame_seq_from_no_frame_we_posted() {
+        let items = two_items();
+        let err = parse_done_claim(&full_claim(), &items, &[3, 5]).unwrap_err();
+        assert!(err.contains("frame_seq 12 is not a screenshot from this run"));
+        assert!(err.contains("3, 5"), "the correction names what would work");
+        assert!(err.contains("Omit frame_seq"));
+
+        // No frames posted at all: still refused, with an honest reason.
+        assert!(parse_done_claim(&full_claim(), &items, &[])
+            .unwrap_err()
+            .contains("posted no screenshots yet"));
+
+        // Not a number.
+        let mut bad = full_claim();
+        bad["items"][0]["frame_seq"] = json!("twelve");
+        assert!(parse_done_claim(&bad, &items, &[12]).unwrap_err().contains("must be a number"));
+
+        // Explicit null is "I have no frame", not an error.
+        let mut null_frame = full_claim();
+        null_frame["items"][0]["frame_seq"] = Value::Null;
+        assert_eq!(
+            parse_done_claim(&null_frame, &items, &[]).unwrap().items[0].frame_seq,
+            None
+        );
+    }
+
+    /// Two entries for one item would leave the operator with two verdicts to
+    /// give on one criterion; and no checklist means no claim at all.
+    #[test]
+    fn claim_rejects_duplicates_and_a_checklistless_task() {
+        let items = two_items();
+        let mut dup = full_claim();
+        dup["items"][1]["item_id"] = dup["items"][0]["item_id"].clone();
+        assert!(parse_done_claim(&dup, &items, &[12]).unwrap_err().contains("appears twice"));
+
+        assert!(parse_done_claim(&full_claim(), &[], &[12])
+            .unwrap_err()
+            .contains("carries no checklist"));
+    }
+
+    /// The payload cap is 16KB serialized; the claim is bounded per FIELD so a
+    /// long-winded note clips instead of the last item vanishing.
+    #[test]
+    fn claim_is_bounded_and_capped_in_item_count() {
+        let items = two_items();
+        let mut long = full_claim();
+        long["items"][0]["evidence_note"] = json!("é".repeat(CLAIM_NOTE_CHARS + 400));
+        long["summary"] = json!("x".repeat(CLAIM_SUMMARY_CHARS + 400));
+        let claim = parse_done_claim(&long, &items, &[12]).unwrap();
+        assert!(claim.items[0].evidence_note.ends_with('…'));
+        assert!(claim.items[0].evidence_note.chars().count() <= CLAIM_NOTE_CHARS + 1);
+        assert!(claim.summary.chars().count() <= CLAIM_SUMMARY_CHARS + 1);
+
+        let many: Vec<Value> = (0..CLAIM_MAX_ITEMS + 1)
+            .map(|_| json!({"item_id": items[0].item_id, "satisfied": true, "evidence_note": "n"}))
+            .collect();
+        assert!(parse_done_claim(&json!({"items": many, "summary": "s"}), &items, &[])
+            .unwrap_err()
+            .contains("at most"));
+    }
+
+    /// The payload the console renders. It is a `status` message's body (the
+    /// only worker→admin type that fits), it carries structured rows AND prose,
+    /// and every rendering of it says "claims" — a false claim must read as a
+    /// false claim, never as a fact.
+    #[test]
+    fn claim_payload_is_structured_and_never_says_done() {
+        let claim = parse_done_claim(&full_claim(), &two_items(), &[12]).unwrap();
+        let p = claim_status_payload("run-1", &claim);
+        assert_eq!(p["kind"], "done_claim");
+        assert_eq!(p["run_id"], "run-1");
+        assert_eq!(p["claimed_satisfied"], 1);
+        assert_eq!(p["claimed_total"], 2);
+        assert_eq!(p["claims"][0]["frame_seq"], 12);
+        assert_eq!(p["claims"][0]["item_id"], "e4777019-5f63-4776-a800-577c965bb88c");
+        assert_eq!(p["claims"][1]["frame_seq"], Value::Null);
+
+        let text = p["text"].as_str().unwrap();
+        assert!(text.starts_with("The worker CLAIMS 1 of 2"));
+        assert!(text.contains("NOT an approval"));
+        assert!(text.contains("claims YES (frame 12)"));
+        assert!(text.contains("claims NO (no frame cited)"));
+
+        // Comfortably inside the 16KB serialized payload cap.
+        assert!(p.to_string().len() < PAYLOAD_SANITY_BYTES);
+
+        // And the model is told it claimed, not that it finished.
+        let ack = claim_ack_text(&claim);
+        assert!(ack.contains("1 of 2"));
+        assert!(ack.contains("not an approval"));
+    }
+
+    /// Local slack under the backend's 16KB PAYLOAD_MAX_BYTES.
+    const PAYLOAD_SANITY_BYTES: usize = 16 * 1024;
+
+    /// `frame_seq` is only citable because the worker feeds the numbers back —
+    /// they are allocated after the turn that produced the frame, so the model
+    /// has no other way to learn them.
+    #[test]
+    fn frame_seq_note_names_this_turns_frames() {
+        assert_eq!(frame_seq_note(&[]), None, "a turn with no frames says nothing");
+        let note = frame_seq_note(&[7, 9]).unwrap();
+        assert!(note.contains("frame_seq 7, 9"));
+        assert!(note.contains("claim_done"));
     }
 
     // ---- the re-readback msg_id --------------------------------------------

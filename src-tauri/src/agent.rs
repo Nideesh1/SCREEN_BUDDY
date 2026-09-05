@@ -1701,6 +1701,12 @@ async fn run_agent(
     // extended from here.
     let browser_tool = crate::browser::tool_schema();
     let element_tool = click_element_tool();
+    // The checklist this run is answerable for, handed over by the task-pickup
+    // loop and consumed here (see `channel::take_run_checklist`). Empty for a
+    // local or dispatched run, which is precisely why `claim_done_tool` returns
+    // None for those: only a run that owes typed items has typed items to claim.
+    let claim_checklist = crate::channel::take_run_checklist(&app);
+    let claim_tool = crate::channel::claim_done_tool(&claim_checklist);
     eprintln!("[agent] model endpoint {} ({:?})", ep.base, ep.source);
 
     // --- persistence bootstrap ---
@@ -1830,6 +1836,19 @@ async fn run_agent(
         }
     };
     let tool = computer_tool(disp_w, disp_h);
+    // Built once: the set is fixed for the run, and it serializes byte-identically
+    // every turn, which the prompt-cache prefix depends on.
+    let tools: Vec<Value> = [Some(tool), Some(cred_tool), Some(element_tool), Some(browser_tool), claim_tool.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // Screenshot event seqs posted so far, in order — the numbers a `claim_done`
+    // entry's `frame_seq` may cite. Kept only because the model cannot otherwise
+    // know them: the seq is allocated by the persistence block AFTER the turn
+    // that produced the frame, so it is fed back in `frame_seq_note` and checked
+    // against this list here.
+    let mut frame_seqs: Vec<i64> = Vec::new();
 
     // Consecutive empty assistant turns; reset by any turn that carries content.
     let mut empty_turns: usize = 0;
@@ -1929,7 +1948,7 @@ async fn run_agent(
             // still hits.
             "system": system_prompt(),
             "messages": messages,
-            "tools": [tool, cred_tool, element_tool, browser_tool],
+            "tools": tools,
             "max_tokens": MAX_TOKENS,
             // The backend used to force streaming when it relayed; talking to
             // Anthropic directly, we must set it ourselves so the SSE parser has
@@ -2103,7 +2122,7 @@ async fn run_agent(
         // `State` never crosses an await point — keeping the future `Send`.
         // We collect what to persist and PUT it after the state scope ends.
         let mut cancelled = false;
-        let (results, persisted): (Vec<Value>, Vec<(String, Value, Vec<String>)>) = {
+        let (mut results, persisted): (Vec<Value>, Vec<(String, Value, Vec<String>)>) = {
             let comp_state = app.state::<ComputerState>();
             let mut results: Vec<Value> = Vec::with_capacity(tool_uses.len());
             let mut persisted: Vec<(String, Value, Vec<String>)> = Vec::new();
@@ -2231,6 +2250,37 @@ async fn run_agent(
                     };
                     persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
                     results.push(tool_result(id, outcome));
+                } else if name == "claim_done" && claim_tool.is_some() {
+                    // The model's per-item assertion about the task's checklist.
+                    // It APPROVES NOTHING — it is stashed and posted to the diary
+                    // as a `status` when the run ends (channel::handle_task), so
+                    // the operator's verdict screen shows which item the worker
+                    // says it satisfied and which frame it cites. Validation is
+                    // strict about identity and its rejections are addressed to
+                    // the model, which can simply call again.
+                    //
+                    // The `claim_tool.is_some()` guard keeps ONE rule about
+                    // availability: a run that was not given the tool treats the
+                    // call as the hallucination it is, via the `unknown tool` arm
+                    // below.
+                    let outcome = match crate::channel::parse_done_claim(
+                        &tu["input"],
+                        &claim_checklist,
+                        &frame_seqs,
+                    ) {
+                        Ok(claim) => {
+                            let ack = crate::channel::claim_ack_text(&claim);
+                            crate::channel::note_run_claim(
+                                &app,
+                                run_id.as_deref().unwrap_or(""),
+                                claim,
+                            );
+                            ok_text(ack)
+                        }
+                        Err(e) => err_text(e),
+                    };
+                    persisted.push((name.to_string(), tu["input"].clone(), Vec::new()));
+                    results.push(tool_result(id, outcome));
                 } else {
                     results.push(tool_result(id, err_text(format!("unknown tool: {name}"))));
                 }
@@ -2252,6 +2302,7 @@ async fn run_agent(
 
         // Persist dispatched actions (tool_use events) + their screenshots now
         // that the Computer state guard is dropped.
+        let frames_before = frame_seqs.len();
         if let Some(rid) = &run_id {
             for (name, input, shots) in &persisted {
                 let s = bump(&mut seq);
@@ -2277,6 +2328,10 @@ async fn run_agent(
                     // where a dense 0,1,2… is what makes a run's directory
                     // readable by hand.
                     let s = bump(&mut seq);
+                    // The number this frame is filed under everywhere — the
+                    // console's screenshot row, and (on a checklisted run) the
+                    // `frame_seq` a done claim may cite as its evidence.
+                    frame_seqs.push(s);
                     // ...and mirror the SAME bytes off-machine so the admin
                     // console can watch this run without a remote desktop. This
                     // is `shot` — the image block the model was actually sent,
@@ -2303,6 +2358,16 @@ async fn run_agent(
                         .await;
                     }
                 }
+            }
+        }
+
+        // Tell the model what this turn's screenshots were filed as, so a later
+        // `claim_done` can point at one. Only on runs where claiming applies —
+        // every other run would pay context for a number nothing reads. A text
+        // block AFTER the tool_results, which is where the API permits one.
+        if claim_tool.is_some() && !results.is_empty() {
+            if let Some(note) = crate::channel::frame_seq_note(&frame_seqs[frames_before..]) {
+                results.push(json!({"type": "text", "text": note}));
             }
         }
 
