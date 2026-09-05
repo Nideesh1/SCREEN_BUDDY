@@ -1069,8 +1069,20 @@ fn dispatch_batch(
     input: &Value,
     last_sent: &mut Option<(u32, u32)>,
 ) -> ActionOutcome {
-    let steps: &Vec<Value> = match input.get("steps").and_then(|s| s.as_array()) {
-        Some(v) if !v.is_empty() => v,
+    // A lone step sent as a bare object rather than a one-element array is
+    // accepted, not refused. The first live run did exactly this — narrated "I
+    // will enter 137, plus, 246, equals in one batch", then sent
+    // `steps: {…}` — and spent a whole turn learning the container shape before
+    // re-sending the same intent correctly. Refusing a call whose meaning is
+    // unambiguous buys nothing: the model was right about what it wanted and
+    // wrong only about brackets, and a turn is the most expensive thing here.
+    let single;
+    let steps: &Vec<Value> = match input.get("steps") {
+        Some(Value::Array(v)) if !v.is_empty() => v,
+        Some(obj @ Value::Object(_)) => {
+            single = vec![obj.clone()];
+            &single
+        }
         _ => return err_text("batch needs a non-empty `steps` array"),
     };
     if steps.len() > MAX_BATCH_STEPS {
