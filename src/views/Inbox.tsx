@@ -687,8 +687,16 @@ function Inbox() {
 // One task claiming to be finished, judged from the row itself. The verdict
 // pair is Approve / Send back — the operator is judging a CLAIM, and those are
 // the claim's two answers ("yes, it holds" / "no, go again with this note").
-// Kill exists too, but as a tertiary act on the task page: ending a task's
-// life is not a verdict on its claim, and does not belong on this row.
+//
+// Kill is here too, because "open the task page to abandon it" is not an answer
+// on the page whose whole job is clearing what is waiting. It is NOT a third
+// verdict, so it is not shaped like one: a small faint ghost the same size and
+// colour as the task page's Kill, pushed past a vertical rule and a full gap
+// from the pair, with no icon to catch the eye — the two things a fast clicker
+// aims at (the gold primary and the outlined secondary) both read as buttons,
+// this reads as text. It is also the only control on the row that opens a
+// danger-red modal, so a mis-click still has to be confirmed against the task's
+// own name before anything dies.
 function VerdictTaskRow({
   task,
   deviceName,
@@ -700,18 +708,18 @@ function VerdictTaskRow({
   onOpen: () => void
   onChanged: () => void
 }) {
-  const [confirming, setConfirming] = useState(false)
+  const [confirming, setConfirming] = useState<'approve' | 'kill' | null>(null)
   const [sendingBack, setSendingBack] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
 
   const patch = useCallback(
-    async (body: { status: 'done' | 'queued'; note?: string }) => {
+    async (body: { status: 'done' | 'killed' | 'queued'; note?: string }) => {
       setBusy(true)
       setNotice(null)
       const out = await patchTaskStatus(task.task_id, body)
       setBusy(false)
-      setConfirming(false)
+      setConfirming(null)
       setSendingBack(false)
       if (!out.ok) setNotice(out.message)
       // Refresh either way: success moves the task off this list, and a 409
@@ -723,7 +731,7 @@ function VerdictTaskRow({
 
   return (
     <div>
-      {confirming && (
+      {confirming === 'approve' && (
         <ConfirmModal
           title={`Approve “${task.title}”?`}
           body={[
@@ -733,7 +741,25 @@ function VerdictTaskRow({
           confirmLabel="Approve"
           busy={busy}
           onConfirm={() => patch({ status: 'done' })}
-          onCancel={() => setConfirming(false)}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
+      {/* The title is in the dialog because the risk this whole affordance
+          carries is killing the wrong row, and the row it came from is off
+          screen behind the backdrop by the time anyone reads it. */}
+      {confirming === 'kill' && (
+        <ConfirmModal
+          title={`Kill “${task.title}”?`}
+          body={[
+            'The task ends here without being judged — neither accepted nor sent back — and it drops off this list.',
+            `No hardware changes: ${deviceName} finished this task and moved on when it reached awaiting verdict. This only abandons the claim.`,
+            'This cannot be undone — a killed task never moves again.',
+          ]}
+          confirmLabel="Kill task"
+          danger
+          busy={busy}
+          onConfirm={() => patch({ status: 'killed' })}
+          onCancel={() => setConfirming(null)}
         />
       )}
       {sendingBack && (
@@ -753,7 +779,7 @@ function VerdictTaskRow({
         }}
       >
         <TaskStatusPill status={task.status} />
-        {/* The title is the door to the full page (diary, checklist, kill);
+        {/* The title is the door to the full page (diary, checklist, history);
             the verbs live beside it so judging never needs a second screen. */}
         <button
           onClick={onOpen}
@@ -787,11 +813,27 @@ function VerdictTaskRow({
         >
           {deviceName} · started {utcRelative(task.started_at)}
         </span>
-        <Button variant="primary" size="sm" disabled={busy} onClick={() => setConfirming(true)}>
+        <Button variant="primary" size="sm" disabled={busy} onClick={() => setConfirming('approve')}>
           ✓ Approve
         </Button>
         <Button variant="secondary" size="sm" disabled={busy} onClick={() => setSendingBack(true)}>
           ✕ Send back
+        </Button>
+        {/* The rule is the point: everything left of it is a verdict on the
+            claim, everything right of it is not. */}
+        <div
+          aria-hidden
+          style={{ width: 1, height: 18, background: 'var(--sb-border)', margin: '0 var(--sp-2)' }}
+        />
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={busy}
+          onClick={() => setConfirming('kill')}
+          title="End this task without a verdict — cannot be undone"
+          style={{ color: 'var(--sb-text-faint)' }}
+        >
+          Kill
         </Button>
       </div>
       {notice && (
@@ -889,6 +931,61 @@ function QuestionCard({
   const rawText = typeof question.payload?.text === 'string' ? question.payload.text : ''
   const rows = questionChecklist(question.payload)
   const text = questionTextWithoutChecklist(rawText, rows.length > 0)
+  const [killing, setKilling] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  // A question is not always a task's readback (the channel allows one with a
+  // null task_id). There is nothing to kill then, so the control is simply not
+  // offered — guessing which task a loose question belongs to is exactly the
+  // mistake this whole affordance is designed against.
+  const taskId = question.task_id
+  const killLabel = taskTitle ?? taskId ?? ''
+
+  // Abandoning a BLOCKED worker's task takes two writes, and both are needed.
+  //
+  // Killing the task does NOT wake the worker: `ask_operator` in the Rust
+  // (src-tauri/src/channel.rs) blocks in a loop that scans the device's log for
+  // a `verdict` whose `in_reply_to` is this question, and it never re-reads the
+  // task's status — deliberately, so a backend blip can't be mistaken for an
+  // answer. Left alone it waits forever. So the kill is followed by a rejection
+  // verdict, which is what the wait is actually watching for: the worker sees a
+  // non-approval, stops pursuing the task, and returns to picking up work.
+  //
+  // Kill first, verdict second, on purpose: the reverse order gives the worker
+  // an answer while the task is still alive, and an approval racing in from a
+  // second console would then start the run we are trying to prevent.
+  const killAndRelease = useCallback(async () => {
+    if (!taskId) return
+    setBusy(true)
+    setNotice(null)
+    const killed = await patchTaskStatus(taskId, { status: 'killed' })
+    if (!killed.ok) {
+      setBusy(false)
+      setKilling(false)
+      setNotice(killed.message)
+      onAnswered()
+      return
+    }
+    const released = await postVerdict(
+      question.device_id,
+      question.msg_id,
+      taskId,
+      'rejected',
+      'Task killed by the operator — stand down and pick up other work.',
+    )
+    setBusy(false)
+    setKilling(false)
+    // A conflict means the question was already answered, so the wait is over
+    // either way. Any other failure leaves the machine frozen, which is the one
+    // outcome the operator must not be allowed to assume away.
+    if (!released.ok && !released.conflict) {
+      setNotice(
+        `The task is killed, but ${deviceName} is still blocked on this question: ${released.message} Answer it here to release the machine.`,
+      )
+    }
+    onAnswered()
+  }, [taskId, question.device_id, question.msg_id, deviceName, onAnswered])
+
   return (
     <div
       style={{
@@ -901,6 +998,21 @@ function QuestionCard({
         gap: 'var(--sp-2)',
       }}
     >
+      {killing && taskId && (
+        <ConfirmModal
+          title={`Kill “${killLabel}” and release ${deviceName}?`}
+          body={[
+            `${deviceName} is frozen on this question and will wait for an answer forever — the worker's wait has no timeout, and killing the task on its own does not end it.`,
+            'So this does both: the task is killed, and the question is answered with a rejection. The worker stands down and goes back to picking up work.',
+            'This cannot be undone — a killed task never moves again.',
+          ]}
+          confirmLabel="Kill and release"
+          danger
+          busy={busy}
+          onConfirm={killAndRelease}
+          onCancel={() => setKilling(false)}
+        />
+      )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
         <span style={{ fontSize: 'var(--fs-base)', fontWeight: 600, color: 'var(--sb-text)' }}>
           {deviceName}
@@ -928,6 +1040,23 @@ function QuestionCard({
         >
           ⏸ {blocking.label}
         </span>
+        {/* Kill lives up here in the header, not down with the answer buttons:
+            the question text, the checklist and the directive box all sit
+            between it and Approve, so no fast click on the answer pair can land
+            on it — and it is faint, unlabelled by an icon, and the only control
+            on the card that stops to confirm. */}
+        {taskId && (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            onClick={() => setKilling(true)}
+            title="End this task and release the machine — cannot be undone"
+            style={{ color: 'var(--sb-text-faint)' }}
+          >
+            Kill &amp; release
+          </Button>
+        )}
       </div>
 
       <div
@@ -953,6 +1082,8 @@ function QuestionCard({
         taskId={question.task_id}
         onAnswered={onAnswered}
       />
+
+      {notice && <div className="error-message">{notice}</div>}
     </div>
   )
 }

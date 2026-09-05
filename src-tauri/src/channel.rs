@@ -851,6 +851,32 @@ fn parse_frame_list(
 /// contradicting itself if the item broke. With no marks — the model marked
 /// nothing all run — nothing is inherited and this is byte-for-byte the old
 /// behaviour.
+///
+/// # Why an UNMARKED claim is not refused
+///
+/// The live failure this could target is real and specific: two items claimed
+/// satisfied, neither marked, both citing frame 15, one of them impossibly. A
+/// refusal here — "you claim this and never marked it; call mark_evidence
+/// first" — would catch exactly that. It is still the wrong place to catch it.
+///
+/// A refusal costs a turn and buys no new information. The model cannot go back
+/// and look: frame 15 was pruned from its context turns ago, which is WHY it
+/// answered from memory. Asked again it re-cites the same number or invents a
+/// different one, and at `max_iters` a run that completed its work is finalized
+/// as failed over a bookkeeping rule.
+///
+/// It would also fail correct runs. An empty citation is explicitly legitimate
+/// ("the file is on disk in the folder I opened" has no frame behind it — see
+/// `ClaimedItem::frame_seqs`), and an item that becomes true on the LAST turn is
+/// satisfied, unmarked, and correct: there was never a later turn to mark it in.
+/// A rule that refuses those punishes the run for the shape of the work.
+///
+/// So the mid-run reminder (`frame_seq_note`) attacks the cause — a model that
+/// never marked — at the turns where marking is still possible, and this call
+/// stays permissive. What the end of the run owes the OPERATOR is not a refusal
+/// but the distinction: `assemble_claim_payload` stamps every claim row with
+/// whether it was ever marked, so "I saw this" and "I remember this" arrive on
+/// the verdict screen as two different assertions instead of one.
 pub fn parse_done_claim(
     input: &Value,
     checklist: &[ChecklistItem],
@@ -1061,29 +1087,106 @@ fn available_frames_sentence(frame_seqs: &[i64]) -> String {
     format!("Most recent frame_seq values: {}.", tail.join(", "))
 }
 
-/// The one-line note appended to a turn's tool results naming the frame numbers
-/// that turn's screenshots were filed under.
+/// The owed items this run has not marked yet — the debt `frame_seq_note`
+/// names. Approved items are not owed (see `owed_items`), and ONE mark clears an
+/// item: the reminder exists to get a first citation made while the frame is
+/// still on screen, and an item marked once is already citable at the end
+/// (`parse_done_claim` prefills from it). Re-marking a broken item stays
+/// possible and is still asked for in `CLAIM_CONTRACT`; it is just not worth
+/// per-turn context to keep asking.
+fn unmarked_owed<'a>(items: &'a [ChecklistItem], marks: &[EvidenceMark]) -> Vec<&'a ChecklistItem> {
+    owed_items(items)
+        .into_iter()
+        .filter(|it| !marks.iter().any(|m| m.item_id == it.item_id))
+        .collect()
+}
+
+/// How much of an unmarked item's text the per-turn reminder repeats. Short on
+/// purpose: this string is rebuilt on every screenshot turn of a run against a
+/// 32K-context model, and its job is to let the model RECOGNISE an item whose
+/// full text it can already read at the top of its prompt — not to restate the
+/// definition of done a second time per turn.
+const REMINDER_ITEM_CHARS: usize = 60;
+
+/// At most this many unmarked items are named in one turn's reminder. A task
+/// with more owed items than this would otherwise carry a reminder several times
+/// longer than the frame line it rides on, every turn, for the whole run. The
+/// slice is the FIRST unmarked items in checklist order — stable turn to turn,
+/// so the model sees the same names until it clears one, and the complete list
+/// is in `messages[0]` regardless.
+const REMINDER_MAX_ITEMS: usize = 3;
+
+/// The note appended to a turn's tool results naming the frame numbers that
+/// turn's screenshots were filed under, and what is still owed against them.
 ///
-/// Without it `frame_seq` is unusable: the seqs are allocated by the run loop
+/// # Why the numbers
+///
+/// Without them `frame_seq` is unusable: the seqs are allocated by the run loop
 /// AFTER a turn's actions are dispatched, so the model has no way to learn the
 /// number of the picture it is looking at, and a claim could only ever cite
 /// frames by guess. Emitted only on runs where `claim_done` applies — every
 /// other run would be paying context for a number nothing consumes.
 ///
-/// It names `mark_evidence` first because THIS turn is the only turn where
-/// these numbers and the picture they name are both in front of the model; by
-/// the end of the run the image is pruned and the number is a digit it has to
-/// remember.
-pub fn frame_seq_note(seqs: &[i64]) -> Option<String> {
+/// # Why the debt line
+///
+/// The first live checklist run produced a correct `claim_done` with ZERO
+/// `mark_evidence` calls behind it: both items were cited, at the end, from
+/// memory, and both named the same frame — one of which could not have shown
+/// what it was cited for. The instruction to mark was not missing, it was
+/// unreachable. It sat in `CLAIM_CONTRACT` in `messages[0]` (which `prune_text`
+/// exempts, so it never left the window) while this note — the one thing the
+/// model reads in the same breath as the frame numbers — said only "if one of
+/// them shows a checklist item is now satisfied". Acting on that required the
+/// model to remember a checklist existed, retrieve the right UUID from fifteen
+/// turns back, and decide the frame satisfied it: three retrievals, each with a
+/// free fall-through to "keep working". Nothing anywhere stated the debt, so an
+/// item never marked was invisible to every check in the system until the
+/// operator read the payload.
+///
+/// So the reminder states the debt where the citation is: the ids to copy and
+/// the frames to cite in one string, at the position the model is already
+/// reading numbers off. It SHRINKS as items are marked and vanishes the moment
+/// nothing is owed — leaving exactly the frame line, which claim_done still
+/// needs — so the cost is paid only while it is buying something, and a run that
+/// marks promptly pays almost nothing.
+///
+/// The all-clear branch deliberately asserts nothing about marks: it is also the
+/// branch a caller with no owed items lands in, and "everything is marked" would
+/// be a lie there.
+pub fn frame_seq_note(
+    seqs: &[i64],
+    checklist: &[ChecklistItem],
+    marks: &[EvidenceMark],
+) -> Option<String> {
     if seqs.is_empty() {
         return None;
     }
     let list = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
-    Some(format!(
-        "[worker] The screenshot(s) above were filed as frame_seq {list}. \
-         If one of them shows a checklist item is now satisfied, call `mark_evidence` NOW with \
-         these numbers in `frame_seqs`. They are also the numbers to cite in claim_done."
-    ))
+    let mut note = format!("[worker] The screenshot(s) above were filed as frame_seq {list}.");
+    let unmarked = unmarked_owed(checklist, marks);
+    if unmarked.is_empty() {
+        note.push_str(" These are the numbers to cite in claim_done.");
+        return Some(note);
+    }
+    note.push_str(" Still unmarked:");
+    for it in unmarked.iter().take(REMINDER_MAX_ITEMS) {
+        note.push_str(&format!(
+            "\n- {} = {}",
+            it.item_id,
+            truncate_chars(&it.text, REMINDER_ITEM_CHARS)
+        ));
+    }
+    if unmarked.len() > REMINDER_MAX_ITEMS {
+        note.push_str(&format!(
+            "\n(and {} more, listed in full at the top of this run)",
+            unmarked.len() - REMINDER_MAX_ITEMS
+        ));
+    }
+    note.push_str(
+        "\nIf a frame above shows one of these, call `mark_evidence` NOW with that item_id and \
+         these numbers in `frame_seqs`. They are also the numbers to cite in claim_done.",
+    );
+    Some(note)
 }
 
 /// The `mark_evidence` tool schema, or None on a run with nothing owed — the
@@ -1342,6 +1445,16 @@ fn clip_payload_text(mut p: Value) -> Value {
     p
 }
 
+/// Whether this item was ever `mark_evidence`d during the run.
+///
+/// Read from `claim.marks` — the WHOLE list — and never from the trimmed slice
+/// `assemble_claim_payload` may be rendering, because dropping an old mark to
+/// fit the byte cap must not turn an item the model genuinely observed into one
+/// the payload accuses of being remembered.
+fn was_marked(claim: &DoneClaim, item_id: &str) -> bool {
+    claim.marks.iter().any(|m| m.item_id == item_id)
+}
+
 /// One candidate payload, carrying `claim.marks[skip..]`.
 fn assemble_claim_payload(run_id: &str, claim: &DoneClaim, skip: usize) -> Value {
     let marks = &claim.marks[skip.min(claim.marks.len())..];
@@ -1354,11 +1467,26 @@ fn assemble_claim_payload(run_id: &str, claim: &DoneClaim, skip: usize) -> Value
     );
     for c in &claim.items {
         let mark = if c.satisfied { "claims YES" } else { "claims NO" };
+        // The provenance of a YES, in the prose the operator's eye lands on
+        // first. An item claimed satisfied that was never marked was cited after
+        // the fact, from a context the frame had already been pruned out of —
+        // the exact shape of the first live run, where both items named one
+        // frame and only one of them could have been shown by it. It is not
+        // grounds to reject the claim (see parse_done_claim), but it is the
+        // difference between "I saw this" and "I remember this", and the human
+        // rendering the verdict is owed it. Only on a YES: a NO cites nothing
+        // the operator has to trust.
+        let recall = if c.satisfied && !was_marked(claim, &c.item_id) {
+            " [never marked during the run — cited afterwards]"
+        } else {
+            ""
+        };
         text.push_str(&format!(
-            "\n- {} — {}{}: {}",
+            "\n- {} — {}{}{}: {}",
             c.text,
             mark,
             frames_phrase(&c.frame_seqs),
+            recall,
             c.evidence_note
         ));
     }
@@ -1393,6 +1521,11 @@ fn assemble_claim_payload(run_id: &str, claim: &DoneClaim, skip: usize) -> Value
                 // reader can only show one. `frame_seqs` is the whole answer.
                 "frame_seq": c.primary_frame(),
                 "frame_seqs": c.frame_seqs,
+                // Additive: whether this row's citation was made mid-run with
+                // the frame on screen, or reconstructed at the end. Lets a
+                // console flag the second kind without joining `marks` itself,
+                // and survives the shrink that trims `marks` (see was_marked).
+                "marked_during_run": was_marked(claim, &c.item_id),
             }))
             .collect::<Vec<_>>(),
         // How many of the oldest marks were dropped to fit the cap. Always
@@ -1970,22 +2103,88 @@ async fn fetch_next_task(
     }
 }
 
+/// The body of `POST /runs`, split out so the wire shape is assertable without a
+/// server — the same reason `message_body` is its own function.
+///
+/// `task_id` is written ONLY when this run belongs to a task. Its ABSENCE is
+/// meaningful to the backend (`RunCreate.task_id` is `Optional`, and a run
+/// without one is a bare run — what `/agent/dispatch` and the desktop's ad-hoc
+/// runs are), so a task-less caller must omit the key rather than send a null,
+/// and the body it produces is byte-for-byte the one this function sent before
+/// the field existed.
+fn create_run_body(task_title: &str, model: &str, task_id: Option<&str>) -> Value {
+    let mut body = json!({ "task": task_title, "model": model });
+    if let Some(t) = task_id {
+        body["task_id"] = json!(t);
+    }
+    body
+}
+
+/// What the operator is told when `POST /runs` answers with an HTTP error.
+///
+/// 404 and 409 are the two codes the task link introduces, and both are facts
+/// about the TASK rather than about the runs store — so the bare "HTTP 409" this
+/// used to report reads as a fleet outage when it actually means "you killed
+/// this task an hour ago". Naming them is the whole difference between an
+/// operator who investigates the backend and one who reads his own decision back.
+///
+/// Both are also SAFE, and the message says so because the alternative reading
+/// costs an operator a manual reconciliation: `create_run` resolves and gates
+/// the task (`task_for_run`) BEFORE it inserts the Run, so a refusal leaves no
+/// run row, no half-attached task, and nothing to clean up.
+fn create_run_error(status: u16, task_id: Option<&str>, body: &str) -> String {
+    let hint = match (status, task_id) {
+        (409, Some(_)) => {
+            " — the task is done, killed or abandoned and accepts no new runs; \
+             no run row was created and the task was not modified"
+        }
+        (404, Some(_)) => {
+            " — this machine cannot reach that task (assigned to another device, or deleted); \
+             no run row was created and the task was not modified"
+        }
+        _ => "",
+    };
+    format!("HTTP {status}: {body}{hint}")
+}
+
 /// `POST /runs` — mint the run row for a task run. Every other run path has the
 /// row minted for it (the frontend for local runs, the backend for dispatched
 /// ones); a task run is the one kind born in Rust, so it mints its own here.
 /// Bounded retries: without a run row the console cannot join task → run, and
 /// starting invisible work on an unattended machine is worse than telling the
 /// operator the pickup failed.
+///
+/// # Why the task id rides on this call
+///
+/// It is what puts the run on `task.run_ids`, and doing it AT MINT TIME is the
+/// only way the join exists while the run is still executing. Without it the
+/// sole task → run link was the `outcome-{run_id}` diary row this module posts
+/// when the run ENDS, so the console's task page said "No run yet" for the
+/// entire duration — observed live on a 59-step run the operator launched from
+/// that page and then could not watch. The backend appends inside the same
+/// device scoping the task already has (routers/tasks.py::task_for_run), so
+/// this is not a second authorization surface: it is one append, of a run this
+/// call is simultaneously creating, onto a task this device's token already
+/// reaches.
+///
+/// A REFUSED task id fails the whole call rather than falling back to a bare
+/// run, and that is deliberate. The two refusals mean "the operator has stopped
+/// waiting on this task" (409) and "this task is not this machine's" (404);
+/// silently starting the work anyway would drive somebody's computer for a task
+/// already judged, and would do it as an unattached run — which is exactly the
+/// invisibility this parameter exists to end, in a worse form. `handle_task`
+/// turns the error into a `runfail` diary row and leaves the task standing.
 async fn create_run_row(
     app: &AppHandle,
     client: &reqwest::Client,
     base: &str,
     task_title: &str,
     model: &str,
+    task_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     let url = format!("{base}/runs");
-    let body = json!({ "task": task_title, "model": model });
+    let body = create_run_body(task_title, model, task_id);
     let mut backoff = BACKOFF_START;
     for attempt in 0..=PATCH_RETRIES {
         match with_bearer(app, client.post(&url).json(&body), "").send().await {
@@ -1998,10 +2197,10 @@ async fn create_run_row(
                     .ok_or_else(|| "POST /runs returned no run_id".to_string());
             }
             Ok(r) => {
-                let status = r.status();
+                let status = r.status().as_u16();
                 let txt = r.text().await.unwrap_or_default();
                 let txt: String = txt.chars().take(300).collect();
-                return Err(format!("HTTP {status}: {txt}"));
+                return Err(create_run_error(status, task_id, &txt));
             }
             Err(e) if attempt < PATCH_RETRIES => {
                 eprintln!("[tasks] POST /runs failed ({e}); retrying");
@@ -2211,21 +2410,34 @@ async fn handle_task(
         eprintln!("[tasks] {task_id}: readback->running failed: {e}");
         return;
     }
-    let run_id = match create_run_row(app, client, base, &title, &promised_model, cancel).await {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("[tasks] {task_id}: POST /runs failed: {e}");
-            post_status(
-                app, client, base, device_id,
-                &format!("runfail-{task_id}"),
-                &task_id,
-                json!({ "text": format!("could not create a run for this task: {e}; task left in running") }),
-                cancel,
-            )
-            .await;
-            return;
-        }
-    };
+    // Naming the task here is what puts this run on the task's `run_ids`, from
+    // the run's first instant rather than from the diary row posted when it ends
+    // — see `create_run_row`. A refusal (409 terminal task, 404 not ours) means
+    // no run row exists at all, so nothing started and there is nothing to
+    // reconcile; say that plainly and leave the task for the operator.
+    let run_id =
+        match create_run_row(app, client, base, &title, &promised_model, Some(&task_id), cancel)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("[tasks] {task_id}: POST /runs failed: {e}");
+                post_status(
+                    app, client, base, device_id,
+                    &format!("runfail-{task_id}"),
+                    &task_id,
+                    json!({
+                        "text": format!(
+                            "could not create a run for this task: {e}; nothing was started \
+                             and the task is left in running"
+                        )
+                    }),
+                    cancel,
+                )
+                .await;
+                return;
+            }
+        };
 
     // The fleet endpoint resolution is UNCHANGED from a dispatched run: pass
     // fleet values in the frame position and let `resolve_endpoint`'s
@@ -2825,11 +3037,98 @@ mod tests {
     /// has no other way to learn them.
     #[test]
     fn frame_seq_note_names_this_turns_frames() {
-        assert_eq!(frame_seq_note(&[]), None, "a turn with no frames says nothing");
-        let note = frame_seq_note(&[7, 9]).unwrap();
+        let items = two_items();
+        assert_eq!(
+            frame_seq_note(&[], &items, &[]),
+            None,
+            "a turn with no frames says nothing"
+        );
+        let note = frame_seq_note(&[7, 9], &items, &[]).unwrap();
         assert!(note.contains("frame_seq 7, 9"));
         assert!(note.contains("claim_done"));
         assert!(note.contains("mark_evidence"), "the turn it happened is the turn to say so");
+    }
+
+    /// The per-turn debt. The live failure was a model that never called
+    /// `mark_evidence` at all: the instruction lived in messages[0] fifteen
+    /// turns back while the only thing beside the frames said "if one of them
+    /// shows a checklist item". The reminder names the ids to copy, in the same
+    /// string as the numbers to cite.
+    #[test]
+    fn frame_seq_note_names_the_items_still_unmarked() {
+        let items = two_items();
+        let note = frame_seq_note(&[15], &items, &[]).unwrap();
+        assert!(note.contains("Still unmarked:"));
+        assert!(
+            note.contains("e4777019-5f63-4776-a800-577c965bb88c"),
+            "the id must be copyable from here, not retrieved from the prompt head"
+        );
+        assert!(note.contains("d6d7e296-e8b2-4535-92cc-d74ec0b3fba0"));
+        assert!(note.contains("Notepad contains"), "and recognisable as the item it is");
+        assert!(note.contains("call `mark_evidence` NOW"));
+    }
+
+    /// It SHRINKS as the debt is paid and disappears entirely once nothing is
+    /// owed — the frame line survives, because claim_done still cites it.
+    #[test]
+    fn frame_seq_note_shrinks_then_vanishes_as_items_are_marked() {
+        let items = two_items();
+        let one = mark(
+            json!({"item_id": "e4777019-5f63-4776-a800-577c965bb88c",
+                   "frame_seqs": [7], "note": "the line is on screen"}),
+            &items,
+            &[7],
+            4,
+        );
+        let note = frame_seq_note(&[9], &items, std::slice::from_ref(&one)).unwrap();
+        assert!(
+            !note.contains("e4777019-5f63-4776-a800-577c965bb88c"),
+            "a marked item stops being asked for"
+        );
+        assert!(note.contains("d6d7e296-e8b2-4535-92cc-d74ec0b3fba0"), "the other still owes");
+
+        let two = mark(
+            json!({"item_id": "d6d7e296-e8b2-4535-92cc-d74ec0b3fba0",
+                   "frame_seqs": [9], "note": "calculator reads 42"}),
+            &items,
+            &[9],
+            6,
+        );
+        let note = frame_seq_note(&[11], &items, &[one, two]).unwrap();
+        assert!(note.contains("frame_seq 11"), "the numbers are still needed");
+        assert!(!note.contains("Still unmarked"), "nothing owed, no reminder");
+        assert!(!note.contains("mark_evidence"), "and no prompt to use a tool with no work left");
+        assert!(note.len() < 120, "the all-clear line stays one short sentence");
+    }
+
+    /// An APPROVED item is not this run's to mark, so it never appears in the
+    /// debt — and a run with no checklist at all gets the bare frame line, which
+    /// is the same string the all-marked run gets. Nothing in either case
+    /// asserts a fact about marks that is not true.
+    #[test]
+    fn frame_seq_note_owes_nothing_for_approved_or_absent_items() {
+        let approved = checklist_items(&json!([
+            {"item_id": "a", "text": "tests pass", "approved": true},
+        ]));
+        let note = frame_seq_note(&[3], &approved, &[]).unwrap();
+        assert!(!note.contains("Still unmarked"), "an accepted item is not owed");
+        assert_eq!(note, frame_seq_note(&[3], &[], &[]).unwrap(), "and neither is nothing");
+    }
+
+    /// A long checklist cannot turn the per-turn note into a second copy of the
+    /// definition of done: it is capped, and it says so rather than silently
+    /// dropping items the model would then never hear about here.
+    #[test]
+    fn frame_seq_note_caps_a_long_checklist() {
+        let rows: Vec<Value> = (0..6)
+            .map(|i| json!({"item_id": format!("id-{i}"), "text": format!("item {i}"),
+                            "approved": false}))
+            .collect();
+        let items = checklist_items(&json!(rows));
+        let note = frame_seq_note(&[1], &items, &[]).unwrap();
+        assert!(note.contains("id-0") && note.contains("id-2"));
+        assert!(!note.contains("id-3"), "past the cap");
+        assert!(note.contains("and 3 more"), "the omission is stated, not hidden");
     }
 
     // ---- multi-frame evidence and the mid-run mark --------------------------
@@ -3271,6 +3570,106 @@ mod tests {
         assert_eq!(s["requires_reply"], json!(false));
         assert!(s.get("task_id").is_none());
         assert!(s.get("in_reply_to").is_none());
+    }
+
+    /// The task → run join, at the moment the run is minted. Without the id the
+    /// console's task page said "No run yet" for a whole 59-step run, because
+    /// the only link was the diary row posted when the run ENDED.
+    #[test]
+    fn create_run_body_carries_the_task_it_belongs_to() {
+        let with = create_run_body("open notepad", "gemma-3-27b", Some("task-1"));
+        assert_eq!(with["task_id"], json!("task-1"));
+        assert_eq!(with["task"], json!("open notepad"));
+        assert_eq!(with["model"], json!("gemma-3-27b"));
+    }
+
+    /// A run with no task above it — the desktop's ad-hoc runs and
+    /// `/agent/dispatch` — sends what it always sent. The key is OMITTED, not
+    /// null: the backend reads its absence as "bare run", and a null would be a
+    /// different assertion.
+    #[test]
+    fn create_run_body_omits_the_key_entirely_without_a_task() {
+        let bare = create_run_body("open notepad", "gemma-3-27b", None);
+        assert!(bare.get("task_id").is_none());
+        assert_eq!(bare, json!({"task": "open notepad", "model": "gemma-3-27b"}));
+    }
+
+    /// The attach can refuse, and the refusal is a fact about the TASK. Both
+    /// codes are gated before the Run is inserted, so the honest report is "no
+    /// run exists" — the run does NOT fall back to starting unattached, which
+    /// would be the invisibility bug again with the operator's kill ignored on
+    /// top.
+    #[test]
+    fn create_run_error_explains_a_refused_attach() {
+        let terminal = create_run_error(409, Some("task-1"), "task is killed");
+        assert!(terminal.contains("HTTP 409"));
+        assert!(terminal.contains("no run row was created"));
+        assert!(terminal.contains("accepts no new runs"));
+
+        let foreign = create_run_error(404, Some("task-1"), "task not found");
+        assert!(foreign.contains("another device"));
+        assert!(foreign.contains("no run row was created"));
+
+        // Anything else, and every code on a task-less run, reports exactly what
+        // it reported before: there is no task fact to add.
+        assert_eq!(create_run_error(500, Some("t"), "boom"), "HTTP 500: boom");
+        assert_eq!(create_run_error(409, None, "boom"), "HTTP 409: boom");
+    }
+
+    /// The claim is never refused for being unmarked (see parse_done_claim), so
+    /// the payload has to carry the distinction instead: a YES the model marked
+    /// while looking at the frame, versus one it reconstructed at the end.
+    #[test]
+    fn payload_flags_a_claim_that_was_never_marked() {
+        let items = two_items();
+        let m = mark(
+            json!({"item_id": "e4777019-5f63-4776-a800-577c965bb88c",
+                   "frame_seqs": [12], "note": "the line is on screen"}),
+            &items,
+            &[12],
+            9,
+        );
+        let claim = parse_done_claim(
+            &json!({
+                "items": [
+                    {"item_id": "e4777019-5f63-4776-a800-577c965bb88c", "satisfied": true},
+                    {"item_id": "d6d7e296-e8b2-4535-92cc-d74ec0b3fba0", "satisfied": true,
+                     "evidence_note": "calculator showed 42", "frame_seqs": [12]},
+                ],
+                "summary": "did both",
+            }),
+            &items,
+            &[12],
+            &[m],
+        )
+        .unwrap();
+        let p = claim_status_payload("r1", &claim);
+        assert_eq!(p["claims"][0]["marked_during_run"], json!(true));
+        assert_eq!(p["claims"][1]["marked_during_run"], json!(false));
+        assert!(
+            p["text"].as_str().unwrap().contains("never marked during the run"),
+            "the operator reads the prose first"
+        );
+    }
+
+    /// A NO is not accused of anything — it cites nothing the operator has to
+    /// trust — and a marked YES carries no warning either. So the run that
+    /// behaved correctly reads exactly as it always did.
+    #[test]
+    fn payload_does_not_flag_an_unsatisfied_item() {
+        let items = two_items();
+        let m = mark(
+            json!({"item_id": "e4777019-5f63-4776-a800-577c965bb88c",
+                   "frame_seqs": [12], "note": "the line is on screen"}),
+            &items,
+            &[12],
+            9,
+        );
+        // Item one: satisfied and marked. Item two: not satisfied, never marked.
+        let claim = parse_done_claim(&full_claim(), &items, &[12], &[m]).unwrap();
+        let p = claim_status_payload("r1", &claim);
+        assert!(!p["text"].as_str().unwrap().contains("never marked"));
+        assert_eq!(p["claims"][1]["marked_during_run"], json!(false), "the fact is still there");
     }
 
     #[test]

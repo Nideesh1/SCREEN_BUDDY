@@ -2426,8 +2426,20 @@ async fn run_agent(
         // `claim_done` can point at one. Only on runs where claiming applies —
         // every other run would pay context for a number nothing reads. A text
         // block AFTER the tool_results, which is where the API permits one.
+        //
+        // The checklist and the marks so far ride in because the note also
+        // carries what is STILL UNMARKED: the frame numbers and the debt they
+        // could settle belong in one string, in the one position the model reads
+        // while the picture is in front of it (see `frame_seq_note`). Passing
+        // `evidence_marks` — mutated by this turn's `mark_evidence` calls a few
+        // lines above — is what makes an item drop out of the reminder in the
+        // very turn it is marked, rather than one turn late.
         if claim_tool.is_some() && !results.is_empty() {
-            if let Some(note) = crate::channel::frame_seq_note(&frame_seqs[frames_before..]) {
+            if let Some(note) = crate::channel::frame_seq_note(
+                &frame_seqs[frames_before..],
+                &claim_checklist,
+                &evidence_marks,
+            ) {
                 results.push(json!({"type": "text", "text": note}));
             }
         }
