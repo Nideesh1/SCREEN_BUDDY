@@ -87,6 +87,9 @@ function Devices() {
   const [addingMachine, setAddingMachine] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const thisDeviceId = useThisDeviceId()
+  // Announces itself as this account's console, and says so when another
+  // machine already is one. Advisory only — see useConsoleClaim.
+  const consoleClaim = useConsoleClaim(thisDeviceId)
 
   // `quiet` keeps the poll from tearing the pane down every 30 seconds: only the
   // first load (and an explicit refresh) may drop back to the spinner, and a
@@ -167,6 +170,10 @@ function Devices() {
           </Button>
         </div>
       </div>
+
+      {/* Above the fleet, because it is about this whole screen rather than any
+          machine in it. Renders nothing in the ordinary case. */}
+      <ConsoleClaimBanner claim={consoleClaim} />
 
       {/* Remounted on every open so a dismissed key is gone for good rather than
           sitting in state waiting to be reopened — the modal's whole premise is
@@ -467,6 +474,141 @@ function AddMachineModal({ onClose }: { onClose: () => void }) {
 }
 
 // ───────────────────────────────────────────────────────── list
+
+// ───────────────────────────────────────────────── the console claim
+//
+// Admin is not a role anyone is granted: it is "signed into this account", so
+// every machine the owner signs in on becomes a console and nothing announced
+// that a second one existed. Two consoles cannot produce two contradictory
+// verdicts — those are compare-and-swap on the backend, and the second writer
+// gets a 409 — so what was missing here was visibility, not enforcement.
+//
+// Hence a claim rather than a lock: nothing refuses to work. The machine that
+// does not hold the claim says so and offers to take it, and a holder that has
+// gone quiet past the backend's window is displaced without a takeover — which
+// is what stops a dead laptop from taking the account's console with it.
+//
+// Browser tabs sit this out entirely. The claim is per MACHINE and a tab cannot
+// read the machine id, so `thisDeviceId` is null: nothing to claim with, and
+// nothing to display.
+
+export interface ConsoleClaimState {
+  /** Someone else's LIVE claim, named — the only case worth interrupting for. */
+  heldBy: { hostname: string | null; seenAt: string | null } | null
+  /** A takeover is in flight. */
+  taking: boolean
+  takeOver: () => void
+}
+
+function useConsoleClaim(thisDeviceId: string | null): ConsoleClaimState {
+  const [heldBy, setHeldBy] = useState<ConsoleClaimState['heldBy']>(null)
+  const [taking, setTaking] = useState(false)
+
+  const claim = useCallback(
+    async (takeover: boolean) => {
+      if (!thisDeviceId) return
+      try {
+        const resp = await fetch(`${CU_BACKEND}/console/claim`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'content-type': 'application/json' },
+          body: JSON.stringify({ device_id: thisDeviceId, takeover }),
+        })
+        if (resp.status === 409) {
+          const detail = (await resp.json())?.detail ?? {}
+          setHeldBy({ hostname: detail.hostname ?? null, seenAt: detail.seen_at ?? null })
+          return
+        }
+        // Any other failure stays silent on purpose. The claim is advisory, so
+        // an operator who came here to judge a run must not be met with an
+        // error about bookkeeping that changes nothing they can do.
+        if (resp.ok) setHeldBy(null)
+      } catch {
+        // Same reasoning: a network blip on the claim earns no banner.
+      }
+    },
+    [thisDeviceId],
+  )
+
+  // Claim on arrival, then poll — and the poll IS the holder's heartbeat
+  // (GET /console bumps `seen_at` for the holder and for nobody else), which is
+  // what lets another machine tell "closed an hour ago" from "someone is
+  // sitting there right now".
+  useEffect(() => {
+    if (!thisDeviceId) return
+    let alive = true
+    claim(false)
+    const beat = async () => {
+      try {
+        const resp = await fetch(
+          `${CU_BACKEND}/console?device_id=${encodeURIComponent(thisDeviceId)}`,
+          { headers: authHeaders() },
+        )
+        if (!alive || !resp.ok) return
+        const view = await resp.json()
+        if (!alive) return
+        // Ours, nobody's, or a holder gone quiet: nothing to say. Only a live
+        // claim held elsewhere earns the banner.
+        setHeldBy(
+          view.is_mine || !view.device_id || view.stale
+            ? null
+            : { hostname: view.hostname ?? null, seenAt: view.seen_at ?? null },
+        )
+      } catch {
+        // leave the last known state on screen
+      }
+    }
+    const id = setInterval(beat, POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [thisDeviceId, claim])
+
+  const takeOver = useCallback(async () => {
+    setTaking(true)
+    await claim(true)
+    setTaking(false)
+  }, [claim])
+
+  return { heldBy, taking, takeOver }
+}
+
+// Not a modal and not a blocker: the console works exactly as well while this
+// is on screen, and the operator may ignore it. Two consoles on one account is
+// untidy, not dangerous.
+function ConsoleClaimBanner({ claim }: { claim: ConsoleClaimState }) {
+  if (!claim.heldBy) return null
+  const { hostname, seenAt } = claim.heldBy
+  const who = hostname ?? 'another machine'
+  return (
+    <Card>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-3)', flexWrap: 'wrap' }}>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 240,
+            fontSize: 'var(--fs-md)',
+            lineHeight: 1.5,
+            color: 'var(--sb-text)',
+          }}
+        >
+          This account&rsquo;s console is on <strong>{who}</strong>
+          {seenAt ? ` — active ${relativeTime(seenAt)}` : ''}. Both can issue verdicts and the
+          first one to land wins; take over to make this the console of record.
+        </span>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={claim.takeOver}
+          disabled={claim.taking}
+          title={`Move the console claim from ${who} to this machine`}
+        >
+          {claim.taking ? 'Taking over…' : 'Take over'}
+        </Button>
+      </div>
+    </Card>
+  )
+}
 
 // The display name an admin gave the machine, or what the machine calls itself.
 function displayName(device: Device): string {
