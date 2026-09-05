@@ -744,6 +744,10 @@ function DeviceDetail({
   const [revoking, setRevoking] = useState(false)
 
   const revoked = device.enrollment_state === 'revoked'
+  // No worker pass means this row is the machine running the console, not a
+  // worker (see isWorker). It changes what this pane is FOR, so it is read
+  // once here rather than per card.
+  const isConsole = !isWorker(device)
 
   // Compare against the server's nulls as empty strings, so clearing a field
   // that was already null doesn't read as an unsaved change.
@@ -887,18 +891,37 @@ function DeviceDetail({
         )}
       </Card>
 
-      <NowCard device={device} onOpenRun={onOpenRun} />
+      {/* Everything from here to ACCESS describes a machine DOING work, and the
+          console's own machine never does any: it holds no worker pass, takes
+          no tasks, uploads no frames. Rendered anyway, the pane was five cards
+          of "not applicable" — a longer read that ended in less information
+          than one sentence. So the work cards are simply absent, and the single
+          card below says why once. */}
+      {isConsole ? (
+        <Card title={<SectionTitle>Console</SectionTitle>}>
+          <div style={{ fontSize: 'var(--fs-md)', lineHeight: 1.6, color: 'var(--sb-text-muted)' }}>
+            This machine runs the console. It signs in with your Google account rather than holding
+            a worker pass, so it takes no tasks, answers no snapshots and records no runs — it is
+            here because every install registers itself, and it is listed so the fleet count is
+            honest.
+          </div>
+        </Card>
+      ) : (
+        <>
+          <NowCard device={device} onOpenRun={onOpenRun} />
 
-      {/* Under NOW because a task is the intent behind the run NOW shows: the
-          run is what the machine is doing, the task is what it was told. Also
-          where new work is handed out — the + New task modal posts for THIS
-          machine. */}
-      <TasksCard device={device} onOpenTask={onOpenTask} />
+          {/* Under NOW because a task is the intent behind the run NOW shows:
+              the run is what the machine is doing, the task is what it was
+              told. Also where new work is handed out — the + New task modal
+              posts for THIS machine. */}
+          <TasksCard device={device} onOpenTask={onOpenTask} />
 
-      {/* Directly under NOW: that card says a run exists, this one says what it
-          is doing. Read the other way round they are the same machine's story in
-          the right order. */}
-      <ScreenCard device={device} />
+          {/* Directly under NOW: that card says a run exists, this one says
+              what it is doing. Read the other way round they are the same
+              machine's story in the right order. */}
+          <ScreenCard device={device} />
+        </>
+      )}
 
       {/* Then the work itself. NOW and SCREEN are this second; RUNS is the last
           thing this machine did, and the door to everything it has ever done.
@@ -906,24 +929,33 @@ function DeviceDetail({
           it — access, the way in, and the fields an admin types — which is the
           order someone reads in only after the answer above was not the one they
           wanted. */}
-      <RunsCard device={device} onOpenRun={onOpenRun} onOpenRuns={onOpenRuns} />
+      {!isConsole && (
+        <>
+          <RunsCard device={device} onOpenRun={onOpenRun} onOpenRuns={onOpenRuns} />
 
-      <AccessCard
-        device={device}
-        revoking={revoking}
-        busy={saving || forgetting}
-        onRevoke={() => setConfirming('revoke')}
-        onAddMachine={onAddMachine}
-      />
+          {/* ACCESS is about a worker pass, and the console has none — the card
+              existed on this row only to say so, which the Console card above
+              now says once. REMOTE DESKTOP goes for the same reason: its
+              purpose is taking a screen back from an agent, and no agent ever
+              drives this one. */}
+          <AccessCard
+            device={device}
+            revoking={revoking}
+            busy={saving || forgetting}
+            onRevoke={() => setConfirming('revoke')}
+            onAddMachine={onAddMachine}
+          />
 
-      <RemoteDesktopCard
-        savedId={device.rustdesk_id}
-        draft={rustdeskId}
-        onDraftChange={setRustdeskId}
-        dirty={rustdeskId !== (device.rustdesk_id ?? '')}
-        saving={saving}
-        onSave={save}
-      />
+          <RemoteDesktopCard
+            savedId={device.rustdesk_id}
+            draft={rustdeskId}
+            onDraftChange={setRustdeskId}
+            dirty={rustdeskId !== (device.rustdesk_id ?? '')}
+            saving={saving}
+            onSave={save}
+          />
+        </>
+      )}
 
       <Card title={<SectionTitle>Details</SectionTitle>}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
@@ -974,8 +1006,9 @@ function DeviceDetail({
           </div>
         </div>
         <div style={{ marginTop: 'var(--sp-2)', fontSize: 'var(--fs-sm)', color: 'var(--sb-text-faint)' }}>
-          Forget removes this machine from the fleet along with everything you typed about it. To
-          cut its access but keep the record, use Revoke access above.
+          {isConsole
+            ? 'Forget removes this machine from the fleet along with everything you typed about it. It will register itself again the next time the app starts here.'
+            : 'Forget removes this machine from the fleet along with everything you typed about it. To cut its access but keep the record, use Revoke access above.'}
         </div>
       </Card>
     </div>
