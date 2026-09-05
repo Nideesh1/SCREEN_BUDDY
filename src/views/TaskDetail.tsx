@@ -2424,8 +2424,54 @@ function DiaryEntry({
     return <ReceiptRow message={m} meta={meta} />
   }
 
-  // nudge — the operator steering mid-flight. Small and muted: it matters to
-  // the story, not to the eye.
+  // nudge — the operator steering mid-flight. Two very different acts arrive
+  // on this one wire, separated only by payload.override: an ordinary nudge is
+  // extra information the worker weighs alongside everything else, while an
+  // override tells it the approach it is taking is wrong and to drop it. An
+  // operator reading a task back afterwards has to be able to tell which one
+  // they sent — "I gave it a hint" and "I made it abandon what it was doing"
+  // explain completely different runs — so the override gets a card of its own
+  // instead of the muted line.
+  if (m.payload.override === true) {
+    return (
+      <div
+        style={{
+          marginLeft: 'var(--sp-5)',
+          border: '1px solid rgba(192, 57, 43, 0.40)',
+          // The heavy left edge is the part that survives skimming: the eye
+          // finds the moment the run changed course without reading a word.
+          borderLeft: '3px solid var(--sb-danger-bright)',
+          background: 'rgba(192, 57, 43, 0.08)',
+          borderRadius: 'var(--r-md)',
+          padding: 'var(--sp-3)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 'var(--sp-2)',
+        }}
+      >
+        {meta}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
+          <Badge tone="danger">↯ redirect</Badge>
+          <span style={{ fontSize: 'var(--fs-xs)', color: 'var(--sb-text-faint)' }}>
+            sent as a replacement instruction — the worker was told to stop the approach it was taking
+          </span>
+        </div>
+        <div
+          style={{
+            fontSize: 'var(--fs-md)',
+            lineHeight: 1.6,
+            color: 'var(--sb-text)',
+            whiteSpace: 'pre-wrap',
+          }}
+        >
+          {text || '(no text)'}
+        </div>
+      </div>
+    )
+  }
+
+  // The additive nudge stays small and muted: it matters to the story, not to
+  // the eye.
   return (
     <div
       style={{
@@ -2441,6 +2487,30 @@ function DiaryEntry({
       <span style={{ whiteSpace: 'pre-wrap' }}>{text || '(no text)'}</span>
     </div>
   )
+}
+
+// A disposition is the worker's own word for what it did with a message —
+// injected, override_applied, dropped_superseded_by_override, and whatever it
+// learns to do next. That vocabulary grows on the worker side, independently of
+// this console, so nothing here may be an exhaustive table: a console that only
+// knows the words it shipped with renders a blank or a shrug for exactly the
+// receipts an operator most needs, the ones describing behaviour that is new.
+// So the raw value is humanised instead of looked up — underscores out, and
+// anything unrecognised still reads as English.
+function dispositionLabel(raw: string): string {
+  return raw.replace(/[_-]+/g, ' ').trim() || 'receipt'
+}
+
+// Emphasis is matched on substrings for the same reason: an override that later
+// becomes "override_applied_at_boundary" should still read as the forceful
+// thing it is rather than falling back to plain text. Dropped is tested first
+// because "dropped_superseded_by_override" names the override that beat it and
+// would otherwise colour itself as one.
+function dispositionColor(raw: string): string | undefined {
+  const v = raw.toLowerCase()
+  if (v.includes('drop') || v.includes('supersed') || v.includes('discard')) return 'var(--sb-text-faint)'
+  if (v.includes('override') || v.includes('redirect')) return 'var(--sb-danger-bright)'
+  return undefined
 }
 
 // A receipt is bookkeeping ("your nudge was injected at the turn boundary") —
@@ -2462,7 +2532,9 @@ function ReceiptRow({ message: m, meta }: { message: DiaryMessage; meta: React.R
         }}
         title={open ? 'Collapse this receipt' : 'Show what this receipt carried'}
       >
-        {open ? '▾' : '▸'} receipt · {disposition} · {whenLine(m)}
+        {open ? '▾' : '▸'} receipt ·{' '}
+        <span style={{ color: dispositionColor(disposition) }}>{dispositionLabel(disposition)}</span> ·{' '}
+        {whenLine(m)}
       </button>
       {open && (
         <pre
@@ -2487,8 +2559,15 @@ function ReceiptRow({ message: m, meta }: { message: DiaryMessage; meta: React.R
   )
 }
 
-// Send one nudge into a running task's diary. The worker takes it at its next
-// turn boundary and answers with a receipt, which the poll renders above.
+// Send one message into a running task's diary. The worker takes it at its
+// next turn boundary and answers with a receipt, which the poll renders above.
+//
+// Two sends share one text box because they are the same message on the wire,
+// differing by a single flag: an additive nudge is information the worker
+// weighs alongside everything else it was told, while payload.override tells it
+// to REPLACE the approach it is taking. Splitting them into two input fields
+// would make an operator who had already typed the sentence retype it to change
+// its force, at the exact moment they are in a hurry — one box, two verbs.
 function NudgeComposer({
   deviceId,
   taskId,
@@ -2499,46 +2578,63 @@ function NudgeComposer({
   onSent: () => void
 }) {
   const [text, setText] = useState('')
-  const [sending, setSending] = useState(false)
+  // Which of the two sends is in flight, so only the button that was pressed
+  // says "Sending…" — with one shared boolean both buttons claimed the send and
+  // the operator could not tell which act they had just committed.
+  const [sending, setSending] = useState<'nudge' | 'override' | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const send = useCallback(async () => {
-    const body = text.trim()
-    if (!body) return
-    setSending(true)
-    setError(null)
-    try {
-      const resp = await fetch(`${CU_BACKEND}/channel/${encodeURIComponent(deviceId)}/messages`, {
-        method: 'POST',
-        headers: { ...authHeaders(), 'content-type': 'application/json' },
-        body: JSON.stringify({
-          msg_id: newMsgId(),
-          type: 'nudge',
-          task_id: taskId,
-          payload: { text: body },
-        }),
-      })
-      if (!resp.ok) {
-        setError(`The nudge was refused (${resp.status}).`)
-        return
+  const send = useCallback(
+    async (override: boolean) => {
+      const body = text.trim()
+      if (!body) return
+      setSending(override ? 'override' : 'nudge')
+      setError(null)
+      try {
+        const resp = await fetch(`${CU_BACKEND}/channel/${encodeURIComponent(deviceId)}/messages`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'content-type': 'application/json' },
+          body: JSON.stringify({
+            msg_id: newMsgId(),
+            type: 'nudge',
+            task_id: taskId,
+            // The additive send keeps the exact payload it has always sent —
+            // the flag appears only when the operator asked to redirect, so a
+            // worker that has never heard of it still reads every ordinary
+            // nudge as it always did.
+            payload: override ? { text: body, override: true } : { text: body },
+          }),
+        })
+        if (!resp.ok) {
+          setError(
+            override
+              ? `The redirect was refused (${resp.status}).`
+              : `The nudge was refused (${resp.status}).`,
+          )
+          return
+        }
+        setText('')
+        onSent()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Network error')
+      } finally {
+        setSending(null)
       }
-      setText('')
-      onSent()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error')
-    } finally {
-      setSending(false)
-    }
-  }, [deviceId, taskId, text, onSent])
+    },
+    [deviceId, taskId, text, onSent],
+  )
+
+  const busy = sending !== null
+  const empty = !text.trim()
 
   return (
     <div style={{ marginTop: 'var(--sp-4)', display: 'flex', flexDirection: 'column', gap: 'var(--sp-2)' }}>
-      <div style={{ display: 'flex', gap: 'var(--sp-2)' }}>
+      <div style={{ display: 'flex', gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
         <input
           className="agent-input"
           style={{
             flex: 1,
-            minWidth: 0,
+            minWidth: 200,
             boxSizing: 'border-box',
             padding: '9px 11px',
             fontFamily: 'inherit',
@@ -2548,20 +2644,49 @@ function NudgeComposer({
             border: '1px solid var(--sb-border)',
             borderRadius: 'var(--r-sm)',
           }}
-          placeholder="nudge the worker — delivered at its next turn boundary"
+          placeholder="say something to the worker — delivered at its next turn boundary"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
-              send()
+              // Enter always sends the additive nudge. A redirect throws away
+              // the plan the worker is part-way through, and that has to cost a
+              // deliberate click — never a stray keypress in a box the operator
+              // was still thinking in.
+              send(false)
             }
           }}
-          disabled={sending}
+          disabled={busy}
         />
-        <Button variant="primary" size="sm" onClick={send} disabled={sending || !text.trim()}>
-          {sending ? 'Sending…' : 'Send nudge'}
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => send(false)}
+          disabled={busy || empty}
+          title="Extra information for the worker to weigh. It keeps going exactly as it was."
+        >
+          {sending === 'nudge' ? 'Sending…' : 'Tell it something'}
         </Button>
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={() => send(true)}
+          disabled={busy || empty}
+          title="For when the approach it is taking is wrong: it stops that approach and takes this one instead. The run does not restart and the task is not killed."
+        >
+          {sending === 'override' ? 'Sending…' : 'Stop and redirect'}
+        </Button>
+      </div>
+      {/* Spelled out beneath the buttons rather than left to tooltips: the two
+          sends look alike and read alike, and the operator choosing between
+          them is mid-run and will not hover to find out which is which. */}
+      <div style={{ fontSize: 'var(--fs-xs)', lineHeight: 1.6, color: 'var(--sb-text-faint)' }}>
+        <strong style={{ color: 'var(--sb-text-muted)', fontWeight: 600 }}>Tell it something</strong> adds
+        information it should weigh from here on — the run carries on exactly as it was.{' '}
+        <strong style={{ color: 'var(--sb-text-muted)', fontWeight: 600 }}>Stop and redirect</strong> says the
+        approach it is taking is wrong: it drops that approach and takes this one instead. Neither restarts the
+        run or ends the task — those are Kill and Send back.
       </div>
       {error && <div className="error-message">{error}</div>}
     </div>

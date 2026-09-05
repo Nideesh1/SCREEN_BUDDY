@@ -2149,13 +2149,24 @@ async fn run_agent(
         // `turn_completed` below, only after this turn's response has fully
         // landed — a crash mid-turn must redeliver the batch, and the
         // deterministic receipt msg_ids make that redelivery harmless.
-        for nudge in drain.at_boundary(&app, &client, &base).await {
+        //
+        // The drain hands back texts already wrapped and already ordered — a
+        // redirect (`payload.override`) leads, and the additive nudges it
+        // supersedes never appear at all. That decision belongs to the drain,
+        // not here: it is the same decision as how a redirect is phrased.
+        let drained = drain.at_boundary(&app, &client, &base).await;
+        if drained.overridden {
+            // Worth a line in the log, because from here the transcript stops
+            // agreeing with the run's earlier turns and that is confusing to
+            // read back. A redirect corrects the approach only — the run, the
+            // task and the context all continue; stopping a worker is a
+            // separate operator action.
+            eprintln!("[agent] drain: redirect applied; the run's earlier approach is superseded");
+        }
+        for text in drained.texts {
             messages.push(json!({
                 "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": crate::channel::nudge_user_text(&nudge),
-                }],
+                "content": [{ "type": "text", "text": text }],
             }));
         }
 

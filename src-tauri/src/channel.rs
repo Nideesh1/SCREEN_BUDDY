@@ -1751,6 +1751,42 @@ pub fn nudge_user_text(nudge: &str) -> String {
     )
 }
 
+/// The user message a REDIRECT (`payload.override == true`) becomes. Deliberately
+/// blunt, and deliberately not a variation on `nudge_user_text`: the model is a
+/// 27B local Qwen whose strongest prior is its own transcript, so an "also take
+/// this into account" framing gets averaged in with the forty turns of wrong
+/// approach sitting above it and the run keeps doing the very thing the operator
+/// just told it to stop doing. The wording therefore has to say three things the
+/// additive wrapper never says — stop, the earlier approach is superseded, do not
+/// resume it — because anything softer reads as one more consideration to weigh
+/// against everything already in the context.
+///
+/// A redirect corrects the approach and nothing else: it does not end the run,
+/// the task, or the context. Stopping a worker is a separate operator action,
+/// and the whole point of a redirect is that the run carries on, correctly.
+pub fn redirect_user_text(nudge: &str) -> String {
+    format!(
+        "STOP. Message from the human supervising this run. This is a \
+         CORRECTION, not an addition: the approach you have been taking is \
+         wrong and is now SUPERSEDED. Abandon it. Do not continue it, do not \
+         resume it later, and do not try to reconcile it with what follows — \
+         everything above in this conversation is what you were doing BEFORE \
+         the human stopped you, not what you should do next. Any earlier plan \
+         or instruction of yours that conflicts with this message no longer \
+         applies. The task itself is not over; you are being pointed at a \
+         different way to do it. From this turn on, do this instead: {nudge}"
+    )
+}
+
+/// Whether a drained `nudge` is a redirect rather than an addition. The flag
+/// rides on the existing `nudge` type instead of getting a type of its own so
+/// that a worker built before redirects existed still delivers the operator's
+/// words — additively, which is wrong but harmless — rather than discarding the
+/// row as an unknown type and losing the instruction entirely.
+pub fn nudge_is_override(payload: &Value) -> bool {
+    payload.get("override").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// Best human-readable text of an admin message's payload, for injection or
 /// receipts. Liberal on purpose: the console may send `{text}`, `{message}`, or
 /// something richer, and a nudge we cannot parse should still reach the model
@@ -1764,15 +1800,50 @@ pub fn payload_text(payload: &Value) -> String {
     payload.to_string()
 }
 
+/// What one nudge in a drained batch was actually DONE with — something the
+/// operator cannot infer from the row they wrote, because a nudge they sent
+/// additively may never reach the model at all if someone redirected the run in
+/// the same breath.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NudgeFate {
+    /// An additive nudge delivered into this turn — the ordinary case, and the
+    /// default so that every non-nudge message type can be receipted without
+    /// its caller having to invent a fate that means nothing for it.
+    #[default]
+    Injected,
+    /// An override applied as a redirect, replacing the run's current approach.
+    Redirected,
+    /// An additive nudge consumed but never delivered, because an override in
+    /// the same drain superseded the plan it was written against.
+    Dropped,
+}
+
 /// What the receipt for a drained admin message says. `handled` is true when
 /// `ask_operator` already consumed the message (a verdict answering our
-/// question re-surfaces in the drain; see `ask_operator` for why).
-pub fn receipt_payload(mtype: &str, handled: bool) -> Value {
+/// question re-surfaces in the drain; see `ask_operator` for why). `fate` says
+/// what the drain did with a `nudge`, and is ignored for every other type,
+/// whose disposition is decided entirely by the type itself.
+pub fn receipt_payload(mtype: &str, handled: bool, fate: NudgeFate) -> Value {
     match (mtype, handled) {
-        ("nudge", _) => json!({
-            "disposition": "injected",
-            "note": "delivered to the model at the next turn boundary",
-        }),
+        ("nudge", _) => match fate {
+            NudgeFate::Injected => json!({
+                "disposition": "injected",
+                "note": "delivered to the model at the next turn boundary",
+            }),
+            NudgeFate::Redirected => json!({
+                "disposition": "redirected",
+                "note": "applied as a redirect: the approach the run was taking was superseded",
+            }),
+            // This one has to be spelled out. The operator's words were consumed
+            // — the cursor moved past them and they will never be redelivered —
+            // and yet the model never saw them, so anything vaguer than "dropped"
+            // reads as "delivered" and they spend the rest of the run wondering
+            // why the worker ignored a nudge it was never given.
+            NudgeFate::Dropped => json!({
+                "disposition": "dropped",
+                "note": "not delivered: a redirect in the same drain superseded the approach this was written against",
+            }),
+        },
         ("verdict", true) => json!({
             "disposition": "handled",
             "note": "consumed by the question wait it answered",
@@ -1844,8 +1915,70 @@ impl DrainCursor {
 
 // ---- the turn-boundary drain -----------------------------------------------
 
-/// What one boundary drain hands the agent loop: nudge texts to inject, in log
-/// order.
+/// What one boundary drain hands the agent loop: fully wrapped user-message
+/// texts, already in the order the model must see them, plus whether a redirect
+/// was among them. The wrapping happens here rather than at the call site
+/// because the ordering rule and the phrasing rule are the same rule — a
+/// redirect only overrules the transcript if it is phrased as a replacement AND
+/// arrives before the additive nudges written against the old plan — and
+/// splitting them across two files is how they drift apart.
+#[derive(Debug, Default, PartialEq)]
+pub struct DrainedNudges {
+    /// The user messages to append this turn, in delivery order.
+    pub texts: Vec<String>,
+    /// True when at least one nudge in this drain was an override. The loop
+    /// uses it for logging only: a redirect corrects the approach, it does not
+    /// end the run, so nothing downstream changes control flow on it.
+    pub overridden: bool,
+}
+
+/// Decides, for one drained batch, what gets injected and in what order — split
+/// out of `at_boundary` as a pure function because the interesting rules here
+/// have nothing to do with HTTP and everything to do with an operator watching a
+/// run go wrong: a redirect jumps ahead of nudges that were logged before it,
+/// and the nudges it jumps are then dropped rather than delivered, because they
+/// were written against a plan that no longer exists and injecting them would
+/// re-argue for the approach the human just killed.
+///
+/// Returns the injection plan plus a fate per batch row (parallel to `batch`, so
+/// the receipt loop can report a drop without scanning for the override twice).
+/// Rows that are not nudges carry the default fate, which `receipt_payload`
+/// ignores for them.
+pub fn plan_nudges(batch: &[Value]) -> (DrainedNudges, Vec<NudgeFate>) {
+    let mut fates = vec![NudgeFate::Injected; batch.len()];
+    let mut redirects = Vec::new();
+    let mut additive = Vec::new();
+
+    for (i, msg) in batch.iter().enumerate() {
+        if msg.get("type").and_then(|t| t.as_str()) != Some("nudge") {
+            continue;
+        }
+        let payload = msg.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let text = payload_text(&payload);
+        if nudge_is_override(&payload) {
+            fates[i] = NudgeFate::Redirected;
+            redirects.push(redirect_user_text(&text));
+        } else {
+            additive.push((i, nudge_user_text(&text)));
+        }
+    }
+
+    let overridden = !redirects.is_empty();
+    let mut texts = redirects;
+    for (i, text) in additive {
+        // Consumed either way — the cursor means DELIVERED-INTO-A-TURN and only
+        // moves forward, so a dropped nudge is still gone. What changes is that
+        // the operator gets told, in its receipt, that it was dropped.
+        if overridden {
+            fates[i] = NudgeFate::Dropped;
+        } else {
+            texts.push(text);
+        }
+    }
+
+    (DrainedNudges { texts, overridden }, fates)
+}
+
 pub struct TurnDrain {
     /// None when this machine should not drain at all: only an enrolled worker
     /// has a diary (the channel routes want its device token, and the cursor
@@ -1865,10 +1998,11 @@ impl TurnDrain {
         Self { device_id, cursor: None }
     }
 
-    /// The once-per-turn GET. Returns the nudge texts to inject; receipts every
-    /// drained message. NEVER fails the turn: any error here is a log line and
-    /// an empty batch — the run must survive a backend outage the way it
-    /// survives one in run persistence.
+    /// The once-per-turn GET. Returns the wrapped user messages to inject (see
+    /// `plan_nudges` for the ordering and drop rules); receipts every drained
+    /// message. NEVER fails the turn: any error here is a log line and an empty
+    /// batch — the run must survive a backend outage the way it survives one in
+    /// run persistence.
     ///
     /// The server cursor is NOT advanced here — see `turn_completed`.
     pub async fn at_boundary(
@@ -1876,8 +2010,8 @@ impl TurnDrain {
         app: &AppHandle,
         client: &reqwest::Client,
         base: &str,
-    ) -> Vec<String> {
-        let Some(device_id) = self.device_id.clone() else { return Vec::new() };
+    ) -> DrainedNudges {
+        let Some(device_id) = self.device_id.clone() else { return DrainedNudges::default() };
 
         // Lazily learn where the server cursor stands. One attempt per turn:
         // until it succeeds we drain nothing, because starting from a guessed 0
@@ -1888,7 +2022,7 @@ impl TurnDrain {
                 Ok(seq) => self.cursor = Some(DrainCursor::starting_at(seq)),
                 Err(e) => {
                     eprintln!("[channel] drain: cursor fetch failed ({e}); draining nothing this turn");
-                    return Vec::new();
+                    return DrainedNudges::default();
                 }
             }
         }
@@ -1901,25 +2035,26 @@ impl TurnDrain {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[channel] drain: fetch failed ({e}); draining nothing this turn");
-                    return Vec::new();
+                    return DrainedNudges::default();
                 }
             };
         if batch.is_empty() {
-            return Vec::new();
+            return DrainedNudges::default();
         }
 
-        let mut nudges = Vec::new();
+        // Plan the whole batch before receipting any of it: whether a nudge is
+        // injected or dropped depends on a redirect that may sit LATER in the
+        // log than it does, so a row's receipt cannot be written until every row
+        // has been looked at.
+        let (drained, fates) = plan_nudges(&batch);
+
         let mut max_seq = cursor.since_seq();
-        for msg in &batch {
+        for (i, msg) in batch.iter().enumerate() {
             let seq = msg.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
             max_seq = max_seq.max(seq);
             let msg_id = msg.get("msg_id").and_then(|m| m.as_str()).unwrap_or("");
             let mtype = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let payload = msg.get("payload").cloned().unwrap_or_else(|| json!({}));
 
-            if mtype == "nudge" {
-                nudges.push(payload_text(&payload));
-            }
             let handled = mtype == "verdict" && was_verdict_handled(app, msg_id);
 
             // Receipt every drained message so the operator's log shows what
@@ -1931,7 +2066,7 @@ impl TurnDrain {
                 "receipt",
                 msg.get("task_id").and_then(|t| t.as_str()),
                 Some(msg_id),
-                receipt_payload(mtype, handled),
+                receipt_payload(mtype, handled, fates[i]),
             );
             if let Err(e) = post_message(app, client, base, &device_id, &receipt).await {
                 // Best-effort: the receipt will be re-posted (same msg_id) when
@@ -1941,7 +2076,7 @@ impl TurnDrain {
             }
         }
         cursor.note_batch(max_seq);
-        nudges
+        drained
     }
 
     /// The turn that consumed the last batch has completed (its model response
@@ -3713,11 +3848,33 @@ mod tests {
 
     #[test]
     fn receipt_payloads_say_what_happened() {
-        assert_eq!(receipt_payload("nudge", false)["disposition"], json!("injected"));
-        assert_eq!(receipt_payload("verdict", true)["disposition"], json!("handled"));
-        assert_eq!(receipt_payload("verdict", false)["disposition"], json!("superseded"));
-        assert_eq!(receipt_payload("goal", false)["disposition"], json!("superseded"));
-        assert_eq!(receipt_payload("status", false)["disposition"], json!("noted"));
+        let f = NudgeFate::Injected;
+        assert_eq!(receipt_payload("nudge", false, f)["disposition"], json!("injected"));
+        assert_eq!(receipt_payload("verdict", true, f)["disposition"], json!("handled"));
+        assert_eq!(receipt_payload("verdict", false, f)["disposition"], json!("superseded"));
+        assert_eq!(receipt_payload("goal", false, f)["disposition"], json!("superseded"));
+        assert_eq!(receipt_payload("status", false, f)["disposition"], json!("noted"));
+    }
+
+    /// The three things that can happen to a nudge are three distinct words in
+    /// the log. An operator whose nudge was dropped by someone else's redirect
+    /// has to be able to see that from the receipt alone — "injected" for a
+    /// message the model never saw would send them hunting a phantom bug in the
+    /// worker.
+    #[test]
+    fn nudge_receipts_distinguish_redirect_from_drop() {
+        let injected = receipt_payload("nudge", false, NudgeFate::Injected);
+        let redirected = receipt_payload("nudge", false, NudgeFate::Redirected);
+        let dropped = receipt_payload("nudge", false, NudgeFate::Dropped);
+        assert_eq!(injected["disposition"], json!("injected"));
+        assert_eq!(redirected["disposition"], json!("redirected"));
+        assert_eq!(dropped["disposition"], json!("dropped"));
+        // A fate only means something for a nudge; every other type's
+        // disposition is fixed by the type.
+        assert_eq!(
+            receipt_payload("verdict", true, NudgeFate::Dropped)["disposition"],
+            json!("handled")
+        );
     }
 
     /// Payload text extraction is liberal: known keys first, raw JSON as the
@@ -3735,5 +3892,101 @@ mod tests {
         let s = nudge_user_text("use the staging site");
         assert!(s.contains("human supervising this run"));
         assert!(s.ends_with("use the staging site"));
+    }
+
+    /// A redirect is not a nudge with a louder voice — it has to tell the model
+    /// that what it has been doing is over. The additive wrapper's "take it into
+    /// account from here on" is exactly the framing that gets averaged into a
+    /// long transcript of the wrong approach, so the two texts must not
+    /// converge, and the redirect must carry the superseding language.
+    #[test]
+    fn redirect_wrapper_supersedes_rather_than_adds() {
+        let r = redirect_user_text("use the staging site");
+        let n = nudge_user_text("use the staging site");
+        assert_ne!(r, n);
+        assert!(r.contains("SUPERSEDED"), "{r}");
+        assert!(r.contains("STOP"), "{r}");
+        assert!(r.contains("Do not continue it"), "{r}");
+        assert!(!r.contains("take it into account"), "{r}");
+        assert!(r.ends_with("use the staging site"));
+        // A redirect corrects the approach; it is not a kill. Nothing in the
+        // wording may suggest the run or the task itself is finished.
+        assert!(r.contains("The task itself is not over"), "{r}");
+    }
+
+    fn nudge_row(seq: u64, text: &str, is_override: bool) -> Value {
+        let mut payload = json!({"text": text});
+        if is_override {
+            payload["override"] = json!(true);
+        }
+        json!({"seq": seq, "msg_id": format!("m{seq}"), "type": "nudge", "payload": payload})
+    }
+
+    /// With no override in the batch the drain behaves exactly as it always
+    /// has: every nudge injected, in log order, wrapped additively. This is the
+    /// overwhelmingly common case and the redirect work must not touch it.
+    #[test]
+    fn drain_without_override_injects_every_nudge_in_log_order() {
+        let batch = vec![
+            nudge_row(1, "first", false),
+            json!({"seq": 2, "msg_id": "m2", "type": "status", "payload": {}}),
+            nudge_row(3, "second", false),
+        ];
+        let (drained, fates) = plan_nudges(&batch);
+        assert!(!drained.overridden);
+        assert_eq!(
+            drained.texts,
+            vec![nudge_user_text("first"), nudge_user_text("second")]
+        );
+        assert_eq!(fates, vec![NudgeFate::Injected; 3]);
+    }
+
+    /// The queue-jump. An operator who watches a run go wrong types the redirect
+    /// after the nudges that were still trying to steer the old approach, so log
+    /// order is precisely the wrong order to deliver in: the correction has to
+    /// land first, or the model reads the redirect and then a paragraph of
+    /// advice about the plan it was just told to abandon.
+    #[test]
+    fn override_jumps_ahead_of_an_earlier_nudge() {
+        let batch = vec![nudge_row(1, "try the other button", false), nudge_row(2, "stop, log in first", true)];
+        let (drained, _) = plan_nudges(&batch);
+        assert!(drained.overridden);
+        assert_eq!(drained.texts, vec![redirect_user_text("stop, log in first")]);
+    }
+
+    /// Everything else in the same drain is dropped rather than delivered — it
+    /// was written against a plan that no longer exists — but it is still
+    /// consumed and still receipted, so the operator can see that their words
+    /// were read and why they went nowhere.
+    #[test]
+    fn nudges_sharing_a_drain_with_an_override_are_dropped_and_receipted() {
+        let batch = vec![
+            nudge_row(1, "earlier", false),
+            nudge_row(2, "redirect", true),
+            nudge_row(3, "later", false),
+        ];
+        let (drained, fates) = plan_nudges(&batch);
+        assert_eq!(drained.texts, vec![redirect_user_text("redirect")]);
+        assert_eq!(
+            fates,
+            vec![NudgeFate::Dropped, NudgeFate::Redirected, NudgeFate::Dropped]
+        );
+        for (i, fate) in fates.iter().enumerate() {
+            let d = receipt_payload("nudge", false, *fate)["disposition"].clone();
+            let expected = if i == 1 { "redirected" } else { "dropped" };
+            assert_eq!(d, json!(expected));
+        }
+    }
+
+    /// The flag is a plain boolean on the existing nudge type, and anything that
+    /// is not `true` means the old additive behaviour — an absent, null or
+    /// string-valued `override` must never silently wipe a run's approach.
+    #[test]
+    fn only_a_true_override_flag_redirects() {
+        assert!(nudge_is_override(&json!({"text": "x", "override": true})));
+        assert!(!nudge_is_override(&json!({"text": "x"})));
+        assert!(!nudge_is_override(&json!({"text": "x", "override": false})));
+        assert!(!nudge_is_override(&json!({"text": "x", "override": "true"})));
+        assert!(!nudge_is_override(&json!({"text": "x", "override": null})));
     }
 }
