@@ -665,11 +665,31 @@ pub fn prompt_block(dump: &UiaDump) -> String {
             dump.window_title
         );
     }
+    // The keyboard reminder rides HERE, on the per-turn element list, rather
+    // than living only in the system prompt — where it was ignored.
+    //
+    // A run told in its system prompt to prefer typing still entered a
+    // multiplication by clicking nine keypad buttons, got the wrong answer,
+    // cleared, clicked it wrong a second time, and only typed the expression on
+    // the third attempt. The rule was forty turns behind the decision, while the
+    // list of clickable controls was right in front of it. That is the same
+    // failure that made `mark_evidence` need a per-turn note, and the same
+    // remedy: say it where the choice is actually being made.
+    //
+    // Unconditional rather than gated on the window looking text-editable,
+    // because the case that motivated it would have failed the gate — Calculator
+    // takes keyboard input perfectly well and exposes no editable control to
+    // detect it by.
     let mut out = format!(
         "UI elements in the foreground window \"{}\" ({} of them). The screenshot is for \
-         UNDERSTANDING what is on screen; this list is for AIMING. To click one, call \
-         click_element with its index plus its control_type and name copied exactly as printed. \
-         This list is regenerated every turn — the indices below are valid for THIS turn only.\n",
+         UNDERSTANDING what is on screen; this list is for AIMING. To click one, send a \
+         click_element step in a `batch` call, citing its index plus its control_type and name \
+         copied exactly as printed. This list is regenerated every turn — the indices below are \
+         valid for THIS turn only.\n\
+         Before clicking anything here, ask whether the keyboard would do it: if this window \
+         takes typed text or a keyboard shortcut for what you want, type it instead. A click is \
+         an aim and can land on the wrong control while still looking like it worked; typed text \
+         either arrives or does not. Click only what has no keyboard route.\n",
         dump.window_title,
         dump.elements.len()
     );
@@ -1642,6 +1662,30 @@ mod tests {
     }
 
     // ---- prompt rendering ----
+
+    /// The keyboard reminder must be on the PER-TURN list, not only in the
+    /// system prompt. A run told once at turn 0 to prefer typing clicked its way
+    /// to two wrong answers before typing the expression; the placement beside
+    /// the clickable controls is the entire fix, so it is pinned here.
+    #[test]
+    fn prompt_block_carries_the_keyboard_reminder() {
+        let s = prompt_block(&dump_of(vec![el("Button", "Seven", 10, 10, 40, 40)]));
+        assert!(s.contains("keyboard"), "the list must ask for the keyboard first: {s}");
+        assert!(
+            s.contains("no keyboard route"),
+            "and must say when clicking IS right: {s}"
+        );
+    }
+
+    /// A window with nothing clickable still gets no reminder — there is no
+    /// choice to make, and the empty-list branch's job is to send the model to
+    /// pixel coordinates without a second instruction competing for attention.
+    #[test]
+    fn an_empty_list_stays_a_single_instruction() {
+        let s = prompt_block(&dump_of(vec![]));
+        assert!(s.contains("pixel coordinates"), "{s}");
+        assert!(!s.contains("no keyboard route"), "{s}");
+    }
 
     #[test]
     fn prompt_block_lists_index_type_and_name() {
