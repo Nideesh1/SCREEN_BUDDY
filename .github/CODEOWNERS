@@ -1,0 +1,13 @@
+# Code owners for ScreenBuddy.
+#
+# Paired with the `main` ruleset's "Require review from Code Owners": an
+# approval only counts toward a pull request if it comes from an owner listed
+# here, so two collaborators cannot approve each other onto the default branch.
+#
+# GitHub does not let anyone approve their own pull request, so the owner's own
+# PRs are unblocked by the ruleset's bypass list rather than by a review. Keep
+# @Nideesh1 on "Always allow" there, or self-authored PRs become unmergeable.
+#
+# Last matching pattern wins, so any narrower rules belong BELOW this one.
+
+* @Nideesh1
