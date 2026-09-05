@@ -636,6 +636,40 @@ function useThisDeviceId(): string | null {
   return id
 }
 
+// The CONSOLE tag: this row is the admin, not a worker.
+//
+// Distinct from THIS MACHINE, which they happen to coincide on today but which
+// answer different questions. THIS MACHINE is "the app you are looking at runs
+// here" — a worker viewed from its own screen earns it too. CONSOLE is "this
+// row takes no tasks", which is a property of the machine and stays true from
+// whichever screen the fleet is being read on.
+//
+// Gold, unlike THIS MACHINE, because it IS a status: it is the difference
+// between a row that can be given work and one that cannot, and the operator
+// scanning for somewhere to send a task needs to skip it at a glance.
+function ConsoleTag() {
+  return (
+    <span
+      style={{
+        flexShrink: 0,
+        fontSize: 'var(--fs-xs)',
+        fontWeight: 600,
+        letterSpacing: '0.04em',
+        textTransform: 'uppercase',
+        color: 'var(--sb-gold-bright)',
+        border: '1px solid var(--sb-border-gold)',
+        background: 'var(--sb-gold-dim)',
+        borderRadius: 'var(--r-pill)',
+        padding: '1px 7px',
+        lineHeight: 1.5,
+      }}
+      title="This machine runs the console. It holds no worker pass, so it takes no tasks."
+    >
+      Console
+    </span>
+  )
+}
+
 // The "this machine" tag. Muted rather than gold: it is an orientation aid, not
 // a status, and it must not compete with the online dot or the mid-run warning.
 function ThisMachineTag() {
@@ -762,6 +796,7 @@ function DeviceRow({
           >
             {displayName(device)}
           </span>
+          {!isWorker(device) && <ConsoleTag />}
           {isThisMachine && <ThisMachineTag />}
           {device.enrollment_state === 'revoked' && <RevokedTag />}
         </span>
@@ -1012,6 +1047,7 @@ function DeviceDetail({
           <h2 style={{ margin: 0, fontSize: 'var(--fs-xl)', fontWeight: 700, color: 'var(--sb-text)' }}>
             {displayName(device)}
           </h2>
+          {isConsole && <ConsoleTag />}
           {isThisMachine && <ThisMachineTag />}
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 'var(--sp-2)' }}>
             <StatusDot online={device.online} revoked={revoked} />
